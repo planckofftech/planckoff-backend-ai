@@ -1,0 +1,16 @@
+# Never commit source bid sets -- git keeps a 46 MB blob forever.
+*.pdf
+*.PDF
+!tests/fixtures/*.pdf
+
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store

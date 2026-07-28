@@ -1,0 +1,188 @@
+"""Thin PyMuPDF wrapper: positioned text, vector rulings, rendering.
+
+All three layers come from one library, which is the whole reason this service
+is Python and not an extension of the TypeScript app (PLAN.md section 3).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import fitz
+
+
+class NotAPdfError(ValueError):
+    pass
+
+
+@dataclass(slots=True)
+class TextItem:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    text: str
+    size: float
+    horizontal: bool
+
+    @property
+    def cx(self) -> float:
+        return (self.x0 + self.x1) / 2
+
+    @property
+    def cy(self) -> float:
+        return (self.y0 + self.y1) / 2
+
+
+@dataclass(slots=True)
+class Segment:
+    """An axis-aligned ruling line. `pos` is x for vertical, y for horizontal."""
+
+    pos: float
+    start: float
+    end: float
+
+    @property
+    def length(self) -> float:
+        return self.end - self.start
+
+
+@dataclass(slots=True)
+class Rulings:
+    vertical: list[Segment]
+    horizontal: list[Segment]
+
+
+# A line is treated as axis-aligned within this tolerance (pt).
+_STRAIGHT_TOL = 0.8
+# Segments shorter than this are noise (hatching, arrowheads, glyph strokes).
+_MIN_SEG_LEN = 2.0
+
+
+# get_text("dict") decodes embedded images into the result by default. On a
+# 46 MB bid set full of rasters that dominates the scan; we only want spans.
+_TEXT_FLAGS = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+
+# Enough to cover the finder handing its candidates to the extractor.
+_TEXT_CACHE_PAGES = 4
+
+
+class PdfDoc:
+    """Owns a fitz.Document. Use as a context manager."""
+
+    def __init__(self, data: bytes):
+        try:
+            self.doc = fitz.open(stream=data, filetype="pdf")
+        except Exception as exc:  # noqa: BLE001 - any failure means unreadable
+            raise NotAPdfError(str(exc)) from exc
+        if self.doc.page_count == 0:
+            raise NotAPdfError("PDF contains no pages")
+        self.size_bytes = len(data)
+        self._text_cache: dict[int, list[TextItem]] = {}
+
+    def __enter__(self) -> PdfDoc:
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        try:
+            self.doc.close()
+        except Exception:  # noqa: BLE001 - close must never raise
+            pass
+
+    @property
+    def page_count(self) -> int:
+        return self.doc.page_count
+
+    @property
+    def size_mb(self) -> float:
+        return round(self.size_bytes / (1024 * 1024), 2)
+
+    def text_items(self, page_index: int) -> list[TextItem]:
+        """Non-empty spans with exact bboxes, in reading order.
+
+        Only the most recent pages are cached. The finder touches every page but
+        the extractor revisits only the handful it picked, so keeping all of them
+        costs a lot of memory on a 100-page set to serve one or two hits.
+        """
+        cached = self._text_cache.get(page_index)
+        if cached is not None:
+            return cached
+        page = self.doc[page_index]
+        raw = page.get_text("dict", flags=_TEXT_FLAGS)
+        items: list[TextItem] = []
+        for block in raw["blocks"]:
+            if block.get("type") != 0:  # 0 = text, 1 = image
+                continue
+            for line in block["lines"]:
+                direction = line.get("dir", (1.0, 0.0))
+                horizontal = abs(direction[0]) > abs(direction[1])
+                for span in line["spans"]:
+                    text = span["text"].strip()
+                    if not text:
+                        continue
+                    x0, y0, x1, y1 = span["bbox"]
+                    items.append(
+                        TextItem(x0, y0, x1, y1, text, span.get("size", 0.0), horizontal)
+                    )
+        if len(self._text_cache) >= _TEXT_CACHE_PAGES:
+            self._text_cache.pop(next(iter(self._text_cache)))
+        self._text_cache[page_index] = items
+        return items
+
+    def rulings(self, page_index: int) -> Rulings:
+        """Every vector line on the page, split into vertical and horizontal.
+
+        Table rulings become a query rather than a heuristic. `pdfjs-dist` cannot
+        do this -- it is why the TypeScript pipeline samples pixels instead.
+        """
+        page = self.doc[page_index]
+        vertical: list[Segment] = []
+        horizontal: list[Segment] = []
+
+        def add(x0: float, y0: float, x1: float, y1: float) -> None:
+            dx, dy = abs(x1 - x0), abs(y1 - y0)
+            if dx < _STRAIGHT_TOL and dy >= _MIN_SEG_LEN:
+                vertical.append(Segment((x0 + x1) / 2, min(y0, y1), max(y0, y1)))
+            elif dy < _STRAIGHT_TOL and dx >= _MIN_SEG_LEN:
+                horizontal.append(Segment((y0 + y1) / 2, min(x0, x1), max(x0, x1)))
+
+        try:
+            drawings = page.get_drawings()
+        except Exception:  # noqa: BLE001 - malformed content streams happen
+            return Rulings([], [])
+
+        for path in drawings:
+            for item in path["items"]:
+                kind = item[0]
+                if kind == "l":
+                    a, b = item[1], item[2]
+                    add(a.x, a.y, b.x, b.y)
+                elif kind == "re":
+                    r = item[1]
+                    # A rect draws four rulings; thin rects are lines themselves.
+                    add(r.x0, r.y0, r.x1, r.y0)
+                    add(r.x0, r.y1, r.x1, r.y1)
+                    add(r.x0, r.y0, r.x0, r.y1)
+                    add(r.x1, r.y0, r.x1, r.y1)
+                elif kind == "qu":
+                    q = item[1]
+                    add(q.ul.x, q.ul.y, q.ur.x, q.ur.y)
+                    add(q.ll.x, q.ll.y, q.lr.x, q.lr.y)
+                    add(q.ul.x, q.ul.y, q.ll.x, q.ll.y)
+                    add(q.ur.x, q.ur.y, q.lr.x, q.lr.y)
+
+        return Rulings(vertical, horizontal)
+
+    def render_png(
+        self, page_index: int, dpi: int = 200, clip: tuple[float, float, float, float] | None = None
+    ) -> bytes:
+        page = self.doc[page_index]
+        rect = fitz.Rect(*clip) if clip else None
+        return page.get_pixmap(dpi=dpi, clip=rect).tobytes("png")
+
+    def page_size(self, page_index: int) -> tuple[float, float]:
+        r = self.doc[page_index].rect
+        return r.width, r.height
