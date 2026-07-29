@@ -32,6 +32,29 @@ def full_bid_set_bytes() -> bytes:
 
 
 @pytest.fixture(scope="session")
+def schedule_shaped_pdf() -> bytes:
+    """Small document with a table-shaped page and no door schedule.
+
+    Scores above zero (a tag-like column exists) but fails the header gate --
+    the shape that triggers the small-document AI guess. Modelled on
+    ASSEMBLIES.pdf, which is floor and ceiling assemblies.
+    """
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page(width=1200, height=900)
+    page.insert_text((60, 60), "INTERIOR FLOOR ASSEMBLIES", fontsize=14)
+    for row, tag in enumerate(f"FL{n:02d}" for n in range(10, 24)):
+        y = 120 + row * 30
+        page.insert_text((60, y), tag, fontsize=10)
+        page.insert_text((160, y), "STRUCTURAL CONCRETE SLAB", fontsize=10)
+        page.insert_text((520, y), "2 HOUR", fontsize=10)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+@pytest.fixture(scope="session")
 def no_schedule_pdf() -> bytes:
     """A valid PDF with a text layer and no door schedule anywhere."""
     import fitz

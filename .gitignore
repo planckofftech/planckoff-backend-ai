@@ -3,6 +3,9 @@
 *.PDF
 !tests/fixtures/*.pdf
 
+# Scratch folder for validate_corpus.py inputs.
+corpus/
+
 .env
 .venv/
 venv/

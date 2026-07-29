@@ -1,0 +1,94 @@
+[
+  {
+    "file": "1780995376_ELLIS_COUNTY_Bid Set.pdf",
+    "size_mb": 44.1,
+    "pages": 102,
+    "scan_ms": 1520,
+    "candidates": [
+      21
+    ],
+    "top_score": "p21 hits=12 run=22",
+    "runner_up": "p55 hits=1 run=24",
+    "method": "deterministic_ruled",
+    "rows": 23,
+    "headers": [
+      "#",
+      "From",
+      "To",
+      "Width",
+      "Height",
+      "Type",
+      "Material",
+      "Finish",
+      "Frame Material",
+      "Frame Finish",
+      "THRESHOLD",
+      "F_R",
+      "HW",
+      "Comments"
+    ],
+    "warnings": [],
+    "outcome": "extracted"
+  },
+  {
+    "file": "ASSEMBLIES.pdf",
+    "size_mb": 6.3,
+    "pages": 9,
+    "scan_ms": 655,
+    "candidates": [],
+    "top_score": "p4 hits=1 run=9",
+    "runner_up": "p3 hits=2 run=6",
+    "method": "-",
+    "rows": 0,
+    "headers": [],
+    "warnings": [],
+    "outcome": "no schedule found (correct if this doc has none)"
+  },
+  {
+    "file": "GRACEM_2.PDF",
+    "size_mb": 60.3,
+    "pages": 70,
+    "scan_ms": 13645,
+    "candidates": [
+      41
+    ],
+    "top_score": "p41 hits=9 run=39",
+    "runner_up": "p40 hits=2 run=29",
+    "method": "deterministic_ruled",
+    "rows": 39,
+    "headers": [
+      "DOOR",
+      "DOOR TYPE",
+      "DOOR MATERIAL",
+      "DOOR GLAZING",
+      "WIDTH",
+      "HEIGHT",
+      "FRAME TYPE",
+      "FRAME MATERIAL",
+      "FRAME HEAD DETAIL",
+      "FRAME JAMB DETAIL",
+      "FRAME SILL DETAIL",
+      "FIRE RATING",
+      "HARDWARE",
+      "COMMENTS"
+    ],
+    "warnings": [
+      "unmapped column headers kept under 'extra': DOOR GLAZING, FRAME TYPE, FRAME HEAD DETAIL, FRAME JAMB DETAIL, FRAME SILL DETAIL"
+    ],
+    "outcome": "extracted"
+  },
+  {
+    "file": "Weston_-_Architectural_Spec_-_Issued_for_Tender_2026.06.08.pdf",
+    "size_mb": 8.5,
+    "pages": 393,
+    "scan_ms": 3024,
+    "candidates": [],
+    "top_score": "p220 hits=1 run=37",
+    "runner_up": "p221 hits=1 run=35",
+    "method": "-",
+    "rows": 0,
+    "headers": [],
+    "warnings": [],
+    "outcome": "no schedule found (correct if this doc has none)"
+  }
+]

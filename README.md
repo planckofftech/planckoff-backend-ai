@@ -23,8 +23,8 @@ bid sets. See [VALIDATION.md](VALIDATION.md) for measured results.
 | 46 MB Ellis County set → 23 rows in < 5 s | ✅ 2.4 s wall clock |
 | `method: deterministic`, `source_pages: [21]` | ✅ |
 | Zero AI tokens on that document | ✅ (runs with no API key set) |
-| `pytest` green, including the golden-file test | ✅ 37 passed |
-| Page finder validated against a second bid set | ✅ 2 sets — [VALIDATION.md](VALIDATION.md) |
+| `pytest` green, including the golden-file test | ✅ 38 passed |
+| Page finder validated against more bid sets | ⚠️ 4 documents, all correct — plan asks for 5–10. [VALIDATION.md](VALIDATION.md) |
 | `/docs` renders a complete OpenAPI schema | ✅ |
 | Every failure mode returns its message, not a 500 | ✅ |
 
@@ -123,6 +123,17 @@ token bill in one string. It is logged on every request.
 | `ai_vision` | Structure was unrecoverable; the candidate page went to a vision model |
 
 Both real bid sets return `deterministic_ruled`. The AI tier has not fired yet.
+
+### Validating a batch of documents
+
+```bash
+python scripts/validate_corpus.py <folder-or-files> --json results.json
+```
+
+Runs the full pipeline over a corpus with the AI tier disabled and tabulates,
+per document, which page was found and which tier fired. Results so far:
+**4 documents, 2 real schedules found, 2 correctly rejected, zero false
+positives** — see [VALIDATION.md](VALIDATION.md).
 
 ---
 

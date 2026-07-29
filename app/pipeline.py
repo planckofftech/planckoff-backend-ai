@@ -95,24 +95,34 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
 
         # --- Tier 2: AI vision, candidate pages only -------------------------
         ai_pages = [c.page for c in candidates[:2]]
+
+        # Nothing passed the gates. On a small document the best-scoring page is
+        # still worth a look, but that is a guess, not a find -- and it must not
+        # be reported as one. `speculative` keeps the two apart so the error
+        # message never claims a schedule was located when it was not.
+        speculative = False
         if not ai_pages and pages_scanned <= _SMALL_DOC_PAGES:
-            # Small document, nothing passed the gates: the best-scoring page is
-            # still a better bet than refusing outright.
             ranked = sorted(scores, key=lambda c: c.score, reverse=True)
             ai_pages = [c.page for c in ranked[:1] if c.score > 0]
+            speculative = bool(ai_pages)
+
+        def _give_up() -> RuntimeError:
+            if speculative or not candidates:
+                return NoScheduleFoundError(pages_scanned)
+            return NoRowsError([c.page for c in candidates], pages_scanned)
 
         if not ai_pages:
             raise NoScheduleFoundError(pages_scanned)
 
         if not allow_ai:
             warnings.append("AI fallback disabled for this request")
-            raise NoRowsError(ai_pages, pages_scanned)
+            raise _give_up()
 
         if not settings.ai_enabled:
             warnings.append(
                 "AI fallback unavailable: OPENROUTER_API_KEY is not configured"
             )
-            raise NoRowsError(ai_pages, pages_scanned)
+            raise _give_up()
 
         from app.ai.vision_extract import extract_with_vision
 
@@ -140,4 +150,4 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
                     page_scores=page_scores,
                 )
 
-        raise NoRowsError(ai_pages, pages_scanned)
+        raise _give_up()

@@ -82,3 +82,21 @@ async def test_pdf_without_a_schedule_says_so(no_schedule_pdf):
         await extract(no_schedule_pdf, allow_ai=False)
     assert "No door schedule found" in str(exc.value)
     assert "1 page" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_small_doc_guess_is_never_reported_as_a_find(schedule_shaped_pdf):
+    """On a document of <= 20 pages the pipeline nominates the best-scoring page
+    for the AI tier even when nothing passed the gates. That is a guess. If it
+    yields nothing, the error must not claim a schedule was located -- a message
+    naming a page sends someone hunting a table that is not there.
+
+    Regression: ASSEMBLIES.pdf (9 pages, zero occurrences of "DOOR") reported
+    "Found a door schedule on page 4 but could not read any rows."
+    """
+    with pytest.raises(NoScheduleFoundError) as exc:
+        await extract(schedule_shaped_pdf, allow_ai=False)
+
+    message = str(exc.value)
+    assert "No door schedule found" in message
+    assert "Found a door schedule" not in message
