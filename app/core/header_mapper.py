@@ -18,10 +18,13 @@ HEADER_ALIASES: list[tuple[str, list[str]]] = [
                   "DOOR MARK", "DR NO"]),
     ("from_space", ["FROM", "FROM ROOM", "FROM SPACE"]),
     ("to_space", ["TO", "TO ROOM", "TO SPACE"]),
-    ("door_width", ["WIDTH", "W", "DOOR WIDTH", "WD"]),
-    ("door_height", ["HEIGHT", "HT", "H", "DOOR HEIGHT"]),
-    ("door_type", ["TYPE", "DOOR TYPE", "DR TYPE"]),
-    ("door_material", ["MATERIAL", "DOOR MATERIAL", "MATL", "DR MATERIAL"]),
+    # "PANEL WIDTH" first: sheets that group columns under DOOR and FRAME print
+    # a bare "WIDTH" under FRAME, and matching that would report the frame's
+    # width as the door's.
+    ("door_width", ["PANEL WIDTH", "LEAF WIDTH", "DOOR WIDTH", "WIDTH", "W", "WD"]),
+    ("door_height", ["PANEL HEIGHT", "LEAF HEIGHT", "DOOR HEIGHT", "HEIGHT", "HT", "H"]),
+    ("door_type", ["DOOR TYPE", "DR TYPE", "TYPE"]),
+    ("door_material", ["DOOR MATERIAL", "DR MATERIAL", "MATERIAL", "MATL", "MAT L"]),
     ("door_finish", ["FINISH", "DOOR FINISH", "FIN"]),
     ("threshold", ["THRESHOLD", "THRESH"]),
     ("fire_rating", ["F.R", "F_R", "FR", "RATING", "FIRE RATING", "LABEL",

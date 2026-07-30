@@ -67,6 +67,19 @@ _TEXT_FLAGS = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
 _TEXT_CACHE_PAGES = 4
 
 
+def _is_horizontal(direction: tuple[float, float], matrix: "fitz.Matrix") -> bool:
+    """Is this text line horizontal *as displayed*?
+
+    `get_text()` reports direction in unrotated PDF space, so on a /Rotate 90
+    sheet the visually horizontal text reads as (0, -1). Rotating the direction
+    by the page matrix is what makes "horizontal" mean what a human sees.
+    """
+    dx, dy = direction
+    tdx = matrix.a * dx + matrix.c * dy
+    tdy = matrix.b * dx + matrix.d * dy
+    return abs(tdx) >= abs(tdy)
+
+
 class PdfDoc:
     """Owns a fitz.Document. Use as a context manager."""
 
@@ -101,7 +114,7 @@ class PdfDoc:
         return round(self.size_bytes / (1024 * 1024), 2)
 
     def text_items(self, page_index: int) -> list[TextItem]:
-        """Non-empty spans with exact bboxes, in reading order.
+        """Non-empty spans with exact bboxes, in display space.
 
         Only the most recent pages are cached. The finder touches every page but
         the extractor revisits only the handful it picked, so keeping all of them
@@ -111,21 +124,22 @@ class PdfDoc:
         if cached is not None:
             return cached
         page = self.doc[page_index]
+        matrix = page.rotation_matrix
         raw = page.get_text("dict", flags=_TEXT_FLAGS)
         items: list[TextItem] = []
         for block in raw["blocks"]:
             if block.get("type") != 0:  # 0 = text, 1 = image
                 continue
             for line in block["lines"]:
-                direction = line.get("dir", (1.0, 0.0))
-                horizontal = abs(direction[0]) > abs(direction[1])
+                horizontal = _is_horizontal(line.get("dir", (1.0, 0.0)), matrix)
                 for span in line["spans"]:
                     text = span["text"].strip()
                     if not text:
                         continue
-                    x0, y0, x1, y1 = span["bbox"]
+                    rect = fitz.Rect(span["bbox"]) * matrix
                     items.append(
-                        TextItem(x0, y0, x1, y1, text, span.get("size", 0.0), horizontal)
+                        TextItem(rect.x0, rect.y0, rect.x1, rect.y1, text,
+                                 span.get("size", 0.0), horizontal)
                     )
         if len(self._text_cache) >= _TEXT_CACHE_PAGES:
             self._text_cache.pop(next(iter(self._text_cache)))
@@ -139,10 +153,16 @@ class PdfDoc:
         do this -- it is why the TypeScript pipeline samples pixels instead.
         """
         page = self.doc[page_index]
+        matrix = page.rotation_matrix
         vertical: list[Segment] = []
         horizontal: list[Segment] = []
 
         def add(x0: float, y0: float, x1: float, y1: float) -> None:
+            # Same display-space transform as the text, or on a rotated page the
+            # rulings and the text they bound would disagree about which way is up.
+            a = fitz.Point(x0, y0) * matrix
+            b = fitz.Point(x1, y1) * matrix
+            x0, y0, x1, y1 = a.x, a.y, b.x, b.y
             dx, dy = abs(x1 - x0), abs(y1 - y0)
             if dx < _STRAIGHT_TOL and dy >= _MIN_SEG_LEN:
                 vertical.append(Segment((x0 + x1) / 2, min(y0, y1), max(y0, y1)))

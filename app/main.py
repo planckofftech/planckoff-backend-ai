@@ -1,11 +1,15 @@
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from app import __version__
 from app.api.routes import router
 from app.config import get_settings
+
+STATIC_DIR = Path(__file__).parent / "static"
 
 settings = get_settings()
 
@@ -34,3 +38,10 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+
+@app.get("/", include_in_schema=False)
+async def ui() -> FileResponse:
+    """Serve the test UI from the API itself, so the page shares an origin with
+    the endpoint it calls and needs no CORS configuration."""
+    return FileResponse(STATIC_DIR / "index.html")

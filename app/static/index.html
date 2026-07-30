@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Door Schedule Extraction</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666;
+    --line: #ddd;
+    --panel: #f7f7f7;
+    --accent: #1d4ed8;
+    --ok: #15803d;
+    --warn: #b45309;
+    --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c; --fg: #e8e8e8; --muted: #9aa0a6; --line: #333;
+      --panel: #1f2227; --accent: #6ea8fe; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 16px; margin-bottom: 16px;
+  }
+  label { display: block; font-weight: 600; margin-bottom: 4px; }
+  input[type=text], input[type=file] {
+    width: 100%; padding: 8px; border: 1px solid var(--line);
+    border-radius: 4px; background: var(--bg); color: var(--fg); font: inherit;
+  }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+  .row > div { flex: 1 1 220px; }
+  .checks { display: flex; gap: 20px; flex-wrap: wrap; margin: 12px 0; }
+  .checks label { font-weight: 400; display: flex; align-items: center; gap: 6px; }
+  button {
+    padding: 9px 18px; font: inherit; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: #fff; border: 0; border-radius: 4px;
+  }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  .status { margin-left: 12px; color: var(--muted); }
+  .banner { padding: 10px 12px; border-radius: 4px; margin-bottom: 12px; }
+  .banner.err { background: #fee; color: var(--err); border: 1px solid var(--err); }
+  .banner.warn { background: #fef6e7; color: var(--warn); border: 1px solid var(--warn); }
+  @media (prefers-color-scheme: dark) {
+    .banner.err { background: #2a1515; } .banner.warn { background: #2a2415; }
+  }
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .card {
+    border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px;
+    min-width: 120px; background: var(--panel);
+  }
+  .card .k { font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: .04em; }
+  .card .v { font-size: 17px; font-weight: 600; margin-top: 2px; }
+  .v.ok { color: var(--ok); }
+  .v.ai { color: var(--warn); }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 9px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { background: var(--panel); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; position: sticky; top: 0; }
+  td.extra, th.extra { background: rgba(180,83,9,.07); }
+  tr:hover td { background: rgba(127,127,127,.08); }
+  td.empty { color: var(--muted); }
+  details { margin-top: 16px; }
+  pre {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 12px; overflow: auto; max-height: 400px; font-size: 12px;
+  }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Door Schedule Extraction</h1>
+  <p class="sub">Upload a construction PDF. The service finds the schedule sheet and returns the rows.
+    <span id="health"></span></p>
+
+  <div class="panel">
+    <div class="row">
+      <div>
+        <label for="file">PDF file</label>
+        <input type="file" id="file" accept="application/pdf,.pdf">
+        <div class="hint" id="filehint"></div>
+      </div>
+      <div>
+        <label for="key">X-API-Key</label>
+        <input type="text" id="key" value="dev-key">
+      </div>
+      <div>
+        <label for="base">API base URL</label>
+        <input type="text" id="base" placeholder="(same origin)">
+        <div class="hint">Leave blank when opened from the API itself.</div>
+      </div>
+    </div>
+
+    <div class="checks">
+      <label><input type="checkbox" id="allowAi"> Allow AI fallback <span class="hint">(costs tokens)</span></label>
+      <label><input type="checkbox" id="debug"> Include per-page scores</label>
+    </div>
+
+    <button id="go">Extract</button>
+    <button id="csv" class="secondary" style="display:none">Download CSV</button>
+    <span class="status" id="status"></span>
+  </div>
+
+  <div id="out"></div>
+
+</div>
+
+<script>
+const FIELDS = ["door_tag","from_space","to_space","door_width","door_height",
+  "door_type","door_material","door_finish","frame_material","frame_finish",
+  "threshold","fire_rating","hw_set","comments"];
+
+const $ = id => document.getElementById(id);
+// Served from the API => relative URLs, so there is no CORS to configure.
+// Opened as a file:// page => fall back to the usual local port.
+const defaultBase = location.protocol.startsWith("http") ? "" : "http://localhost:8010";
+let lastResult = null;
+
+function base() { return ($("base").value || defaultBase).replace(/\/$/, ""); }
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+function label(f) { return f.replace(/_/g, " "); }
+
+fetch(defaultBase + "/health")
+  .then(r => r.json())
+  .then(h => {
+    $("health").innerHTML = "&mdash; API v" + esc(h.version) +
+      ", AI fallback " + (h.ai_enabled ? "enabled" : "not configured");
+  })
+  .catch(() => { $("health").textContent = "— API unreachable"; });
+
+$("file").addEventListener("change", () => {
+  const f = $("file").files[0];
+  if (!f) { $("filehint").textContent = ""; return; }
+  const mb = f.size / 1048576;
+  $("filehint").textContent = mb.toFixed(1) + " MB" +
+    (mb > 50 ? "  — over the 50 MB cap, expect HTTP 413" : "");
+});
+
+$("go").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) { alert("Pick a PDF first."); return; }
+
+  const params = new URLSearchParams({
+    allow_ai: $("allowAi").checked ? "true" : "false",
+    debug: $("debug").checked ? "true" : "false"
+  });
+  const body = new FormData();
+  body.append("file", f);
+
+  $("go").disabled = true;
+  $("csv").style.display = "none";
+  $("status").textContent = "extracting…";
+  $("out").innerHTML = "";
+  const t0 = performance.now();
+
+  try {
+    const res = await fetch(base() + "/api/v1/door-schedule/extract?" + params, {
+      method: "POST",
+      headers: { "X-API-Key": $("key").value },
+      body
+    });
+    const wall = Math.round(performance.now() - t0);
+    const data = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      const detail = data && data.detail ? data.detail : res.statusText;
+      $("out").innerHTML = '<div class="banner err"><strong>HTTP ' + res.status +
+        "</strong> &mdash; " + esc(detail) + "</div>";
+      return;
+    }
+    lastResult = data;
+    render(data, wall);
+    $("csv").style.display = data.rows.length ? "inline-block" : "none";
+  } catch (err) {
+    $("out").innerHTML = '<div class="banner err"><strong>Request failed</strong> &mdash; ' +
+      esc(err.message) + ". Is the API running at " + esc(base() || location.origin) + "?</div>";
+  } finally {
+    $("go").disabled = false;
+    $("status").textContent = "";
+  }
+});
+
+function render(d, wall) {
+  let html = "";
+
+  for (const w of d.warnings || []) {
+    html += '<div class="banner warn">' + esc(w) + "</div>";
+  }
+
+  const aiUsed = d.method.startsWith("ai");
+  html += '<div class="cards">' +
+    card("method", d.method, aiUsed ? "ai" : "ok") +
+    card("rows", d.row_count) +
+    card("source page", (d.source_pages || []).join(", ") || "—") +
+    card("pages scanned", d.pages_scanned) +
+    card("server time", d.duration_ms + " ms") +
+    card("round trip", wall + " ms") +
+    "</div>";
+
+  if (aiUsed) {
+    html += '<div class="banner warn">Rows came from the vision model, not the ' +
+      "deterministic parser. Spot-check them against the sheet.</div>";
+  }
+
+  // Columns whose header did not map to a canonical field are kept in `extra`.
+  const extraKeys = [];
+  for (const r of d.rows) {
+    for (const k of Object.keys(r.extra || {})) {
+      if (!extraKeys.includes(k)) extraKeys.push(k);
+    }
+  }
+
+  if (d.rows.length) {
+    html += '<div class="tablewrap"><table><thead><tr><th>#</th>';
+    for (const f of FIELDS) html += "<th>" + esc(label(f)) + "</th>";
+    for (const k of extraKeys) html += '<th class="extra">' + esc(label(k)) + "</th>";
+    html += "</tr></thead><tbody>";
+
+    d.rows.forEach((r, i) => {
+      html += "<tr><td>" + (i + 1) + "</td>";
+      for (const f of FIELDS) {
+        const v = r[f] || "";
+        html += (v ? "<td>" : '<td class="empty">') + (v ? esc(v) : "—") + "</td>";
+      }
+      for (const k of extraKeys) {
+        const v = (r.extra || {})[k] || "";
+        html += '<td class="extra">' + (v ? esc(v) : "—") + "</td>";
+      }
+      html += "</tr>";
+    });
+    html += "</tbody></table></div>";
+    if (extraKeys.length) {
+      html += '<p class="hint">Shaded columns had no canonical field and were kept under ' +
+        "<code>extra</code> rather than dropped.</p>";
+    }
+  } else {
+    html += '<div class="banner warn">No rows returned.</div>';
+  }
+
+  if (d.headers && d.headers.length) {
+    html += '<p class="hint">Headers as printed on the sheet: ' +
+      esc(d.headers.join("  |  ")) + "</p>";
+  }
+
+  if (d.page_scores && d.page_scores.length) {
+    html += "<details><summary>Per-page finder scores (" + d.page_scores.length +
+      " pages)</summary><div class='tablewrap'><table><thead><tr>" +
+      "<th>page</th><th>header hits</th><th>tag run</th><th>score</th><th>passed</th>" +
+      "</tr></thead><tbody>";
+    for (const p of [...d.page_scores].sort((a, b) => b.score - a.score)) {
+      if (!p.score) continue;
+      html += "<tr><td>" + p.page + "</td><td>" + p.header_hits + "</td><td>" +
+        p.tag_run + "</td><td>" + p.score + "</td><td>" +
+        (p.passed ? "yes" : "") + "</td></tr>";
+    }
+    html += "</tbody></table></div></details>";
+  }
+
+  html += "<details><summary>Raw JSON</summary><pre>" +
+    esc(JSON.stringify(d, null, 2)) + "</pre></details>";
+
+  $("out").innerHTML = html;
+}
+
+function card(k, v, cls) {
+  return '<div class="card"><div class="k">' + esc(k) + '</div><div class="v ' +
+    (cls || "") + '">' + esc(v) + "</div></div>";
+}
+
+$("csv").addEventListener("click", () => {
+  if (!lastResult) return;
+  const extraKeys = [];
+  for (const r of lastResult.rows) {
+    for (const k of Object.keys(r.extra || {})) {
+      if (!extraKeys.includes(k)) extraKeys.push(k);
+    }
+  }
+  const cols = FIELDS.concat(extraKeys);
+  const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
+  const lines = [cols.join(",")];
+  for (const r of lastResult.rows) {
+    lines.push(cols.map(c => q(FIELDS.includes(c) ? r[c] : (r.extra || {})[c])).join(","));
+  }
+  const url = URL.createObjectURL(new Blob([lines.join("\r\n")], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "door_schedule.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
