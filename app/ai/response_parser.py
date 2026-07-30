@@ -60,6 +60,87 @@ def _salvage_objects(text: str) -> list[dict]:
     return out
 
 
+def _salvage_arrays(text: str) -> list[list[str]]:
+    """Recover every row array that closed before the response was cut off.
+
+    Rows sit nested inside the `rows` container, so every nesting level has to
+    be tracked -- scanning only the outermost array finds the header row and
+    nothing else, because the container itself never closes when truncated.
+    Arrays of arrays are skipped; only all-scalar arrays are rows.
+    """
+    out: list[list[str]] = []
+    starts: list[int] = []
+    in_string = False
+    escaped = False
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[":
+            starts.append(idx)
+        elif ch == "]" and starts:
+            start = starts.pop()
+            try:
+                row = json.loads(text[start:idx + 1])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, list) and all(
+                isinstance(c, (str, int, float, type(None))) for c in row
+            ):
+                out.append(["" if c is None else str(c) for c in row])
+    return out
+
+
+def parse_table(content: str) -> tuple[list[str], list[list[str]], list[str]]:
+    """Parse {"headers": [...], "rows": [[...]]} from a model response.
+
+    Returns (headers, rows, warnings). Survives markdown fences, prose around
+    the JSON, and truncation at the token limit.
+    """
+    warnings: list[str] = []
+    if not content or not content.strip():
+        return [], [], ["model returned an empty response"]
+
+    text = _strip_fences(content)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        salvaged = _salvage_arrays(text)
+        if len(salvaged) < 2:
+            return [], [], ["model response could not be parsed as JSON"]
+        # The first complete array is the header row; the rest are data.
+        headers, rows = salvaged[0], salvaged[1:]
+        warnings.append(
+            f"model response was truncated; salvaged {len(rows)} complete rows"
+        )
+        return headers, rows, warnings
+
+    if not isinstance(parsed, dict):
+        return [], [], ["model response was not a JSON object"]
+
+    headers = [str(h) for h in parsed.get("headers") or [] if h is not None]
+    raw_rows = parsed.get("rows") or []
+    rows: list[list[str]] = []
+    for row in raw_rows:
+        if isinstance(row, list):
+            rows.append(["" if c is None else str(c) for c in row])
+        elif isinstance(row, dict) and headers:
+            # Tolerate a model that keyed rows by header despite the instruction.
+            rows.append([str(row.get(h, "") or "") for h in headers])
+
+    if not headers:
+        warnings.append("model returned no column headers")
+    return headers, rows, warnings
+
+
 def parse_rows(content: str) -> tuple[list[dict], list[str]]:
     """Returns (row dicts, warnings)."""
     warnings: list[str] = []

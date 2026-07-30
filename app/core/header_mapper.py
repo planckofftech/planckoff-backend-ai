@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 
+from app.schemas import CANONICAL_FIELDS
+
 # Order matters: qualified aliases are tested before bare ones, or "FINISH"
 # swallows "FRAME FINISH" and every frame column lands in the door column.
 HEADER_ALIASES: list[tuple[str, list[str]]] = [
@@ -49,15 +51,29 @@ _NORMALIZED_ALIASES: list[tuple[str, list[str]]] = [
 ]
 
 
-def map_headers(headers: list[str]) -> tuple[list[str | None], list[str]]:
+def map_headers(headers: list[str],
+                overrides: dict[str, str] | None = None
+                ) -> tuple[list[str | None], list[str]]:
     """Returns (canonical field per column, list of unmapped header strings).
 
     A field is claimed by at most one column -- if a sheet prints "FINISH" twice
     the second becomes an extra rather than overwriting the first.
+
+    `overrides` maps a raw header string to a canonical field and is applied
+    first. It carries resolutions the static alias table cannot know about --
+    every firm names columns differently, and no fixed list survives that.
     """
     normalized = [normalize(h) for h in headers]
     mapped: list[str | None] = [None] * len(headers)
     claimed: set[str] = set()
+
+    if overrides:
+        by_normalized = {normalize(k): v for k, v in overrides.items()}
+        for idx, text in enumerate(normalized):
+            field = by_normalized.get(text)
+            if field in CANONICAL_FIELDS and field not in claimed:
+                mapped[idx] = field
+                claimed.add(field)
 
     # Exact matches first, so an exact "FINISH" is not stolen by a prefix rule.
     for exact_pass in (True, False):

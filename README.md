@@ -214,9 +214,22 @@ sheet that matters beats the first bitmap in the file.
 
 If nothing qualifies, the API returns a clear 422 rather than guessing.
 
-Response parsing survives markdown fences, a bare array instead of the expected
-envelope, and truncation at the token limit (complete objects are recovered from
-the partial JSON).
+The model is asked for the sheet's **own** column headers and rows — never for
+our field names. Forcing a fixed schema made it displace real values: on a sheet
+with `THK` / `LOCK FUNCTION` / `FRAME TYPE` columns it put the thickness
+`1 3/4"` into `door_material` and shifted every column after it. Transcribing
+the table as printed keeps mapping in one place, shared with the deterministic
+path, with `extra` as the escape hatch.
+
+When two or more headers are still unrecognised, one small text-only call maps
+them (~50 tokens, **headers only, never the table**), cached per header
+signature so a firm's second document costs nothing. That is what resolves
+`OPNG → door_tag` and `HGT. → door_height` without anyone maintaining an alias
+list for every office.
+
+Response parsing survives markdown fences, rows keyed by header instead of
+positional arrays, prose around the JSON, and truncation at the token limit —
+row arrays are recovered from the partial JSON at any nesting depth.
 
 Leave `OPENROUTER_API_KEY` unset and this tier is skipped rather than failing.
 

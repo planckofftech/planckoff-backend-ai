@@ -11,26 +11,41 @@ import base64
 import logging
 
 from app.ai.client import AiUnavailableError, AiUpstreamError, get_client
-from app.ai.response_parser import parse_rows
+from app.ai.header_map import resolve_headers
+from app.ai.response_parser import parse_table
 from app.config import get_settings
+from app.core import header_mapper
 from app.core.pdf_doc import PdfDoc
-from app.schemas import CANONICAL_FIELDS, DoorRow
+from app.schemas import DoorRow
 
 log = logging.getLogger(__name__)
 
+# Below this, the static alias table is doing fine and a call is not worth it.
+_AI_HEADER_THRESHOLD = 2
+
+# Ask for the sheet's OWN columns, not our field names. Forcing a fixed schema
+# made the model displace real values: on a sheet with THK / LOCK FUNCTION /
+# FRAME TYPE columns it put the thickness "1 3/4"" into door_material and shifted
+# every column after it. Reporting the table as printed keeps our mapping in one
+# place -- the header mapper -- shared with the deterministic path.
 _PROMPT = (
-    "This image is one sheet from a construction document. Extract the DOOR "
-    "SCHEDULE table only.\n\n"
+    "This image is one sheet from a construction document. Find the schedule "
+    "that lists the doors or openings and transcribe it.\n\n"
+    "The table may be titled DOOR SCHEDULE, FRAME OPENING SCHEDULE, DOOR AND "
+    "HARDWARE SCHEDULE or similar. Hardware, frame and detail columns are part "
+    "of that table -- include them. Ignore door-type elevations, general notes, "
+    "material keys and the title block.\n\n"
     "Rules:\n"
-    "- Ignore the hardware schedule, title block, notes, and any other table.\n"
-    "- One object per door row, in sheet order.\n"
-    "- Copy values exactly as printed. Do not normalize, expand or invent.\n"
+    "- Report the column headers exactly as printed, left to right.\n"
+    "- Where headers are stacked (a group above a sub-heading), join them with "
+    "a space, e.g. 'FRAME MATERIAL'.\n"
+    "- One array per row, in sheet order, with one cell per header. Pad short "
+    "rows with empty strings so every row has the same length as headers.\n"
+    "- Copy values exactly as printed. Do not normalise, expand, or invent.\n"
     "- Use an empty string for a cell that is blank on the sheet.\n"
     "- A row with no door number is still a row if it has other values.\n"
-    "- If you cannot read the table, return an empty rows array. Never guess.\n\n"
-    'Return JSON: {"rows": [{' +
-    ", ".join(f'"{f}": ""' for f in CANONICAL_FIELDS) +
-    "}]}"
+    "- If you cannot read a table, return empty arrays. Never guess.\n\n"
+    'Return JSON: {"headers": ["..."], "rows": [["..."]]}'
 )
 
 
@@ -86,7 +101,7 @@ async def extract_with_vision(doc: PdfDoc, page: int) -> tuple[list[DoorRow], li
         raise AiUpstreamError(_upstream_reason(exc)) from exc
 
     content = response.choices[0].message.content or ""
-    raw_rows, parse_warnings = parse_rows(content)
+    headers, raw_rows, parse_warnings = parse_table(content)
     warnings.extend(parse_warnings)
 
     usage = getattr(response, "usage", None)
@@ -94,16 +109,52 @@ async def extract_with_vision(doc: PdfDoc, page: int) -> tuple[list[DoorRow], li
         log.info("ai_vision tokens prompt=%s completion=%s",
                  usage.prompt_tokens, usage.completion_tokens)
 
+    if not headers or not raw_rows:
+        return [], warnings
+
+    rows, map_warnings = await rows_from_table(headers, raw_rows)
+    warnings.extend(map_warnings)
+    return rows, warnings
+
+
+async def rows_from_table(headers: list[str], raw_rows: list[list[str]]
+                          ) -> tuple[list[DoorRow], list[str]]:
+    """Map a transcribed table onto DoorRow through the shared header mapper.
+
+    The same alias table and the same `extra` escape hatch as the deterministic
+    path, so a column with no canonical equivalent is preserved rather than
+    displacing a real field.
+    """
+    warnings: list[str] = []
+    mapped, unmapped = header_mapper.map_headers(headers)
+
+    if len(unmapped) >= _AI_HEADER_THRESHOLD:
+        overrides, hint_warnings = await resolve_headers(unmapped)
+        warnings.extend(hint_warnings)
+        if overrides:
+            mapped, unmapped = header_mapper.map_headers(headers, overrides)
+
+    if unmapped:
+        warnings.append(
+            f"columns kept under 'extra': {', '.join(unmapped)}"
+        )
+
     rows: list[DoorRow] = []
-    for raw in raw_rows:
-        values = {
-            f: str(raw.get(f) or "").strip() for f in CANONICAL_FIELDS if raw.get(f)
-        }
-        extra = {
-            str(k): str(v).strip() for k, v in raw.items()
-            if k not in CANONICAL_FIELDS and k != "extra" and v
-        }
-        if values:
+    for cells in raw_rows:
+        values: dict[str, str] = {}
+        extra: dict[str, str] = {}
+        for idx, cell in enumerate(cells):
+            if idx >= len(headers):
+                break
+            text = str(cell or "").strip()
+            if not text:
+                continue
+            field = mapped[idx] if idx < len(mapped) else None
+            if field:
+                values[field] = text
+            else:
+                extra[header_mapper.extra_key(headers[idx], idx)] = text
+        if values or extra:
             rows.append(DoorRow(**values, extra=extra))
 
     return rows, warnings
