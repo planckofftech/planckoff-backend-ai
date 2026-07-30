@@ -26,6 +26,27 @@ _SMALL_DOC_PAGES = 20
 _MAX_AI_PAGES = 2
 
 
+def select_fallback_pages(doc: PdfDoc, scores: list, pages_scanned: int) -> list[int]:
+    """Pages worth handing to the vision tier when nothing passed the gates.
+
+    A scanned sheet has no text to score, so it can never pass -- it is exactly
+    what the vision tier is for, and that must not be gated on document size.
+    Shared with the preview endpoint so both agree on which page matters.
+    """
+    scanned = [c for c in scores
+               if not c.has_text_layer and doc.has_raster(c.page - 1)]
+
+    shortlist = {c.page: c for c in scanned}
+    if scanned or pages_scanned <= _SMALL_DOC_PAGES:
+        # Keep any page that scored at all. A scan often retains a thin text
+        # layer on the sheet that matters, and that page is a far better bet
+        # than the first bitmap in the file.
+        shortlist.update({c.page: c for c in scores if c.score > 0})
+
+    ranked = sorted(shortlist.values(), key=lambda c: (-c.score, c.page))
+    return [c.page for c in ranked[:_MAX_AI_PAGES]]
+
+
 class NoScheduleFoundError(RuntimeError):
     def __init__(self, pages_scanned: int):
         self.pages_scanned = pages_scanned
@@ -104,23 +125,9 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
         # message never claims a schedule was located when it was not.
         speculative = False
         if not ai_pages:
-            # A scanned sheet has no text to score, so it can never pass the
-            # structural gates -- it is exactly what the vision tier is for.
-            # Size must not gate that: a scanned 100-page set would otherwise be
-            # refused outright while a scanned 4-page one goes through.
             scanned = [c for c in scores
                        if not c.has_text_layer and doc.has_raster(c.page - 1)]
-
-            shortlist = {c.page: c for c in scanned}
-            if scanned or pages_scanned <= _SMALL_DOC_PAGES:
-                # Keep any page that scored at all. A scan often retains a thin
-                # text layer on the sheet that matters, and that page is a far
-                # better bet than the first bitmap in the file.
-                shortlist.update({c.page: c for c in scores if c.score > 0})
-
-            ranked = sorted(shortlist.values(),
-                            key=lambda c: (-c.score, c.page))
-            ai_pages = [c.page for c in ranked[:_MAX_AI_PAGES]]
+            ai_pages = select_fallback_pages(doc, scores, pages_scanned)
             speculative = bool(ai_pages) and not scanned
 
             if scanned and ai_pages:

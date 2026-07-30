@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from app.core.page_finder import PageCandidate
 from app.core.pdf_doc import PdfDoc
-from app.core.table_locator import TableGrid, locate_table
+from app.core.table_locator import TableGrid, TableNotFoundError, locate_table
 
 _OUTLINE = (200, 25, 25)
 _BORDER_WIDTH = 4
@@ -52,24 +52,43 @@ def _font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def render_preview(doc: PdfDoc, candidate: PageCandidate, *, dpi: int = 110) -> bytes:
-    """PNG of the candidate page with the door schedule boxed and labelled."""
+def render_preview(doc: PdfDoc, candidate: PageCandidate, *, dpi: int = 110,
+                   located: bool = True) -> bytes:
+    """PNG of the page, with the door schedule boxed when it was actually found.
+
+    `located` must be False when the page did not pass the structural gates. On
+    such a page the locator will still latch onto *some* ruled block -- on one
+    real sheet it boxed the MATERIAL KEY legend and labelled it DOOR SCHEDULE.
+    Drawing that is worse than drawing nothing: it asserts a result the finder
+    never reached. The page is still shown, because it is what the vision tier
+    read.
+    """
     page_index = candidate.page - 1
-    items = doc.text_items(page_index)
-    grid, _headers = locate_table(items, doc.rulings(page_index),
-                                  candidate.header_y, candidate.tag_x)
-
-    top = min(grid.header_top, grid.header_bottom)
-    bottom = _table_bottom(grid, doc, page_index)
-
     image = Image.open(io.BytesIO(doc.render_png(page_index, dpi=dpi))).convert("RGB")
     scale = dpi / _PDF_DPI
-    box = (grid.left * scale, top * scale, grid.right * scale, bottom * scale)
-
     draw = ImageDraw.Draw(image)
-    draw.rectangle(box, outline=_OUTLINE, width=_BORDER_WIDTH)
 
-    label = f"DOOR SCHEDULE - page {candidate.page}"
+    grid = None
+    if located:
+        try:
+            grid, _headers = locate_table(doc.text_items(page_index),
+                                          doc.rulings(page_index),
+                                          candidate.header_y, candidate.tag_x)
+        except (TableNotFoundError, IndexError, ValueError):
+            grid = None
+
+    if grid is not None:
+        top = min(grid.header_top, grid.header_bottom)
+        bottom = _table_bottom(grid, doc, page_index)
+        draw.rectangle(
+            (grid.left * scale, top * scale, grid.right * scale, bottom * scale),
+            outline=_OUTLINE, width=_BORDER_WIDTH,
+        )
+        label = f"DOOR SCHEDULE - page {candidate.page}"
+        box = (grid.left * scale, top * scale, 0, 0)
+    else:
+        label = f"page {candidate.page} - no schedule located; shown as read"
+        box = (_LABEL_PAD, _LABEL_PAD * 2 + 14, 0, 0)
     font = _font(max(13, int(image.width / 90)))
     text_box = draw.textbbox((0, 0), label, font=font)
     text_w = text_box[2] - text_box[0]

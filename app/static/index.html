@@ -315,10 +315,15 @@ $("preview").addEventListener("click", async () => {
       return;
     }
     const page = res.headers.get("X-Source-Page") || "?";
+    const located = res.headers.get("X-Table-Located") !== "false";
     const url = URL.createObjectURL(await res.blob());
-    $("preview-out").innerHTML =
-      '<p class="hint">Detected schedule outlined on page ' + esc(page) + ".</p>" +
-      '<img src="' + url + '" alt="page ' + esc(page) + ' with the door schedule outlined">';
+    const note = located
+      ? '<p class="hint">Detected schedule outlined on page ' + esc(page) + ".</p>"
+      : '<div class="banner warn">Page ' + esc(page) + " has no text layer, so " +
+        "there is no table geometry to outline. This is the page the vision " +
+        "model read.</div>";
+    $("preview-out").innerHTML = note +
+      '<img src="' + url + '" alt="page ' + esc(page) + '">';
   } catch (err) {
     $("preview-out").innerHTML = '<div class="banner err">Preview failed &mdash; ' +
       esc(err.message) + "</div>";

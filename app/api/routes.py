@@ -108,17 +108,28 @@ async def preview(
     """Visual confirmation that the right region was located. No AI, ever."""
     from app.core import page_finder
     from app.core.preview import render_preview
+    from app.pipeline import select_fallback_pages
 
     data = await _read_upload(file)
     try:
         with PdfDoc(data) as doc:
-            candidates = page_finder.passing(page_finder.find_schedule_pages(doc))
-            if not candidates:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"No door schedule found - scanned {doc.page_count} pages.",
-                )
-            png = render_preview(doc, candidates[0])
+            scores = page_finder.find_schedule_pages(doc)
+            candidates = page_finder.passing(scores)
+            if candidates:
+                chosen, located = candidates[0], True
+            else:
+                # No recoverable geometry -- most likely a scan. Show the page
+                # the vision tier would read rather than refusing outright.
+                fallback = select_fallback_pages(doc, scores, doc.page_count)
+                if not fallback:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"No door schedule found - scanned "
+                               f"{doc.page_count} pages.",
+                    )
+                by_page = {c.page: c for c in scores}
+                chosen, located = by_page[fallback[0]], False
+            png = render_preview(doc, chosen, located=located)
     except NotAPdfError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="File is not a readable PDF.") from exc
@@ -126,7 +137,10 @@ async def preview(
     return Response(
         content=png,
         media_type="image/png",
-        headers={"X-Source-Page": str(candidates[0].page)},
+        headers={
+            "X-Source-Page": str(chosen.page),
+            "X-Table-Located": "true" if located else "false",
+        },
     )
 
 

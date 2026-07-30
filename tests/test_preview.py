@@ -82,6 +82,32 @@ def test_preview_endpoint_returns_png(ellis_p21_bytes):
     assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_unlocated_page_never_consults_the_locator(schedule_shaped_pdf, monkeypatch):
+    """When no page passed the gates the locator must not be asked at all.
+
+    Left to run, it latches onto whatever ruled block it can find: on a real
+    sheet it boxed the MATERIAL KEY legend and captioned it DOOR SCHEDULE,
+    asserting a result the finder never reached. The page is still rendered --
+    it is what the vision tier read -- just without the claim.
+    """
+    from app.core import preview as preview_module
+    from app.core.page_finder import score_page
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("locate_table called for an unlocated page")
+
+    monkeypatch.setattr(preview_module, "locate_table", explode)
+
+    with PdfDoc(schedule_shaped_pdf) as doc:
+        candidate = score_page(doc.text_items(0), 1)
+        assert not candidate.passed, "fixture should not pass the gates"
+        png = render_preview(doc, candidate, located=False)
+
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    image = Image.open(io.BytesIO(png))
+    assert image.width > 0 and image.height > 0
+
+
 def test_preview_endpoint_422s_when_no_schedule(no_schedule_pdf):
     from fastapi.testclient import TestClient
 
