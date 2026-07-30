@@ -79,6 +79,10 @@
     padding: 12px; overflow: auto; max-height: 400px; font-size: 12px;
   }
   .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  #preview-out img {
+    max-width: 100%; height: auto; display: block;
+    border: 1px solid var(--line); border-radius: 6px; margin-bottom: 16px;
+  }
 </style>
 </head>
 <body>
@@ -112,10 +116,12 @@
     </div>
 
     <button id="go">Extract</button>
+    <button id="preview" class="secondary">Preview page</button>
     <button id="csv" class="secondary" style="display:none">Download CSV</button>
     <span class="status" id="status"></span>
   </div>
 
+  <div id="preview-out"></div>
   <div id="out"></div>
 
 </div>
@@ -283,6 +289,44 @@ function card(k, v, cls) {
   return '<div class="card"><div class="k">' + esc(k) + '</div><div class="v ' +
     (cls || "") + '">' + esc(v) + "</div></div>";
 }
+
+$("preview").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) { alert("Pick a PDF first."); return; }
+
+  const body = new FormData();
+  body.append("file", f);
+
+  $("preview").disabled = true;
+  $("status").textContent = "rendering…";
+  $("preview-out").innerHTML = "";
+
+  try {
+    const res = await fetch(base() + "/api/v1/door-schedule/preview", {
+      method: "POST",
+      headers: { "X-API-Key": $("key").value },
+      body
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail; } catch (e) { /* not JSON */ }
+      $("preview-out").innerHTML = '<div class="banner err"><strong>HTTP ' +
+        res.status + "</strong> &mdash; " + esc(detail) + "</div>";
+      return;
+    }
+    const page = res.headers.get("X-Source-Page") || "?";
+    const url = URL.createObjectURL(await res.blob());
+    $("preview-out").innerHTML =
+      '<p class="hint">Detected schedule outlined on page ' + esc(page) + ".</p>" +
+      '<img src="' + url + '" alt="page ' + esc(page) + ' with the door schedule outlined">';
+  } catch (err) {
+    $("preview-out").innerHTML = '<div class="banner err">Preview failed &mdash; ' +
+      esc(err.message) + "</div>";
+  } finally {
+    $("preview").disabled = false;
+    $("status").textContent = "";
+  }
+});
 
 $("csv").addEventListener("click", () => {
   if (!lastResult) return;

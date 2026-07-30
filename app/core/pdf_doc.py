@@ -127,6 +127,9 @@ class PdfDoc:
         matrix = page.rotation_matrix
         raw = page.get_text("dict", flags=_TEXT_FLAGS)
         items: list[TextItem] = []
+        # CAD exports routinely draw the same run twice at the same spot. Left
+        # in, every such cell reads "VALUE VALUE" once the cell text is joined.
+        seen: set[tuple[int, int, str]] = set()
         for block in raw["blocks"]:
             if block.get("type") != 0:  # 0 = text, 1 = image
                 continue
@@ -137,6 +140,10 @@ class PdfDoc:
                     if not text:
                         continue
                     rect = fitz.Rect(span["bbox"]) * matrix
+                    fingerprint = (round(rect.x0 * 2), round(rect.y0 * 2), text)
+                    if fingerprint in seen:
+                        continue
+                    seen.add(fingerprint)
                     items.append(
                         TextItem(rect.x0, rect.y0, rect.x1, rect.y1, text,
                                  span.get("size", 0.0), horizontal)

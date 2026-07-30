@@ -32,6 +32,11 @@ _COL_LINE_COVERAGE = 0.80
 _HEADER_BAND = 6.0
 # Consecutive header cells further apart than this belong to different tables.
 _MAX_COL_GAP = 320.0
+# A neighbouring cell is part of the run if its gap is within this multiple of
+# the run's typical gap.
+_GAP_TOLERANCE = 4.0
+# ...but never be stricter than this, or wide columns split a legitimate table.
+_MIN_COL_GAP = 60.0
 # Data x-positions within this are the same left-aligned column.
 _DATA_X_TOL = 6.0
 # A ruled row band taller than this multiple of the median is the end of the table.
@@ -139,11 +144,19 @@ def header_items(items: list[TextItem], header_y: float, tag_x: float) -> list[T
         raise TableNotFoundError("no header cells at the detected header line")
 
     anchor = min(range(len(band)), key=lambda k: abs(band[k].x0 - tag_x))
+
+    # A fixed gap cannot separate "next column" from "unrelated block of notes
+    # that happens to share this y". Grow the run using a gap budget derived
+    # from the spacing already seen, so a run of tight columns stays tight.
+    gaps = sorted(b.x0 - a.x1 for a, b in zip(band, band[1:]) if b.x0 > a.x1)
+    typical = gaps[len(gaps) // 2] if gaps else _MAX_COL_GAP
+    budget = min(_MAX_COL_GAP, max(typical * _GAP_TOLERANCE, _MIN_COL_GAP))
+
     start = anchor
-    while start > 0 and band[start].x0 - band[start - 1].x1 < _MAX_COL_GAP:
+    while start > 0 and band[start].x0 - band[start - 1].x1 < budget:
         start -= 1
     end = anchor
-    while end + 1 < len(band) and band[end + 1].x0 - band[end].x1 < _MAX_COL_GAP:
+    while end + 1 < len(band) and band[end + 1].x0 - band[end].x1 < budget:
         end += 1
     return band[start:end + 1]
 

@@ -3,7 +3,7 @@
 import logging
 import time
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 
 from app import __version__
 from app.ai.client import AiUpstreamError
@@ -92,6 +92,42 @@ async def extract_door_schedule(
         int((time.perf_counter() - started) * 1000),
     )
     return result
+
+
+@router.post(
+    "/api/v1/door-schedule/preview",
+    tags=["extraction"],
+    summary="PNG of the schedule page with the detected table outlined",
+    response_class=Response,
+    responses={200: {"content": {"image/png": {}}}},
+)
+async def preview(
+    file: UploadFile = File(...),
+    _key: str = Depends(require_api_key),
+) -> Response:
+    """Visual confirmation that the right region was located. No AI, ever."""
+    from app.core import page_finder
+    from app.core.preview import render_preview
+
+    data = await _read_upload(file)
+    try:
+        with PdfDoc(data) as doc:
+            candidates = page_finder.passing(page_finder.find_schedule_pages(doc))
+            if not candidates:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"No door schedule found - scanned {doc.page_count} pages.",
+                )
+            png = render_preview(doc, candidates[0])
+    except NotAPdfError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="File is not a readable PDF.") from exc
+
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"X-Source-Page": str(candidates[0].page)},
+    )
 
 
 @router.post("/api/v1/door-schedule/inspect", tags=["extraction"],
