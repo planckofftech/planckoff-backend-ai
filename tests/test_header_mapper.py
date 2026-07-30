@@ -51,6 +51,27 @@ def test_duplicate_header_does_not_overwrite_the_first():
     assert unmapped == ["Finish"]
 
 
+def test_overrides_fill_gaps_but_never_displace_the_alias_table():
+    """Applied first, an override like "FRAME TYPE -> frame_material" claims the
+    field and locks out "FRAME MAT'L", which genuinely matches. On a real sheet
+    that put the frame type code into frame_material and the actual frame
+    material into extras."""
+    headers = ["FRAME TYPE", "FRAME MAT'L", "SPECIAL COL"]
+    overrides = {"FRAME TYPE": "frame_material", "SPECIAL COL": "comments"}
+
+    mapped, unmapped = map_headers(headers, overrides)
+
+    assert mapped[1] == "frame_material", "alias table lost its column"
+    assert mapped[0] is None, "override displaced a genuine alias match"
+    assert mapped[2] == "comments", "override should still fill a real gap"
+    assert unmapped == ["FRAME TYPE"]
+
+
+def test_overrides_are_ignored_for_unknown_fields():
+    mapped, _ = map_headers(["WEIRD"], {"WEIRD": "not_a_field"})
+    assert mapped == [None]
+
+
 def test_tag_column_defaults_to_first_when_absent():
     assert tag_column_index([None, "from_space"]) == 0
     assert tag_column_index(["from_space", "door_tag"]) == 1

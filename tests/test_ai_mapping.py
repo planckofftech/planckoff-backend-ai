@@ -92,6 +92,55 @@ def test_recovers_rows_from_a_truncated_response():
     assert any("truncated" in w for w in warnings)
 
 
+def test_row_objects_cannot_shift_when_cells_are_missing():
+    """The real failure: the model dropped blank cells from positional arrays.
+
+    Its headers were right (16 columns) but rows came back with 12, 13 and 15
+    cells, so a value belonging to FINISH FRM. landed in DETAIL HEAD and every
+    cell after the gap moved with it. Keyed rows make an omitted cell a missing
+    key, which cannot displace anything.
+    """
+    headers = ["OPNG", "TYPE", "HEAD", "JAMB", "SILL", "FINISH FRM.", "REMARKS"]
+    payload = json.dumps({
+        "headers": headers,
+        # HEAD/JAMB/SILL blank on this row -- keys simply absent.
+        "rows": [{"OPNG": "100", "TYPE": "A", "FINISH FRM.": "MPR",
+                  "REMARKS": "2, 3, 11"}],
+    })
+
+    parsed_headers, rows, warnings = parse_table(payload)
+    assert parsed_headers == headers
+    cells = dict(zip(headers, rows[0]))
+
+    assert cells["FINISH FRM."] == "MPR", "value shifted out of its column"
+    assert cells["HEAD"] == "" and cells["JAMB"] == "" and cells["SILL"] == ""
+    assert cells["REMARKS"] == "2, 3, 11"
+    assert not warnings
+
+
+def test_ragged_positional_rows_are_flagged_not_silently_accepted():
+    """If a model still returns arrays, a short row means the cells after the
+    gap are shifted. That has to be reported -- it reads as valid output."""
+    payload = json.dumps({
+        "headers": ["A", "B", "C", "D"],
+        "rows": [["1", "2", "3", "4"], ["1", "2", "3"]],
+    })
+    _headers, rows, warnings = parse_table(payload)
+
+    assert len(rows) == 2
+    assert len(rows[1]) == 4, "short row should be padded to the header count"
+    assert any("shifted" in w for w in warnings), "raggedness was not reported"
+
+
+def test_cell_lookup_tolerates_key_whitespace_and_case():
+    payload = json.dumps({
+        "headers": ["Frame Mat'l"],
+        "rows": [{" FRAME MAT'L ": "HM KD"}],
+    })
+    _headers, rows, _ = parse_table(payload)
+    assert rows[0] == ["HM KD"]
+
+
 def test_tolerates_rows_keyed_by_header():
     payload = json.dumps({"headers": ["#", "FROM"],
                           "rows": [{"#": "1", "FROM": "HALL"}]})

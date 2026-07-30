@@ -158,7 +158,7 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
 
         for page in ai_pages:
             try:
-                rows, ai_warnings = await extract_with_vision(doc, page)
+                rows, ai_headers, ai_warnings = await extract_with_vision(doc, page)
             except AiUpstreamError:
                 raise
             except Exception as exc:  # noqa: BLE001 - a tier failure is a warning
@@ -176,6 +176,7 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
                     row_count=len(rows),
                     duration_ms=duration,
                     warnings=warnings,
+                    headers=ai_headers,
                     rows=rows,
                     page_scores=page_scores,
                 )

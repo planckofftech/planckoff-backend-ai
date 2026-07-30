@@ -96,16 +96,22 @@
     border-radius: 8px; background: var(--surface);
   }
   table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
-  th, td { padding: 9px 13px; text-align: left; white-space: nowrap; }
+  th, td {
+    padding: 7px 12px; text-align: left; white-space: nowrap;
+    border-right: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  }
+  th:last-child, td:last-child { border-right: 0; }
+  tbody tr:last-child td { border-bottom: 0; }
   thead th {
     background: var(--bg); color: var(--muted); font-size: 11px; font-weight: 650;
-    text-transform: uppercase; letter-spacing: .05em;
-    border-bottom: 1px solid var(--line); position: sticky; top: 0;
+    text-transform: uppercase; letter-spacing: .04em;
+    position: sticky; top: 0; z-index: 1;
+    border-bottom: 2px solid var(--line);
   }
-  tbody tr + tr td { border-top: 1px solid var(--line); }
+  tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg) 55%, transparent); }
   tbody tr:hover td { background: var(--bg); }
-  td.blank { color: var(--line); }
-  td.tag { font-weight: 600; }
+  td.blank { color: transparent; }
+  td.tag { font-weight: 650; }
 
   figure { margin: 0; }
   figure img {
@@ -318,11 +324,11 @@ function render(d, wall) {
         const v = r[key] || "";
         html += v
           ? '<td' + (key === "door_tag" ? ' class="tag"' : "") + ">" + esc(v) + "</td>"
-          : '<td class="blank">·</td>';
+          : '<td class="blank">.</td>';
       }
       for (const k of extras) {
         const v = (r.extra || {})[k] || "";
-        html += v ? "<td>" + esc(v) + "</td>" : '<td class="blank">·</td>';
+        html += v ? "<td>" + esc(v) + "</td>" : '<td class="blank">.</td>';
       }
       html += "</tr>";
     }

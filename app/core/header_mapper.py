@@ -67,13 +67,6 @@ def map_headers(headers: list[str],
     mapped: list[str | None] = [None] * len(headers)
     claimed: set[str] = set()
 
-    if overrides:
-        by_normalized = {normalize(k): v for k, v in overrides.items()}
-        for idx, text in enumerate(normalized):
-            field = by_normalized.get(text)
-            if field in CANONICAL_FIELDS and field not in claimed:
-                mapped[idx] = field
-                claimed.add(field)
 
     # Exact matches first, so an exact "FINISH" is not stolen by a prefix rule.
     for exact_pass in (True, False):
@@ -92,6 +85,19 @@ def map_headers(headers: list[str],
                     mapped[idx] = field
                     claimed.add(field)
                     break
+
+    # Overrides fill the gaps the alias table left -- they never displace it.
+    # Applied first, a suggestion like "FRAME TYPE -> frame_material" claims the
+    # field and locks out "FRAME MAT'L", which genuinely matches.
+    if overrides:
+        by_normalized = {normalize(k): v for k, v in overrides.items()}
+        for idx, text in enumerate(normalized):
+            if mapped[idx] is not None or not text:
+                continue
+            field = by_normalized.get(text)
+            if field in CANONICAL_FIELDS and field not in claimed:
+                mapped[idx] = field
+                claimed.add(field)
 
     unmapped = [headers[i] for i, f in enumerate(mapped) if f is None and headers[i]]
     return mapped, unmapped

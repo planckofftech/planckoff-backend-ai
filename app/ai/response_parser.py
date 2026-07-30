@@ -129,16 +129,41 @@ def parse_table(content: str) -> tuple[list[str], list[list[str]], list[str]]:
     headers = [str(h) for h in parsed.get("headers") or [] if h is not None]
     raw_rows = parsed.get("rows") or []
     rows: list[list[str]] = []
+    ragged = 0
     for row in raw_rows:
-        if isinstance(row, list):
-            rows.append(["" if c is None else str(c) for c in row])
-        elif isinstance(row, dict) and headers:
-            # Tolerate a model that keyed rows by header despite the instruction.
-            rows.append([str(row.get(h, "") or "") for h in headers])
+        if isinstance(row, dict) and headers:
+            # The requested shape. A missing key is a blank cell and cannot
+            # shift the cells after it.
+            rows.append([_cell(row, h) for h in headers])
+        elif isinstance(row, list):
+            # Positional fallback. Models drop blank cells rather than padding
+            # them, which silently shifts every value after the gap -- so a
+            # length mismatch has to be reported, not quietly accepted.
+            if headers and len(row) != len(headers):
+                ragged += 1
+            padded = ["" if c is None else str(c) for c in row]
+            padded += [""] * (len(headers) - len(padded))
+            rows.append(padded[:len(headers)] if headers else padded)
 
     if not headers:
         warnings.append("model returned no column headers")
+    if ragged:
+        warnings.append(
+            f"{ragged} of {len(rows)} rows did not have one cell per column; "
+            "values in those rows may be shifted"
+        )
     return headers, rows, warnings
+
+
+def _cell(row: dict, header: str) -> str:
+    """Look up a cell, tolerating case and whitespace drift in the key."""
+    if header in row:
+        return "" if row[header] is None else str(row[header]).strip()
+    wanted = header.strip().casefold()
+    for key, value in row.items():
+        if str(key).strip().casefold() == wanted:
+            return "" if value is None else str(value).strip()
+    return ""
 
 
 def parse_rows(content: str) -> tuple[list[dict], list[str]]:

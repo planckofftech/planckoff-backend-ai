@@ -39,13 +39,12 @@ _PROMPT = (
     "- Report the column headers exactly as printed, left to right.\n"
     "- Where headers are stacked (a group above a sub-heading), join them with "
     "a space, e.g. 'FRAME MATERIAL'.\n"
-    "- One array per row, in sheet order, with one cell per header. Pad short "
-    "rows with empty strings so every row has the same length as headers.\n"
+    "- Each row is an OBJECT whose keys are those exact header strings.\n"
+    "- Omit a key, or give it \"\", when that cell is blank on the sheet.\n"
     "- Copy values exactly as printed. Do not normalise, expand, or invent.\n"
-    "- Use an empty string for a cell that is blank on the sheet.\n"
     "- A row with no door number is still a row if it has other values.\n"
     "- If you cannot read a table, return empty arrays. Never guess.\n\n"
-    'Return JSON: {"headers": ["..."], "rows": [["..."]]}'
+    'Return JSON: {"headers": ["..."], "rows": [{"<header>": "<value>"}]}'
 )
 
 
@@ -68,7 +67,9 @@ def _upstream_reason(exc: Exception) -> str:
     return f"{hint} [{exc}]" if hint else str(exc)
 
 
-async def extract_with_vision(doc: PdfDoc, page: int) -> tuple[list[DoorRow], list[str]]:
+async def extract_with_vision(
+    doc: PdfDoc, page: int
+) -> tuple[list[DoorRow], list[str], list[str]]:
     """Render one page and ask the model. Returns (rows, warnings)."""
     settings = get_settings()
     warnings: list[str] = []
@@ -76,7 +77,7 @@ async def extract_with_vision(doc: PdfDoc, page: int) -> tuple[list[DoorRow], li
     try:
         client = get_client()
     except AiUnavailableError as exc:
-        return [], [f"AI fallback skipped: {exc}"]
+        return [], [], [f"AI fallback skipped: {exc}"]
 
     png = doc.render_png(page - 1, dpi=settings.ai_render_dpi)
     data_url = "data:image/png;base64," + base64.b64encode(png).decode()
@@ -110,11 +111,11 @@ async def extract_with_vision(doc: PdfDoc, page: int) -> tuple[list[DoorRow], li
                  usage.prompt_tokens, usage.completion_tokens)
 
     if not headers or not raw_rows:
-        return [], warnings
+        return [], headers, warnings
 
     rows, map_warnings = await rows_from_table(headers, raw_rows)
     warnings.extend(map_warnings)
-    return rows, warnings
+    return rows, headers, warnings
 
 
 async def rows_from_table(headers: list[str], raw_rows: list[list[str]]
