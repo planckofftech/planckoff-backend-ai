@@ -64,6 +64,9 @@ class PageScore(BaseModel):
     tag_x: float
     score: int
     passed: bool
+    item_count: int = Field(
+        0, description="Horizontal text spans found. Near zero means a scan."
+    )
 
 
 class ExtractionResult(BaseModel):

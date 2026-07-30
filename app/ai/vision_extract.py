@@ -34,6 +34,25 @@ _PROMPT = (
 )
 
 
+def _upstream_reason(exc: Exception) -> str:
+    """Turn a provider error into something the caller can act on.
+
+    "Error code: 401" tells an operator nothing; "the key was rejected, check
+    OPENROUTER_API_KEY" tells them exactly what to go and do.
+    """
+    status = getattr(exc, "status_code", None)
+    hints = {
+        401: "OpenRouter rejected the API key -- check OPENROUTER_API_KEY "
+             "(a deleted or revoked key reports 'User not found')",
+        402: "OpenRouter reports insufficient credit for this request",
+        403: "OpenRouter refused this model for this key",
+        404: "OpenRouter does not recognise the configured AI_MODEL",
+        429: "OpenRouter rate-limited this key; retry shortly",
+    }
+    hint = hints.get(status)
+    return f"{hint} [{exc}]" if hint else str(exc)
+
+
 async def extract_with_vision(doc: PdfDoc, page: int) -> tuple[list[DoorRow], list[str]]:
     """Render one page and ask the model. Returns (rows, warnings)."""
     settings = get_settings()
@@ -64,7 +83,7 @@ async def extract_with_vision(doc: PdfDoc, page: int) -> tuple[list[DoorRow], li
             }],
         )
     except Exception as exc:  # noqa: BLE001 - surface the upstream reason as-is
-        raise AiUpstreamError(str(exc)) from exc
+        raise AiUpstreamError(_upstream_reason(exc)) from exc
 
     content = response.choices[0].message.content or ""
     raw_rows, parse_warnings = parse_rows(content)

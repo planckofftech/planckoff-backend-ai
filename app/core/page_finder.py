@@ -46,6 +46,13 @@ class PageCandidate:
     tag_x: float
     score: int
     passed: bool
+    item_count: int = 0
+
+    @property
+    def has_text_layer(self) -> bool:
+        """False when there is too little text to recover any structure from --
+        a scanned sheet. Such a page is the AI tier's whole reason to exist."""
+        return self.item_count >= _MIN_ITEMS
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -72,7 +79,7 @@ def score_page(items: list[TextItem], page_number: int, *,
                min_header_hits: int = 5, min_tag_run: int = 8) -> PageCandidate:
     horizontal = [i for i in items if i.horizontal]
     if len(horizontal) < _MIN_ITEMS:
-        return PageCandidate(page_number, 0, 0.0, 0, 0.0, 0, False)
+        return PageCandidate(page_number, 0, 0.0, 0, 0.0, 0, False, len(horizontal))
 
     # --- 1. best header band -------------------------------------------------
     buckets: dict[int, list[TextItem]] = defaultdict(list)
@@ -103,7 +110,8 @@ def score_page(items: list[TextItem], page_number: int, *,
 
     passed = header_hits >= min_header_hits and tag_run >= min_tag_run
     score = header_hits * 2 + min(tag_run, 30)
-    return PageCandidate(page_number, header_hits, header_y, tag_run, tag_x, score, passed)
+    return PageCandidate(page_number, header_hits, header_y, tag_run, tag_x, score,
+                         passed, len(horizontal))
 
 
 def find_schedule_pages(doc: PdfDoc, *, min_header_hits: int = 5,

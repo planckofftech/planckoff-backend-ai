@@ -210,6 +210,14 @@ class PdfDoc:
         rect = fitz.Rect(*clip) if clip else None
         return page.get_pixmap(dpi=dpi, clip=rect).tobytes("png")
 
+    def has_raster(self, page_index: int) -> bool:
+        """Does this page carry a bitmap? A page with no text and an image on it
+        is a scan; one with neither is simply blank and not worth rendering."""
+        try:
+            return bool(self.doc[page_index].get_images(full=False))
+        except Exception:  # noqa: BLE001 - a broken xref must not be fatal
+            return False
+
     def page_size(self, page_index: int) -> tuple[float, float]:
         r = self.doc[page_index].rect
         return r.width, r.height

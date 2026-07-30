@@ -197,10 +197,22 @@ The second bid set exercises this: its `FRAME HEAD DETAIL`, `FRAME JAMB DETAIL`,
 
 ### 6. AI fallback — [`ai/vision_extract.py`](app/ai/vision_extract.py)
 
-Fires only when the deterministic tiers produce nothing. Renders the **candidate
-pages only** at 200 dpi and sends them to Gemini via OpenRouter at
-`temperature=0`. Never the whole document — if nothing was found and the document
-is large, the API returns a clear 422 instead.
+Fires only when the deterministic tiers produce nothing. Renders **at most two
+pages** at 200 dpi and sends them to Gemini via OpenRouter at `temperature=0`.
+Never the whole document.
+
+Pages are nominated when either:
+
+- **the page has no text layer but carries a bitmap** — a scan. Deliberately not
+  gated on document size: a scanned 100-page set is exactly the case that needs
+  the vision tier, and gating it on size refused those while letting a scanned
+  4-page one through.
+- the document is small (≤ 20 pages) and some page scored above zero.
+
+Candidates are ranked by score, so a scan that retains a thin text layer on the
+sheet that matters beats the first bitmap in the file.
+
+If nothing qualifies, the API returns a clear 422 rather than guessing.
 
 Response parsing survives markdown fences, a bare array instead of the expected
 envelope, and truncation at the token limit (complete objects are recovered from
@@ -244,11 +256,16 @@ All via `.env` — see [.env.example](.env.example). Keys are never in code.
 ## Tests
 
 ```bash
-pytest
+pytest            # correctness
+pytest -m perf    # the < 5 s budget, on a quiet machine
 ```
 
-37 tests. The golden-file test freezes all 23 rows of page 21 field-for-field —
-without it there is no way to tell an improvement from a regression.
+The golden-file test freezes all 23 rows of page 21 field-for-field — without it
+there is no way to tell an improvement from a regression.
+
+Wall-clock assertions are marked `perf` and deselected by default. Measuring
+elapsed time while the rest of the suite competes for CPU says nothing about the
+requirement, and a test that fails on a busy laptop trains you to ignore it.
 
 Tests needing the full bid sets skip when the files are absent; only the 1.7 MB
 single-page fixture is committed. `.gitignore` excludes `*.pdf` except

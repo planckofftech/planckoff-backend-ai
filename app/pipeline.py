@@ -22,6 +22,8 @@ log = logging.getLogger(__name__)
 # Below this page count it is cheap enough to let the AI look at the best-
 # scoring page even though no page passed the structural gates.
 _SMALL_DOC_PAGES = 20
+# Never render more than this many pages to the model, whatever the page count.
+_MAX_AI_PAGES = 2
 
 
 class NoScheduleFoundError(RuntimeError):
@@ -101,10 +103,31 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
         # be reported as one. `speculative` keeps the two apart so the error
         # message never claims a schedule was located when it was not.
         speculative = False
-        if not ai_pages and pages_scanned <= _SMALL_DOC_PAGES:
-            ranked = sorted(scores, key=lambda c: c.score, reverse=True)
-            ai_pages = [c.page for c in ranked[:1] if c.score > 0]
-            speculative = bool(ai_pages)
+        if not ai_pages:
+            # A scanned sheet has no text to score, so it can never pass the
+            # structural gates -- it is exactly what the vision tier is for.
+            # Size must not gate that: a scanned 100-page set would otherwise be
+            # refused outright while a scanned 4-page one goes through.
+            scanned = [c for c in scores
+                       if not c.has_text_layer and doc.has_raster(c.page - 1)]
+
+            shortlist = {c.page: c for c in scanned}
+            if scanned or pages_scanned <= _SMALL_DOC_PAGES:
+                # Keep any page that scored at all. A scan often retains a thin
+                # text layer on the sheet that matters, and that page is a far
+                # better bet than the first bitmap in the file.
+                shortlist.update({c.page: c for c in scores if c.score > 0})
+
+            ranked = sorted(shortlist.values(),
+                            key=lambda c: (-c.score, c.page))
+            ai_pages = [c.page for c in ranked[:_MAX_AI_PAGES]]
+            speculative = bool(ai_pages) and not scanned
+
+            if scanned and ai_pages:
+                warnings.append(
+                    f"{len(scanned)} page(s) have no text layer; "
+                    f"reading page(s) {ai_pages} as images"
+                )
 
         def _give_up() -> RuntimeError:
             if speculative or not candidates:

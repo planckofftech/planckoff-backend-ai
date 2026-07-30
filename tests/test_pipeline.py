@@ -67,7 +67,14 @@ async def test_full_bid_set_end_to_end(full_bid_set_bytes):
     assert result.source_pages == [21]
     assert result.row_count == 23
     assert result.method == ExtractionMethod.DETERMINISTIC_RULED
-    assert result.duration_ms < 5000
+
+
+@pytest.mark.perf
+@pytest.mark.asyncio
+async def test_full_bid_set_within_time_budget(full_bid_set_bytes):
+    """Deselected by default -- see test_scan_meets_the_five_second_budget."""
+    result = await extract(full_bid_set_bytes, allow_ai=False)
+    assert result.duration_ms < 5000, f"took {result.duration_ms} ms"
 
 
 @pytest.mark.asyncio
