@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.ai.client import AiUpstreamError
@@ -106,6 +107,7 @@ async def extract_door_schedule(
 async def master_sheet(
     file: UploadFile = File(...),
     allow_ai: bool = Query(True, description="Permit the vision fallback tier"),
+    preview: bool = Query(False, description="Return JSON rows instead of .xlsx"),
     _key: str = Depends(require_api_key),
 ) -> Response:
     """The master sheet with every extracted door as a row.
@@ -113,7 +115,7 @@ async def master_sheet(
     Columns no door schedule can answer are left empty rather than guessed --
     they belong to sources that have not been loaded yet.
     """
-    from app.core.master_sheet import build_workbook
+    from app.core.master_sheet import BANDS, COLUMNS, build_rows, build_workbook
 
     data = await _read_upload(file)
     try:
@@ -126,6 +128,21 @@ async def master_sheet(
     except AiUpstreamError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
                             detail=f"AI provider error: {exc}") from exc
+
+    if preview:
+        # Same builder as the spreadsheet, so the screen and the download can
+        # never disagree.
+        rows, stats = build_rows(result)
+        return JSONResponse({
+            "columns": COLUMNS,
+            "bands": {str(index): name for name, index in BANDS},
+            "rows": rows,
+            "row_count": stats.rows,
+            "filled_columns": stats.filled_columns,
+            "empty_columns": stats.empty_columns,
+            "method": result.method.value,
+            "source_pages": result.source_pages,
+        })
 
     xlsx, stats = build_workbook(result, source_name=file.filename or "")
     stem = Path(file.filename or "door-schedule").stem

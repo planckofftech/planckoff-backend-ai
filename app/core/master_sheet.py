@@ -138,6 +138,31 @@ def master_row(row: DoorRow) -> dict[str, str]:
     return out
 
 
+def build_rows(result: ExtractionResult) -> tuple[list[dict[str, str]],
+                                                  MasterSheetStats]:
+    """Every extracted door as master-sheet columns, plus what got filled.
+
+    Shared by the spreadsheet and the on-screen preview, so what you see is
+    exactly what downloads.
+    """
+    tables = result.tables or []
+    source = [r for t in tables for r in t.rows] if tables else list(result.rows)
+
+    rows: list[dict[str, str]] = []
+    filled: set[str] = set()
+    for row in source:
+        values = master_row(row)
+        filled.update(k for k, v in values.items() if v)
+        rows.append({name: values.get(name, "") for name in COLUMNS})
+
+    stats = MasterSheetStats(
+        rows=len(rows),
+        filled_columns=[c for c in COLUMNS if c in filled],
+        empty_columns=[c for c in COLUMNS if c not in filled],
+    )
+    return rows, stats
+
+
 def build_workbook(result: ExtractionResult, *, source_name: str = ""
                    ) -> tuple[bytes, MasterSheetStats]:
     """The master sheet as .xlsx, with every extracted door as a row."""
@@ -163,14 +188,8 @@ def build_workbook(result: ExtractionResult, *, source_name: str = ""
 
     ws.freeze_panes = "A3"
 
-    # Every schedule on the sheet, in the order they appear on the drawing.
-    tables = result.tables or []
-    rows = [r for t in tables for r in t.rows] if tables else list(result.rows)
-
-    filled: set[str] = set()
-    for offset, row in enumerate(rows):
-        values = master_row(row)
-        filled.update(k for k, v in values.items() if v)
+    rows, stats = build_rows(result)
+    for offset, values in enumerate(rows):
         for index, name in enumerate(COLUMNS, start=1):
             cell = ws.cell(3 + offset, index)
             cell.value = values.get(name, "")
@@ -182,11 +201,5 @@ def build_workbook(result: ExtractionResult, *, source_name: str = ""
     buffer = io.BytesIO()
     wb.save(buffer)
     wb.close()
-
-    stats = MasterSheetStats(
-        rows=len(rows),
-        filled_columns=[c for c in COLUMNS if c in filled],
-        empty_columns=[c for c in COLUMNS if c not in filled],
-    )
     _ = source_name
     return buffer.getvalue(), stats

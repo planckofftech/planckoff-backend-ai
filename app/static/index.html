@@ -117,6 +117,8 @@
   tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg) 55%, transparent); }
   tbody tr:hover td { background: var(--bg); }
   td.blank { color: transparent; }
+  /* A column no source has answered -- visibly waiting, not visibly wrong. */
+  th.unfilled { color: var(--line); font-style: italic; }
   td.tag { font-weight: 650; }
 
   /* Table and drawing are two views of the same result -- one at a time, so
@@ -190,6 +192,7 @@
 
   <div id="result"></div>
   <div id="pagepreview"></div>
+  <div id="mastersheet"></div>
 
   <details class="tech" id="tech" style="display:none">
     <summary>Technical details</summary>
@@ -234,28 +237,32 @@ const esc = s => String(s).replace(/[&<>"]/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 let previewUrl = null;
+let masterData = null;
 
 function clearOutput() {
   $("msg").innerHTML = "";
   $("result").innerHTML = "";
   $("pagepreview").innerHTML = "";
+  $("mastersheet").innerHTML = "";
   $("tech").style.display = "none";
   $("csv").style.display = "none";
   if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+  masterData = null;
   showView("table");
 }
 
-// The two views share the space rather than splitting it -- a 21-column table
-// and a full drawing sheet both need the whole width.
+// The views share the space rather than splitting it -- a 41-column sheet, a
+// 21-column table and a full drawing all need the whole width.
 function showView(name) {
-  const drawing = name === "drawing";
-  $("result").style.display = drawing ? "none" : "";
-  $("pagepreview").style.display = drawing ? "" : "none";
-  $("preview").textContent = drawing ? "Show table" : "Show page";
+  $("result").style.display = name === "table" ? "" : "none";
+  $("pagepreview").style.display = name === "drawing" ? "" : "none";
+  $("mastersheet").style.display = name === "master" ? "" : "none";
+  $("preview").textContent = name === "drawing" ? "Show table" : "Show page";
+  $("master").textContent = name === "master" ? "Show table" : "Master sheet";
 }
 
 function busy(button, on, text) {
-  button.disabled = on;
+  if (button) button.disabled = on;
   $("preview").disabled = on;
   $("master").disabled = on;
   $("go").disabled = on;
@@ -516,6 +523,10 @@ $("preview").addEventListener("click", async () => {
 });
 
 $("master").addEventListener("click", async () => {
+  if (masterData) {
+    showView($("mastersheet").style.display === "none" ? "master" : "table");
+    return;
+  }
   const f = $("file").files[0];
   if (!f) { fail("Choose a PDF first."); return; }
 
@@ -524,36 +535,94 @@ $("master").addEventListener("click", async () => {
   body.append("file", f);
 
   try {
-    const res = await fetch(base() + "/api/v1/door-schedule/master-sheet?allow_ai=" +
-      ($("allowAi").checked ? "true" : "false"), {
+    const res = await fetch(base() + "/api/v1/door-schedule/master-sheet?preview=true" +
+      "&allow_ai=" + ($("allowAi").checked ? "true" : "false"), {
       method: "POST", headers: { "X-API-Key": $("key").value }, body
     });
+    const data = await res.json().catch(() => null);
     if (!res.ok) {
-      let detail = res.statusText;
-      try { detail = (await res.json()).detail; } catch (e) { /* not JSON */ }
-      fail(detail, res.status);
+      fail((data && data.detail) || res.statusText, res.status);
       return;
     }
-    const empty = res.headers.get("X-Empty-Columns") || "";
-    const url = URL.createObjectURL(await res.blob());
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = f.name.replace(/\.pdf$/i, "") + " - master.xlsx";
-    a.click();
-    URL.revokeObjectURL(url);
-
-    if (empty) {
-      $("msg").innerHTML = '<div class="msg warn"><strong>Master sheet downloaded — ' +
-        res.headers.get("X-Filled-Columns") + " of 41 columns filled.</strong> " +
-        "A door schedule cannot answer the rest; they wait on other sources: " +
-        esc(empty) + ".</div>";
-    }
+    masterData = data;
+    renderMaster(data);
+    showView("master");
   } catch (err) {
     fail("Could not reach the service. " + err.message);
   } finally {
     busy($("master"), false);
   }
 });
+
+function renderMaster(d) {
+  const filled = new Set(d.filled_columns);
+  const showAll = $("mastersheet").dataset.showAll === "1";
+  const cols = showAll ? d.columns : d.columns.filter(c => filled.has(c));
+
+  let html = '<div class="headline"><span class="count">' + d.row_count +
+    (d.row_count === 1 ? " row" : " rows") + "</span>" +
+    '<span class="badge">' + d.filled_columns.length + " of " + d.columns.length +
+    " columns filled</span></div>";
+  html += '<p class="sub">Master door format sheet. Blank means no source has ' +
+    "answered that column yet — a door schedule cannot fill them all.</p>";
+
+  html += '<div class="actions" style="margin:0 0 16px">' +
+    '<button id="masterdl">Download .xlsx</button>' +
+    '<label class="toggle"><input type="checkbox" id="masterall"' +
+    (showAll ? " checked" : "") + "> Show all " + d.columns.length +
+    " columns</label></div>";
+
+  html += '<div class="tablewrap"><table><thead><tr>';
+  for (const c of cols) {
+    html += "<th" + (filled.has(c) ? "" : ' class="unfilled"') + ">" + esc(c) + "</th>";
+  }
+  html += "</tr></thead><tbody>";
+  for (const r of d.rows) {
+    html += "<tr>";
+    for (const c of cols) {
+      const v = r[c] || "";
+      html += v ? "<td>" + esc(v) + "</td>" : '<td class="blank">.</td>';
+    }
+    html += "</tr>";
+  }
+  html += "</tbody></table></div>";
+
+  if (d.empty_columns.length) {
+    html += '<p class="sub" style="margin-top:12px"><strong>Waiting on other ' +
+      "sources (" + d.empty_columns.length + "):</strong> " +
+      esc(d.empty_columns.join(", ")) + ".</p>";
+  }
+
+  $("mastersheet").innerHTML = html;
+  $("masterdl").addEventListener("click", downloadMaster);
+  $("masterall").addEventListener("change", e => {
+    $("mastersheet").dataset.showAll = e.target.checked ? "1" : "0";
+    renderMaster(masterData);
+  });
+}
+
+async function downloadMaster() {
+  const f = $("file").files[0];
+  if (!f) return;
+  busy($("masterdl"), true, "Building the spreadsheet…");
+  const body = new FormData();
+  body.append("file", f);
+  try {
+    const res = await fetch(base() + "/api/v1/door-schedule/master-sheet?allow_ai=" +
+      ($("allowAi").checked ? "true" : "false"), {
+      method: "POST", headers: { "X-API-Key": $("key").value }, body
+    });
+    if (!res.ok) { fail("Download failed.", res.status); return; }
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = f.name.replace(/\.pdf$/i, "") + " - master.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+  } finally {
+    busy($("masterdl"), false);
+  }
+}
 
 $("csv").addEventListener("click", () => {
   if (!lastResult) return;
