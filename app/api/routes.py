@@ -2,6 +2,7 @@
 
 import logging
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 
@@ -92,6 +93,57 @@ async def extract_door_schedule(
         int((time.perf_counter() - started) * 1000),
     )
     return result
+
+
+@router.post(
+    "/api/v1/door-schedule/master-sheet",
+    tags=["extraction"],
+    summary="Extract, then return the filled master door format sheet (.xlsx)",
+    response_class=Response,
+    responses={200: {"content": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}}}},
+)
+async def master_sheet(
+    file: UploadFile = File(...),
+    allow_ai: bool = Query(True, description="Permit the vision fallback tier"),
+    _key: str = Depends(require_api_key),
+) -> Response:
+    """The master sheet with every extracted door as a row.
+
+    Columns no door schedule can answer are left empty rather than guessed --
+    they belong to sources that have not been loaded yet.
+    """
+    from app.core.master_sheet import build_workbook
+
+    data = await _read_upload(file)
+    try:
+        result = await extract(data, allow_ai=allow_ai)
+    except NotAPdfError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="File is not a readable PDF.") from exc
+    except (NoScheduleFoundError, NoRowsError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AiUpstreamError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=f"AI provider error: {exc}") from exc
+
+    xlsx, stats = build_workbook(result, source_name=file.filename or "")
+    stem = Path(file.filename or "door-schedule").stem
+    log.info("master_sheet file=%s rows=%s filled=%s of %s",
+             file.filename, stats.rows, len(stats.filled_columns),
+             len(stats.filled_columns) + len(stats.empty_columns))
+
+    return Response(
+        content=xlsx,
+        media_type=("application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet"),
+        headers={
+            "Content-Disposition": f'attachment; filename="{stem} - master.xlsx"',
+            "X-Row-Count": str(stats.rows),
+            "X-Filled-Columns": str(len(stats.filled_columns)),
+            "X-Empty-Columns": ", ".join(stats.empty_columns),
+        },
+    )
 
 
 @router.post(

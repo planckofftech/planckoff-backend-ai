@@ -175,6 +175,7 @@
     <div class="actions">
       <button id="go">Extract schedule</button>
       <button id="preview" class="ghost">Show page</button>
+      <button id="master" class="ghost">Master sheet</button>
       <button id="csv" class="ghost" style="display:none">Download CSV</button>
       <span class="working" id="working"></span>
       <span style="flex:1"></span>
@@ -256,6 +257,7 @@ function showView(name) {
 function busy(button, on, text) {
   button.disabled = on;
   $("preview").disabled = on;
+  $("master").disabled = on;
   $("go").disabled = on;
   $("working").innerHTML = on ? '<span class="spinner"></span>' + esc(text) : "";
 }
@@ -510,6 +512,46 @@ $("preview").addEventListener("click", async () => {
     fail("Could not reach the service. " + err.message);
   } finally {
     busy($("preview"), false);
+  }
+});
+
+$("master").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) { fail("Choose a PDF first."); return; }
+
+  busy($("master"), true, "Building the master sheet…");
+  const body = new FormData();
+  body.append("file", f);
+
+  try {
+    const res = await fetch(base() + "/api/v1/door-schedule/master-sheet?allow_ai=" +
+      ($("allowAi").checked ? "true" : "false"), {
+      method: "POST", headers: { "X-API-Key": $("key").value }, body
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail; } catch (e) { /* not JSON */ }
+      fail(detail, res.status);
+      return;
+    }
+    const empty = res.headers.get("X-Empty-Columns") || "";
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = f.name.replace(/\.pdf$/i, "") + " - master.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+
+    if (empty) {
+      $("msg").innerHTML = '<div class="msg warn"><strong>Master sheet downloaded — ' +
+        res.headers.get("X-Filled-Columns") + " of 41 columns filled.</strong> " +
+        "A door schedule cannot answer the rest; they wait on other sources: " +
+        esc(empty) + ".</div>";
+    }
+  } catch (err) {
+    fail("Could not reach the service. " + err.message);
+  } finally {
+    busy($("master"), false);
   }
 });
 

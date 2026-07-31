@@ -66,3 +66,11 @@ def no_schedule_pdf() -> bytes:
     data = doc.tobytes()
     doc.close()
     return data
+
+
+@pytest.fixture
+def multi_schedule_bytes() -> bytes:
+    path = Path(__file__).parent.parent / "DOOR SCHEDULE.pdf"
+    if not path.exists():
+        pytest.skip(f"{path.name} not present")
+    return path.read_bytes()

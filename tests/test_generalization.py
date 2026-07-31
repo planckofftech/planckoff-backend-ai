@@ -1,4 +1,4 @@
-"""A second bid set, from a different firm, with a different column layout.
+﻿"""A second bid set, from a different firm, with a different column layout.
 
 Every threshold in the page finder was fitted to the Ellis County set. This is
 the test that distinguishes "tuned on one sample" from "actually works".
@@ -47,16 +47,6 @@ async def test_different_column_layout_still_maps(gracem_bytes):
     # Columns this firm has and Ellis does not are kept, not dropped.
     assert first.extra["frame_head_detail"] == "1/A.403"
     assert first.extra["door_glazing"] == "A"
-
-
-MULTI = Path(__file__).parent.parent / "DOOR SCHEDULE.pdf"
-
-
-@pytest.fixture
-def multi_schedule_bytes() -> bytes:
-    if not MULTI.exists():
-        pytest.skip(f"{MULTI.name} not present")
-    return MULTI.read_bytes()
 
 
 @pytest.mark.asyncio
@@ -147,3 +137,4 @@ async def test_alphanumeric_door_tags_survive(gracem_bytes):
     tags = [r.door_tag for r in result.rows]
     assert "101A" in tags and "129B" in tags
     assert all(t for t in tags), "no row should lose its tag"
+
