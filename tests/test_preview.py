@@ -64,6 +64,26 @@ def test_preview_box_excludes_the_neighbouring_tables(ellis_p21_bytes):
     assert grid.right < 2340, "outline reaches into the title block"
 
 
+def test_outline_includes_the_tables_own_title_row(ellis_p21_bytes):
+    """A schedule's caption sits inside the same outer rule as the columns it
+    names, so it is part of the table -- an outline that starts at the column
+    headings cuts the title off. It also supplies the label: whatever this sheet
+    calls its schedule beats anything hard-coded."""
+    from app.core.preview import _title_band
+    from app.core.table_locator import locate_table
+
+    with PdfDoc(ellis_p21_bytes) as doc:
+        candidate = page_finder.passing(page_finder.find_schedule_pages(doc))[0]
+        rulings = doc.rulings(0)
+        grid, _ = locate_table(doc.text_items(0), rulings,
+                               candidate.header_y, candidate.tag_x)
+        title_top, title = _title_band(grid, doc, 0, rulings)
+
+    assert title == "Door Schedule"
+    assert title_top is not None
+    assert title_top < grid.header_top, "title must sit above the column headings"
+
+
 def test_preview_endpoint_returns_png(ellis_p21_bytes):
     from fastapi.testclient import TestClient
 
