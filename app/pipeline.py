@@ -110,23 +110,38 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
         if best is not None and best.rows:
             # Columns the alias table could not place. No firm names them the
             # same way, so resolve the leftovers instead of shipping them as
-            # extras -- headers only, never the table.
-            if (len(best.unmapped) >= _AI_HEADER_THRESHOLD and allow_ai
-                    and settings.ai_enabled and best.candidate is not None):
+            # extras -- headers only, never the table. Pooled across every
+            # schedule on the sheet: they share a vocabulary, so one call
+            # answers for all of them, and resolving only the largest left the
+            # rest with the same columns filed under `extra`.
+            leftovers: list[str] = []
+            for extraction in found:
+                for header in extraction.unmapped:
+                    if header not in leftovers:
+                        leftovers.append(header)
+
+            if (len(leftovers) >= _AI_HEADER_THRESHOLD and allow_ai
+                    and settings.ai_enabled):
                 from app.ai.header_map import resolve_headers
 
-                overrides, hint_warnings = await resolve_headers(best.unmapped)
+                overrides, hint_warnings = await resolve_headers(leftovers)
                 warnings.extend(hint_warnings)
                 if overrides:
-                    retried = extract_page(doc, best.candidate, overrides)
-                    if retried.rows:
-                        found = [retried if e is best else e for e in found]
-                        best = retried
+                    refreshed = []
+                    for extraction in found:
+                        if extraction.unmapped and extraction.candidate is not None:
+                            retried = extract_page(doc, extraction.candidate,
+                                                   overrides)
+                            refreshed.append(retried if retried.rows else extraction)
+                        else:
+                            refreshed.append(extraction)
+                    found = refreshed
+                    best = max(found, key=lambda e: len(e.rows))
             warnings.extend(best.warnings)
 
             tables = [
                 ScheduleTable(title=e.title, page=e.page, headers=e.headers,
-                              row_count=len(e.rows), rows=e.rows)
+                              field_map=e.mapped, row_count=len(e.rows), rows=e.rows)
                 for e in sorted(found, key=lambda e: (e.page, -len(e.rows)))
             ]
             if len(tables) > 1:

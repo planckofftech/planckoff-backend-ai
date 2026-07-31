@@ -76,6 +76,11 @@ class ScheduleTable(BaseModel):
     title: str = Field("", description="Caption as printed above the table")
     page: int
     headers: list[str] = Field(default_factory=list)
+    field_map: list[str | None] = Field(
+        default_factory=list,
+        description="Canonical field per column, aligned to `headers`; null "
+        "where the column had no equivalent and went to `extra`.",
+    )
     row_count: int = 0
     rows: list[DoorRow] = Field(default_factory=list)
 

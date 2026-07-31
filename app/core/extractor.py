@@ -26,6 +26,8 @@ class PageExtraction:
     unmapped: list[str] = field(default_factory=list)
     candidate: PageCandidate | None = None
     title: str = ""
+    # Canonical field per column, aligned to `headers`; None where unmapped.
+    mapped: list[str | None] = field(default_factory=list)
 
 
 def _is_noise(cells: list[str], tag_col: int) -> bool:
@@ -89,7 +91,7 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         rows.append(DoorRow(**values, extra=extra))
 
     return PageExtraction(candidate.page, method, header_strings, rows, warnings,
-                          unmapped, candidate, title)
+                          unmapped, candidate, title, mapped)
 
 
 def _looks_like_header(cells: list[str], header_strings: list[str]) -> bool:

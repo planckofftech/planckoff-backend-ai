@@ -358,6 +358,7 @@ function render(d, wall) {
 
 function tableHtml(t) {
   const cols = columnsFor(t);
+  if (!cols.length) return "";
   let html = '<div class="tablewrap"><table><thead><tr>';
   for (const c of cols) html += "<th>" + esc(c.label) + "</th>";
   html += "</tr></thead><tbody>";
@@ -374,8 +375,8 @@ function tableHtml(t) {
   }
   html += "</tbody></table></div>";
 
-  const hidden = FIELDS.filter(([k]) => !t.rows.some(r => r[k]))
-    .map(([, label]) => label);
+  const shown = new Set(cols.map(c => c.key));
+  const hidden = FIELDS.filter(([k]) => !shown.has(k)).map(([, label]) => label);
   if (hidden.length) {
     html += '<p class="sub" style="margin:8px 0 22px">Not on this schedule: ' +
       esc(hidden.join(", ")) + ".</p>";
@@ -387,38 +388,49 @@ function tableHtml(t) {
 const slug = h => String(h).toLowerCase()
   .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 
-function columnsFor(t) {
-  // Only columns this schedule actually carries. One with no FROM/TO should
-  // not lead with two columns of dots while the room name sits out past
-  // COMMENTS.
-  const d = t;
-  const cols = FIELDS
-    .filter(([key]) => d.rows.some(r => r[key]))
-    .map(([key, label]) => ({ key, label, get: r => r[key] || "" }));
+const LABELS = new Map(FIELDS);
+const nice = k => k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
 
-  const extras = [];
-  for (const r of d.rows) {
+function columnsFor(t) {
+  const cols = [];
+  const used = new Set();
+
+  // Follow the drawing's own left-to-right order. Rendering canonical fields
+  // in our fixed order put TYPE third on a sheet that prints it first, so the
+  // table on screen did not match the table on the paper.
+  (t.headers || []).forEach((header, i) => {
+    const field = (t.field_map || [])[i] || null;
+    if (field) {
+      used.add(field);
+      cols.push({ key: field, label: LABELS.get(field) || nice(field),
+                  get: r => r[field] || "" });
+    } else {
+      const k = slug(header);
+      if (!k || used.has("x:" + k)) return;
+      used.add("x:" + k);
+      cols.push({ key: k, label: header || nice(k),
+                  get: r => (r.extra || {})[k] || "" });
+    }
+  });
+
+  // Anything the rows carry that the header list did not describe.
+  for (const [key, label] of FIELDS) {
+    if (!used.has(key) && t.rows.some(r => r[key])) {
+      cols.push({ key, label, get: r => r[key] || "" });
+    }
+  }
+  for (const r of t.rows) {
     for (const k of Object.keys(r.extra || {})) {
-      if (!extras.includes(k)) extras.push(k);
+      if (!used.has("x:" + k)) {
+        used.add("x:" + k);
+        cols.push({ key: k, label: nice(k), get: r => (r.extra || {})[k] || "" });
+      }
     }
   }
 
-  // Sheet order, not discovery order -- a column that is blank on the first
-  // rows would otherwise jump to the end, far from where it sits on the paper.
-  const position = new Map();
-  (d.headers || []).forEach((h, i) => {
-    const s = slug(h);
-    if (!position.has(s)) position.set(s, i);
-  });
-  extras.sort((a, b) =>
-    (position.has(a) ? position.get(a) : 1e6) -
-    (position.has(b) ? position.get(b) : 1e6));
-
-  const nice = k => k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-  for (const k of extras) {
-    cols.push({ key: k, label: nice(k), get: r => (r.extra || {})[k] || "" });
-  }
-  return cols;
+  // Only columns this schedule actually carries -- a schedule with no FROM/TO
+  // should not lead with two columns of dots.
+  return cols.filter(c => t.rows.some(r => c.get(r)));
 }
 
 function renderTech(d, wall) {

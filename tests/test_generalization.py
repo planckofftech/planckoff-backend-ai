@@ -88,6 +88,21 @@ async def test_every_schedule_on_the_sheet_is_returned(multi_schedule_bytes):
 
 
 @pytest.mark.asyncio
+async def test_field_map_follows_the_sheets_own_column_order(multi_schedule_bytes):
+    """`field_map` aligns to `headers`, so a caller can render the table in the
+    order the drawing prints it. Rendering canonical fields in our own fixed
+    order put TYPE third on a sheet that prints it first."""
+    result = await extract(multi_schedule_bytes, allow_ai=False)
+    table = result.tables[0]
+
+    assert len(table.field_map) == len(table.headers)
+    assert table.headers[0] == "TYPE"
+    assert table.field_map[0] == "door_type"
+    # A column with no canonical equivalent is null, not silently shifted.
+    assert table.field_map[table.headers.index("DOOR THICKNESS")] is None
+
+
+@pytest.mark.asyncio
 async def test_single_schedule_sheets_report_one_table(ellis_p21_bytes):
     result = await extract(ellis_p21_bytes, allow_ai=False)
     assert len(result.tables) == 1
