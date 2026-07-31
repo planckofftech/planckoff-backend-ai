@@ -51,6 +51,30 @@ def test_duplicate_header_does_not_overwrite_the_first():
     assert unmapped == ["Finish"]
 
 
+def test_grouped_headers_disambiguate_repeated_sub_headings():
+    """Sheets that group columns under PANEL and FRAME print "MAT'L" twice.
+    Once the group heading is pushed down onto its columns, the two are
+    distinguishable; without it, the second MAT'L is an unmappable duplicate and
+    frame_material comes back empty."""
+    headers = ["NO.", "LOCATION", "TYPE", "PANEL MAT'L", "PANEL WIDTH",
+               "PANEL HEIGHT", "PANEL THK", "FRAME MAT'L", "FRAME TYPE",
+               "FRAME GAUGE", "FRAME WIDTH", "FIRE RATING", "HW SET", "NOTES"]
+    mapped, _ = map_headers(headers)
+    by_field = {f: headers[i] for i, f in enumerate(mapped) if f}
+
+    assert by_field["door_material"] == "PANEL MAT'L"
+    assert by_field["frame_material"] == "FRAME MAT'L"
+    assert by_field["door_width"] == "PANEL WIDTH"
+    assert by_field["door_height"] == "PANEL HEIGHT"
+    assert by_field["hw_set"] == "HW SET"
+    assert by_field["comments"] == "NOTES"
+
+    # A frame's width and type must not be mistaken for the door's.
+    assert mapped[headers.index("FRAME WIDTH")] is None
+    assert mapped[headers.index("FRAME TYPE")] is None
+    assert mapped[headers.index("PANEL THK")] is None
+
+
 def test_overrides_fill_gaps_but_never_displace_the_alias_table():
     """Applied first, an override like "FRAME TYPE -> frame_material" claims the
     field and locks out "FRAME MAT'L", which genuinely matches. On a real sheet

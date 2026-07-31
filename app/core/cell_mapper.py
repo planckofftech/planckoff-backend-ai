@@ -7,8 +7,13 @@ nearest-anchor mapping files every comment under "HW".
 
 from __future__ import annotations
 
-from app.core.pdf_doc import TextItem
-from app.core.table_locator import TableGrid
+from app.core.pdf_doc import Rulings, TextItem
+from app.core.table_locator import (
+    _MERGE_TOL,
+    TableGrid,
+    _coverage,
+    _group_by_pos,
+)
 
 
 def _join(parts: list[tuple[float, float, str]]) -> str:
@@ -17,12 +22,45 @@ def _join(parts: list[tuple[float, float, str]]) -> str:
     return " ".join(p[2] for p in parts).strip()
 
 
-def header_texts(grid: TableGrid, headers: list[TextItem],
-                 items: list[TextItem]) -> list[str]:
+def _spanned_columns(grid: TableGrid, vertical_groups, item: TextItem) -> list[int]:
+    """Which columns this header cell covers, per the rulings at its own height.
+
+    A group heading spans several columns, and the rulings say so: the sub-column
+    rules simply do not extend up into the group row. Without this, a heading is
+    filed under whichever column its left edge happens to land in -- producing
+    "PANEL WIDTH" and "FRAME TYPE" while the sibling columns stay bare "MAT'L",
+    indistinguishable from each other.
+    """
+    height = max(item.y1 - item.y0, 1.0)
+    crossing = [
+        pos for pos, segs in vertical_groups
+        if _coverage(segs, item.y0, item.y1) >= height * 0.6
+    ]
+    left = max((x for x in crossing if x <= item.x0 + 1), default=None)
+    right = min((x for x in crossing if x >= item.x1 - 1), default=None)
+    if left is None or right is None:
+        col = grid.column_of(item.x0)
+        return [] if col is None else [col]
+
+    cols = [
+        k for k in range(grid.n_cols)
+        if grid.col_bounds[k] >= left - 1 and grid.col_bounds[k + 1] <= right + 1
+    ]
+    if cols:
+        return cols
+    col = grid.column_of(item.x0)
+    return [] if col is None else [col]
+
+
+def header_texts(grid: TableGrid, headers: list[TextItem], items: list[TextItem],
+                 rulings: Rulings | None = None) -> list[str]:
     """One header string per column.
 
     Multi-line headers are stitched: "Frame" above "Finish" is one column named
-    "Frame Finish", and it must not be read as a second bare "Finish".
+    "Frame Finish", and it must not be read as a second bare "Finish". Grouped
+    headers are pushed down onto every column of their group, so a sheet with
+    PANEL and FRAME groups yields "PANEL MAT'L" and "FRAME MAT'L" rather than
+    two identical "MAT'L" columns.
     """
     if grid.mode == "ruled":
         band = [
@@ -34,12 +72,21 @@ def header_texts(grid: TableGrid, headers: list[TextItem],
         top = min(h.y0 for h in headers) - span * 1.8
         band = [i for i in items if i.horizontal and top <= i.cy <= grid.header_bottom + 0.5]
 
+    vertical_groups = (
+        _group_by_pos(rulings.vertical, _MERGE_TOL)
+        if rulings is not None and grid.mode == "ruled" else None
+    )
+
     buckets: list[list[tuple[float, float, str]]] = [[] for _ in range(grid.n_cols)]
     for item in band:
-        col = grid.column_of(item.x0)
-        if col is None:
-            col = grid.column_of(item.cx)
-        if col is not None:
+        if vertical_groups is not None:
+            columns = _spanned_columns(grid, vertical_groups, item)
+        else:
+            col = grid.column_of(item.x0)
+            if col is None:
+                col = grid.column_of(item.cx)
+            columns = [] if col is None else [col]
+        for col in columns:
             buckets[col].append((item.y0, item.x0, item.text))
     return [_join(b) for b in buckets]
 

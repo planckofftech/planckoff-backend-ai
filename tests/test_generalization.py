@@ -49,6 +49,36 @@ async def test_different_column_layout_still_maps(gracem_bytes):
     assert first.extra["door_glazing"] == "A"
 
 
+ROTATED = Path(__file__).parent.parent / "door schdule.pdf"
+
+
+@pytest.fixture
+def rotated_bytes() -> bytes:
+    if not ROTATED.exists():
+        pytest.skip(f"{ROTATED.name} not present")
+    return ROTATED.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_grouped_headers_are_qualified_by_their_group(rotated_bytes):
+    """A /Rotate 90 sheet grouping columns under PANEL and FRAME. Both groups
+    contain a MAT'L; without the group heading the second is a duplicate and
+    frame_material comes back empty on all 128 rows."""
+    result = await extract(rotated_bytes, allow_ai=False)
+
+    assert result.row_count == 128
+    assert "PANEL MAT'L" in result.headers
+    assert "FRAME MAT'L" in result.headers
+
+    first = result.rows[0]
+    assert first.door_material == "HM"
+    assert first.frame_material == "HM", "frame material lost to a duplicate header"
+    assert first.door_width == "3' - 0\""
+    # The frame's own width and thickness must not displace the door's fields.
+    assert first.extra["frame_width"] == '2"'
+    assert first.extra["panel_thk"] == '1 3/4"'
+
+
 @pytest.mark.asyncio
 async def test_alphanumeric_door_tags_survive(gracem_bytes):
     result = await extract(gracem_bytes, allow_ai=False)

@@ -42,7 +42,7 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate) -> PageExtraction:
     grid, headers = locate_table(items, rulings, candidate.header_y, candidate.tag_x)
     warnings = list(grid.warnings)
 
-    header_strings = cell_mapper.header_texts(grid, headers, items)
+    header_strings = cell_mapper.header_texts(grid, headers, items, rulings)
     mapped, unmapped = header_mapper.map_headers(header_strings)
     tag_col = header_mapper.tag_column_index(mapped)
 
