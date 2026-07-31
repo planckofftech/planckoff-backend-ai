@@ -18,6 +18,7 @@ Two strategies, tried in order:
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 
 from app.core.pdf_doc import Rulings, Segment, TextItem
@@ -26,8 +27,11 @@ from app.core.pdf_doc import Rulings, Segment, TextItem
 _MERGE_TOL = 4.0
 # A horizontal ruling must cover this fraction of the table width to be a row line.
 _ROW_LINE_COVERAGE = 0.70
-# A vertical ruling must cover this fraction of the header band to be a column line.
-_COL_LINE_COVERAGE = 0.80
+# A vertical ruling must cover this fraction of the header band to be a column
+# line. Header text often overflows its ruled cell, so demanding most of the
+# text's height rejects real grids: on one sheet the column rules covered 5.9 of
+# an 11.1 pt header and every one of them was discarded.
+_COL_LINE_COVERAGE = 0.45
 # Header cells sit within this many pt of the detected header baseline.
 _HEADER_BAND = 6.0
 # Consecutive header cells further apart than this belong to different tables.
@@ -117,6 +121,37 @@ def _coverage(segments: list[Segment], lo: float, hi: float) -> float:
     return total
 
 
+def _row_rule_right_edge(horizontal: list[Segment], left: float,
+                         header_bottom: float) -> float | None:
+    """Where the table's own row rules stop, to the right.
+
+    Rules that begin at the table's left edge and run under the header are the
+    data rows. Their common right end is the table's edge -- an adjacent notes
+    block sharing the header's y sits beyond it.
+    """
+    ends: Counter[int] = Counter()
+    for pos, segs in _group_by_pos(horizontal, _MERGE_TOL):
+        if pos <= header_bottom - _MERGE_TOL:
+            continue
+        # How far this rule runs from the table's left edge without a break.
+        # Rows are often drawn as one segment per cell, so the raw segment ends
+        # are cell widths -- following the chain is what gives the table's.
+        reach = left
+        for start, end in sorted((s.start, s.end) for s in segs):
+            if start > reach + _MERGE_TOL:
+                break
+            reach = max(reach, end)
+        if reach > left + 50:
+            ends[int(round(reach))] += 1
+
+    if not ends:
+        return None
+    # The most repeated reach wins; a stray full-width sheet rule cannot
+    # outvote the dozens of rules that bound the actual rows.
+    edge, count = ends.most_common(1)[0]
+    return float(edge) if count >= 3 else None
+
+
 def _dedupe(values: list[float], tol: float) -> list[float]:
     out: list[float] = []
     for v in sorted(values):
@@ -185,20 +220,38 @@ def _ruled_grid(headers: list[TextItem], rulings: Rulings) -> TableGrid | None:
     if left is None or right is None or right - left < 100:
         return None
 
+    # The header run can reach past the table into a neighbouring block of
+    # notes that happens to share its y. The row rules cannot: they stop at the
+    # table's edge. Take whichever edge is nearer.
+    row_edge = _row_rule_right_edge(rulings.horizontal, left, hdr_y1)
+    if row_edge is not None:
+        snapped = max((x for x in crossing if x <= row_edge + _MERGE_TOL),
+                      default=None)
+        if snapped is not None and snapped - left >= 100:
+            right = min(right, snapped)
+
     col_bounds = _dedupe([x for x in crossing if left <= x <= right], _MERGE_TOL)
     if len(col_bounds) < 4:
         return None
 
     grid = TableGrid("ruled", left, right, hdr_y0, hdr_y1, col_bounds)
 
-    # Every header must land in its own column, or this is not our grid.
+    # Header cells beyond the ruled bounds belong to whatever sits next to the
+    # table -- a notes block sharing the header's y. Drop them rather than
+    # rejecting the grid, which would fall back to guessing columns and pull
+    # the notes in as data.
+    inside = [h for h in headers if h.x0 >= left - 2 and h.x0 < right]
+    if len(inside) < 3:
+        return None
+
+    # Every remaining header must land in its own column, or this is not our grid.
     seen: set[int] = set()
-    for h in headers:
+    for h in inside:
         col = grid.column_of(h.x0 if h.x0 >= left else left)
         if col is None:
             return None
         seen.add(col)
-    if len(seen) < max(3, len(headers) - 2):
+    if len(seen) < max(3, len(inside) - 2):
         return None
 
     # Row rules: horizontals spanning most of the table width.

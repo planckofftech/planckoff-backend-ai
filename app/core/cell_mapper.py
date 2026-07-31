@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from app.core.pdf_doc import Rulings, TextItem
 from app.core.table_locator import (
+    _COL_LINE_COVERAGE,
     _MERGE_TOL,
     TableGrid,
     _coverage,
@@ -31,10 +32,12 @@ def _spanned_columns(grid: TableGrid, vertical_groups, item: TextItem) -> list[i
     "PANEL WIDTH" and "FRAME TYPE" while the sibling columns stay bare "MAT'L",
     indistinguishable from each other.
     """
+    # Same threshold the grid itself was built with. A stricter one here sees
+    # only the table's outer rules, so every header cell "spans" all columns.
     height = max(item.y1 - item.y0, 1.0)
     crossing = [
         pos for pos, segs in vertical_groups
-        if _coverage(segs, item.y0, item.y1) >= height * 0.6
+        if _coverage(segs, item.y0, item.y1) >= height * _COL_LINE_COVERAGE
     ]
     left = max((x for x in crossing if x <= item.x0 + 1), default=None)
     right = min((x for x in crossing if x >= item.x1 - 1), default=None)
