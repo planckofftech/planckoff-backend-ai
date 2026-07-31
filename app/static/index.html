@@ -305,38 +305,71 @@ function render(d, wall) {
   }
 
   if (d.rows.length) {
-    const extras = [];
-    for (const r of d.rows) {
-      for (const k of Object.keys(r.extra || {})) {
-        if (!extras.includes(k)) extras.push(k);
-      }
-    }
-    const nice = k => k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+    const cols = columnsFor(d);
 
     html += '<div class="tablewrap"><table><thead><tr>';
-    for (const [, label] of FIELDS) html += "<th>" + esc(label) + "</th>";
-    for (const k of extras) html += "<th>" + esc(nice(k)) + "</th>";
+    for (const c of cols) html += "<th>" + esc(c.label) + "</th>";
     html += "</tr></thead><tbody>";
 
     for (const r of d.rows) {
       html += "<tr>";
-      for (const [key] of FIELDS) {
-        const v = r[key] || "";
+      for (const c of cols) {
+        const v = c.get(r);
         html += v
-          ? '<td' + (key === "door_tag" ? ' class="tag"' : "") + ">" + esc(v) + "</td>"
+          ? '<td' + (c.key === "door_tag" ? ' class="tag"' : "") + ">" + esc(v) + "</td>"
           : '<td class="blank">.</td>';
-      }
-      for (const k of extras) {
-        const v = (r.extra || {})[k] || "";
-        html += v ? "<td>" + esc(v) + "</td>" : '<td class="blank">.</td>';
       }
       html += "</tr>";
     }
     html += "</tbody></table></div>";
+
+    const hidden = FIELDS.filter(([k]) => !d.rows.some(r => r[k]))
+      .map(([, label]) => label);
+    if (hidden.length) {
+      html += '<p class="sub" style="margin-top:10px">Not on this drawing: ' +
+        esc(hidden.join(", ")) + ".</p>";
+    }
   }
 
   $("result").innerHTML = html;
   renderTech(d, wall);
+}
+
+// Backend's extra_key(): lowercase, runs of non-alphanumerics to underscores.
+const slug = h => String(h).toLowerCase()
+  .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+function columnsFor(d) {
+  // Only columns this drawing actually carries. A schedule with no FROM/TO
+  // should not lead with two columns of dots while the room name sits out
+  // past COMMENTS.
+  const cols = FIELDS
+    .filter(([key]) => d.rows.some(r => r[key]))
+    .map(([key, label]) => ({ key, label, get: r => r[key] || "" }));
+
+  const extras = [];
+  for (const r of d.rows) {
+    for (const k of Object.keys(r.extra || {})) {
+      if (!extras.includes(k)) extras.push(k);
+    }
+  }
+
+  // Sheet order, not discovery order -- a column that is blank on the first
+  // rows would otherwise jump to the end, far from where it sits on the paper.
+  const position = new Map();
+  (d.headers || []).forEach((h, i) => {
+    const s = slug(h);
+    if (!position.has(s)) position.set(s, i);
+  });
+  extras.sort((a, b) =>
+    (position.has(a) ? position.get(a) : 1e6) -
+    (position.has(b) ? position.get(b) : 1e6));
+
+  const nice = k => k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+  for (const k of extras) {
+    cols.push({ key: k, label: nice(k), get: r => (r.extra || {})[k] || "" });
+  }
+  return cols;
 }
 
 function renderTech(d, wall) {
@@ -412,19 +445,12 @@ $("preview").addEventListener("click", async () => {
 
 $("csv").addEventListener("click", () => {
   if (!lastResult) return;
-  const extras = [];
-  for (const r of lastResult.rows) {
-    for (const k of Object.keys(r.extra || {})) {
-      if (!extras.includes(k)) extras.push(k);
-    }
-  }
-  const keys = FIELDS.map(f => f[0]);
-  const header = FIELDS.map(f => f[1]).concat(extras.map(k => k.replace(/_/g, " ")));
+  // Same columns, same order as the table on screen.
+  const cols = columnsFor(lastResult);
   const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
-  const lines = [header.map(q).join(",")];
+  const lines = [cols.map(c => q(c.label)).join(",")];
   for (const r of lastResult.rows) {
-    lines.push(keys.map(k => q(r[k]))
-      .concat(extras.map(k => q((r.extra || {})[k]))).join(","));
+    lines.push(cols.map(c => q(c.get(r))).join(","));
   }
   const url = URL.createObjectURL(new Blob([lines.join("\r\n")], { type: "text/csv" }));
   const a = document.createElement("a");
