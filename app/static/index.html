@@ -119,15 +119,9 @@
   td.blank { color: transparent; }
   td.tag { font-weight: 650; }
 
-  /* The drawing sits beside the rows, not a scroll away below 128 of them. */
-  .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px;
-            align-items: start; }
-  .layout.has-preview { grid-template-columns: minmax(0, 1fr) 420px; }
-  @media (max-width: 1180px) {
-    .layout.has-preview { grid-template-columns: minmax(0, 1fr); }
-  }
+  /* Table and drawing are two views of the same result -- one at a time, so
+     neither is squeezed into half a screen. */
   #pagepreview:empty { display: none; }
-  #pagepreview { position: sticky; top: 16px; }
 
   figure { margin: 0; }
   figure img {
@@ -193,10 +187,8 @@
 
   <div id="msg"></div>
 
-  <div class="layout" id="layout">
-    <div id="result"></div>
-    <aside id="pagepreview"></aside>
-  </div>
+  <div id="result"></div>
+  <div id="pagepreview"></div>
 
   <details class="tech" id="tech" style="display:none">
     <summary>Technical details</summary>
@@ -240,13 +232,25 @@ const base = () => ($("base").value || defaultBase).replace(/\/$/, "");
 const esc = s => String(s).replace(/[&<>"]/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
+let previewUrl = null;
+
 function clearOutput() {
   $("msg").innerHTML = "";
   $("result").innerHTML = "";
   $("pagepreview").innerHTML = "";
-  $("layout").classList.remove("has-preview");
   $("tech").style.display = "none";
   $("csv").style.display = "none";
+  if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+  showView("table");
+}
+
+// The two views share the space rather than splitting it -- a 21-column table
+// and a full drawing sheet both need the whole width.
+function showView(name) {
+  const drawing = name === "drawing";
+  $("result").style.display = drawing ? "none" : "";
+  $("pagepreview").style.display = drawing ? "" : "none";
+  $("preview").textContent = drawing ? "Show table" : "Show page";
 }
 
 function busy(button, on, text) {
@@ -452,11 +456,16 @@ function renderTech(d, wall) {
 }
 
 $("preview").addEventListener("click", async () => {
+  // Already rendered: this is just a swap back and forth, no refetch.
+  if (previewUrl) {
+    showView($("pagepreview").style.display === "none" ? "drawing" : "table");
+    return;
+  }
+
   const f = $("file").files[0];
   if (!f) { fail("Choose a PDF first."); return; }
 
   $("pagepreview").innerHTML = "";
-  $("layout").classList.remove("has-preview");
   busy($("preview"), true, "Rendering the page…");
 
   const body = new FormData();
@@ -474,16 +483,17 @@ $("preview").addEventListener("click", async () => {
     }
     const page = res.headers.get("X-Source-Page") || "?";
     const located = res.headers.get("X-Table-Located") !== "false";
-    const url = URL.createObjectURL(await res.blob());
+    previewUrl = URL.createObjectURL(await res.blob());
     $("pagepreview").innerHTML =
-      '<figure><div class="maxwrap"><a href="' + url + '" target="_blank" ' +
-      'rel="noopener"><img src="' + url + '" alt="Page ' + esc(page) + '"></a></div>' +
+      '<figure><div class="maxwrap"><a href="' + previewUrl + '" target="_blank" ' +
+      'rel="noopener"><img src="' + previewUrl + '" alt="Page ' + esc(page) +
+      '"></a></div>' +
       "<figcaption>" + (located
         ? "Page " + esc(page) + " — the schedule is outlined in red. Click to enlarge."
         : "Page " + esc(page) + " — this is the page that was read. No outline " +
           "is shown because its layout could not be measured.") +
       "</figcaption></figure>";
-    $("layout").classList.add("has-preview");
+    showView("drawing");
   } catch (err) {
     fail("Could not reach the service. " + err.message);
   } finally {
