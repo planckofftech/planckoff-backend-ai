@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from app.core import cell_mapper, header_mapper, row_builder
+from app.core import cell_mapper, header_mapper, page_finder, row_builder
 from app.core.page_finder import PageCandidate
 from app.core.pdf_doc import PdfDoc
-from app.core.table_locator import TableNotFoundError, locate_table
+from app.core.table_locator import TableNotFoundError, locate_table, table_title
 from app.schemas import DoorRow, ExtractionMethod
+
+
+# Tag-column length required of a *further* table on a page that already
+# qualified. The page-level gate stays at its full strength.
+_SECONDARY_TAG_RUN = 3
 
 
 @dataclass(slots=True)
@@ -18,6 +23,9 @@ class PageExtraction:
     headers: list[str]
     rows: list[DoorRow]
     warnings: list[str]
+    unmapped: list[str] = field(default_factory=list)
+    candidate: PageCandidate | None = None
+    title: str = ""
 
 
 def _is_noise(cells: list[str], tag_col: int) -> bool:
@@ -34,7 +42,8 @@ def _is_noise(cells: list[str], tag_col: int) -> bool:
     return all(len(c) <= 1 and not c.isalnum() for c in populated)
 
 
-def extract_page(doc: PdfDoc, candidate: PageCandidate) -> PageExtraction:
+def extract_page(doc: PdfDoc, candidate: PageCandidate,
+                 header_overrides: dict[str, str] | None = None) -> PageExtraction:
     page_index = candidate.page - 1
     items = doc.text_items(page_index)
     rulings = doc.rulings(page_index)
@@ -42,8 +51,9 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate) -> PageExtraction:
     grid, headers = locate_table(items, rulings, candidate.header_y, candidate.tag_x)
     warnings = list(grid.warnings)
 
+    _title_top, title = table_title(grid, items, rulings)
     header_strings = cell_mapper.header_texts(grid, headers, items, rulings)
-    mapped, unmapped = header_mapper.map_headers(header_strings)
+    mapped, unmapped = header_mapper.map_headers(header_strings, header_overrides)
     tag_col = header_mapper.tag_column_index(mapped)
 
     if grid.mode == "ruled":
@@ -78,7 +88,8 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate) -> PageExtraction:
                 extra[header_mapper.extra_key(header_strings[idx], idx)] = text
         rows.append(DoorRow(**values, extra=extra))
 
-    return PageExtraction(candidate.page, method, header_strings, rows, warnings)
+    return PageExtraction(candidate.page, method, header_strings, rows, warnings,
+                          unmapped, candidate, title)
 
 
 def _looks_like_header(cells: list[str], header_strings: list[str]) -> bool:
@@ -90,14 +101,35 @@ def _looks_like_header(cells: list[str], header_strings: list[str]) -> bool:
 
 
 def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtraction]:
-    """Extract every candidate. A page that throws is recorded, not fatal."""
+    """Every schedule on every candidate page. A page that throws is recorded,
+    not fatal.
+
+    One sheet often stacks several schedules, so each candidate page is searched
+    for all of its header rows rather than just the strongest.
+    """
     out: list[PageExtraction] = []
+    seen: set[tuple[int, int]] = set()
+
     for candidate in candidates:
-        try:
-            out.append(extract_page(doc, candidate))
-        except (TableNotFoundError, IndexError, ValueError) as exc:
-            out.append(PageExtraction(
-                candidate.page, ExtractionMethod.NONE, [], [],
-                [f"page {candidate.page}: deterministic extraction failed ({exc})"],
-            ))
+        # This page already passed the structural gates, so the expensive
+        # question -- is this a schedule sheet? -- is settled. Additional
+        # tables on it can be admitted on a lower bar; a guestroom schedule
+        # with seven rows is still a schedule.
+        bands = page_finder.header_bands(
+            doc.text_items(candidate.page - 1), candidate.page,
+            min_tag_run=_SECONDARY_TAG_RUN,
+        ) or [candidate]
+        for band in bands:
+            key = (band.page, int(round(band.header_y)))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                out.append(extract_page(doc, band))
+            except (TableNotFoundError, IndexError, ValueError) as exc:
+                out.append(PageExtraction(
+                    band.page, ExtractionMethod.NONE, [], [],
+                    [f"page {band.page}: a table at y={band.header_y:.0f} "
+                     f"could not be read ({exc})"],
+                ))
     return out

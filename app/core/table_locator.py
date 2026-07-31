@@ -45,6 +45,8 @@ _MIN_COL_GAP = 60.0
 _DATA_X_TOL = 6.0
 # A ruled row band taller than this multiple of the median is the end of the table.
 _ROW_GAP_FACTOR = 3.0
+# How far above the grid to look for a caption that is not ruled in (pt).
+_FLOATING_TITLE_GAP = 34.0
 
 
 @dataclass(slots=True)
@@ -337,6 +339,46 @@ def _banded_grid(headers: list[TextItem], items: list[TextItem],
 # --------------------------------------------------------------------------- #
 # entry point
 # --------------------------------------------------------------------------- #
+
+def table_title(grid: TableGrid, items: list[TextItem],
+                rulings: Rulings) -> tuple[float | None, str]:
+    """The table's caption, in the ruled band directly above the headers.
+
+    It sits inside the same outer rule as the columns it names, so it is part
+    of the table -- and it is what distinguishes several schedules stacked on
+    one sheet from each other.
+    """
+    span = grid.right - grid.left
+    if span <= 0:
+        return None, ""
+
+    boundaries = sorted(
+        pos for pos, segs in _group_by_pos(rulings.horizontal, _MERGE_TOL)
+        if _coverage(segs, grid.left, grid.right) >= span * _ROW_LINE_COVERAGE
+        and pos < grid.header_top - 0.5
+    )
+    def caption(top: float) -> tuple[float | None, str]:
+        band = [
+            i for i in items
+            if i.horizontal and top - 0.5 <= i.cy <= grid.header_top + 0.5
+            and grid.left - 1 <= i.cx <= grid.right + 1
+        ]
+        if not band:
+            return None, ""
+        band.sort(key=lambda i: (round(i.cy / 3), i.x0))
+        text = " ".join(i.text for i in band).strip()
+        # A band full of column-ish text is another header row, not a caption.
+        return (top, text) if 0 < len(text) <= 80 else (None, "")
+
+    if boundaries:
+        ruled = caption(boundaries[-1])
+        if ruled[1]:
+            return ruled
+
+    # Not every sheet rules its caption in, and the nearest rule above may bound
+    # an empty strip. Fall back to looking a couple of lines further up.
+    return caption(grid.header_top - _FLOATING_TITLE_GAP)
+
 
 def locate_table(items: list[TextItem], rulings: Rulings, header_y: float,
                  tag_x: float) -> tuple[TableGrid, list[TextItem]]:

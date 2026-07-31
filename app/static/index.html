@@ -90,6 +90,12 @@
   }
   .badge.ai { background: var(--warn-bg); color: var(--warn-fg); }
   .sub { color: var(--muted); font-size: 14px; margin: 0 0 18px; }
+  .tabletitle {
+    font-size: 15px; font-weight: 650; letter-spacing: -0.01em;
+    margin: 26px 0 10px; display: flex; align-items: baseline; gap: 10px;
+  }
+  .tabletitle:first-child { margin-top: 4px; }
+  .tablecount { font-size: 13px; font-weight: 400; color: var(--muted); }
 
   .tablewrap {
     overflow-x: auto; border: 1px solid var(--line);
@@ -305,13 +311,19 @@ function render(d, wall) {
   const pages = (d.source_pages || []).join(", ");
   const secs = (d.duration_ms / 1000).toFixed(1);
 
+  const total = (d.tables && d.tables.length)
+    ? d.tables.reduce((n, t) => n + t.row_count, 0)
+    : d.row_count;
+  const many = d.tables && d.tables.length > 1;
+
   let html = '<div class="headline">' +
-    '<span class="count">' + d.row_count + (d.row_count === 1 ? " door" : " doors") + "</span>" +
+    '<span class="count">' + total + (total === 1 ? " row" : " rows") + "</span>" +
     '<span class="badge' + (ai ? " ai" : "") + '">' +
       (ai ? "Read by AI" : "Read exactly from the drawing") + "</span></div>";
 
-  html += '<p class="sub">Found on page ' + esc(pages) + " of " + d.pages_scanned +
-    " · " + secs + " seconds</p>";
+  html += '<p class="sub">' +
+    (many ? "Across " + d.tables.length + " schedules on page " : "Found on page ") +
+    esc(pages) + " of " + d.pages_scanned + " · " + secs + " seconds</p>";
 
   if (ai) {
     html += '<div class="msg warn">These rows were interpreted from an image ' +
@@ -319,45 +331,63 @@ function render(d, wall) {
       "sheet before relying on them.</div>";
   }
 
-  if (d.rows.length) {
-    const cols = columnsFor(d);
+  // A sheet often carries several schedules. Show each under its own caption
+  // rather than silently reporting only the biggest.
+  const tables = (d.tables && d.tables.length)
+    ? d.tables
+    : [{ title: "", headers: d.headers, rows: d.rows, row_count: d.row_count }];
 
-    html += '<div class="tablewrap"><table><thead><tr>';
-    for (const c of cols) html += "<th>" + esc(c.label) + "</th>";
-    html += "</tr></thead><tbody>";
-
-    for (const r of d.rows) {
-      html += "<tr>";
-      for (const c of cols) {
-        const v = c.get(r);
-        html += v
-          ? '<td' + (c.key === "door_tag" ? ' class="tag"' : "") + ">" + esc(v) + "</td>"
-          : '<td class="blank">.</td>';
-      }
-      html += "</tr>";
+  for (const t of tables) {
+    if (!t.rows.length) continue;
+    if (tables.length > 1) {
+      html += '<h2 class="tabletitle">' +
+        esc(t.title || "Untitled schedule") +
+        ' <span class="tablecount">' + t.row_count +
+        (t.row_count === 1 ? " row" : " rows") + "</span></h2>";
     }
-    html += "</tbody></table></div>";
-
-    const hidden = FIELDS.filter(([k]) => !d.rows.some(r => r[k]))
-      .map(([, label]) => label);
-    if (hidden.length) {
-      html += '<p class="sub" style="margin-top:10px">Not on this drawing: ' +
-        esc(hidden.join(", ")) + ".</p>";
-    }
+    html += tableHtml(t);
   }
 
   $("result").innerHTML = html;
   renderTech(d, wall);
 }
 
+function tableHtml(t) {
+  const cols = columnsFor(t);
+  let html = '<div class="tablewrap"><table><thead><tr>';
+  for (const c of cols) html += "<th>" + esc(c.label) + "</th>";
+  html += "</tr></thead><tbody>";
+
+  for (const r of t.rows) {
+    html += "<tr>";
+    for (const c of cols) {
+      const v = c.get(r);
+      html += v
+        ? '<td' + (c.key === "door_tag" ? ' class="tag"' : "") + ">" + esc(v) + "</td>"
+        : '<td class="blank">.</td>';
+    }
+    html += "</tr>";
+  }
+  html += "</tbody></table></div>";
+
+  const hidden = FIELDS.filter(([k]) => !t.rows.some(r => r[k]))
+    .map(([, label]) => label);
+  if (hidden.length) {
+    html += '<p class="sub" style="margin:8px 0 22px">Not on this schedule: ' +
+      esc(hidden.join(", ")) + ".</p>";
+  }
+  return html;
+}
+
 // Backend's extra_key(): lowercase, runs of non-alphanumerics to underscores.
 const slug = h => String(h).toLowerCase()
   .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 
-function columnsFor(d) {
-  // Only columns this drawing actually carries. A schedule with no FROM/TO
-  // should not lead with two columns of dots while the room name sits out
-  // past COMMENTS.
+function columnsFor(t) {
+  // Only columns this schedule actually carries. One with no FROM/TO should
+  // not lead with two columns of dots while the room name sits out past
+  // COMMENTS.
+  const d = t;
   const cols = FIELDS
     .filter(([key]) => d.rows.some(r => r[key]))
     .map(([key, label]) => ({ key, label, get: r => r[key] || "" }));
@@ -463,13 +493,25 @@ $("preview").addEventListener("click", async () => {
 
 $("csv").addEventListener("click", () => {
   if (!lastResult) return;
-  // Same columns, same order as the table on screen.
-  const cols = columnsFor(lastResult);
+  const d = lastResult;
+  const tables = (d.tables && d.tables.length)
+    ? d.tables
+    : [{ title: "", headers: d.headers, rows: d.rows }];
+
   const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
-  const lines = [cols.map(c => q(c.label)).join(",")];
-  for (const r of lastResult.rows) {
-    lines.push(cols.map(c => q(c.get(r))).join(","));
-  }
+  const lines = [];
+  // Same columns and order as each table on screen; captions separate them so
+  // three schedules do not arrive as one undifferentiated block.
+  tables.forEach((t, i) => {
+    if (!t.rows.length) return;
+    if (tables.length > 1) {
+      if (i) lines.push("");
+      lines.push(q(t.title || "Untitled schedule"));
+    }
+    const cols = columnsFor(t);
+    lines.push(cols.map(c => q(c.label)).join(","));
+    for (const r of t.rows) lines.push(cols.map(c => q(c.get(r))).join(","));
+  });
   const url = URL.createObjectURL(new Blob([lines.join("\r\n")], { type: "text/csv" }));
   const a = document.createElement("a");
   a.href = url;

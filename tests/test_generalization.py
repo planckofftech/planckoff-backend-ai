@@ -49,6 +49,53 @@ async def test_different_column_layout_still_maps(gracem_bytes):
     assert first.extra["door_glazing"] == "A"
 
 
+MULTI = Path(__file__).parent.parent / "DOOR SCHEDULE.pdf"
+
+
+@pytest.fixture
+def multi_schedule_bytes() -> bytes:
+    if not MULTI.exists():
+        pytest.skip(f"{MULTI.name} not present")
+    return MULTI.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_every_schedule_on_the_sheet_is_returned(multi_schedule_bytes):
+    """One sheet, three schedules stacked down the page, plus a notes block
+    beside them. Reporting only the strongest header row dropped two of the
+    three; letting the header run reach into the notes turned prose into
+    columns."""
+    result = await extract(multi_schedule_bytes, allow_ai=False)
+
+    titles = [t.title for t in result.tables]
+    assert titles == [
+        "DOOR TYPE SCHEDULE",
+        "DOOR TYPE SCHEDULE - RESIDENTIAL UNITS",
+        "DOOR TYPE SCHEDULE - GUESTROOMS",
+    ]
+    assert [t.row_count for t in result.tables] == [65, 12, 7]
+    assert result.method == ExtractionMethod.DETERMINISTIC_RULED
+
+    # The notes block must not appear as columns or as data.
+    blob = " ".join(
+        h for t in result.tables for h in t.headers
+    ) + " ".join(
+        v for t in result.tables for r in t.rows
+        for v in r.model_dump().values() if isinstance(v, str)
+    )
+    assert "EGRESS" not in blob, "notes bled into the table"
+    assert "COMPLYING WITH IBC" not in blob
+
+
+@pytest.mark.asyncio
+async def test_single_schedule_sheets_report_one_table(ellis_p21_bytes):
+    result = await extract(ellis_p21_bytes, allow_ai=False)
+    assert len(result.tables) == 1
+    assert result.tables[0].title == "Door Schedule"
+    assert result.tables[0].row_count == 23
+    assert result.tables[0].rows == result.rows
+
+
 ROTATED = Path(__file__).parent.parent / "door schdule.pdf"
 
 

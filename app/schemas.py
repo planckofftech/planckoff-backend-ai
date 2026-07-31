@@ -69,6 +69,17 @@ class PageScore(BaseModel):
     )
 
 
+class ScheduleTable(BaseModel):
+    """One schedule. A sheet often carries several stacked down the page --
+    a main door schedule, then residential units, then guestrooms."""
+
+    title: str = Field("", description="Caption as printed above the table")
+    page: int
+    headers: list[str] = Field(default_factory=list)
+    row_count: int = 0
+    rows: list[DoorRow] = Field(default_factory=list)
+
+
 class ExtractionResult(BaseModel):
     status: str = "ok"
     method: ExtractionMethod
@@ -81,6 +92,10 @@ class ExtractionResult(BaseModel):
         default_factory=list, description="Raw column headers as printed on the sheet"
     )
     rows: list[DoorRow] = Field(default_factory=list)
+    tables: list[ScheduleTable] = Field(
+        default_factory=list,
+        description="Every schedule found. `rows` above is the largest of them.",
+    )
     page_scores: list[PageScore] = Field(
         default_factory=list, description="Diagnostics; only when ?debug=true"
     )

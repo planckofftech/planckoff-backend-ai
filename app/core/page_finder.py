@@ -35,6 +35,10 @@ _Y_BUCKET = 5.0
 _TAG_X_TOL = 6.0
 # Pages with fewer text items than this cannot hold a schedule.
 _MIN_ITEMS = 40
+# How far outside a header row's own width its data may sit (pt). Data is
+# left-aligned under centre-aligned headers, so the tag column starts left of
+# the first header cell.
+_BAND_X_MARGIN = 80.0
 
 
 @dataclass(slots=True)
@@ -75,6 +79,20 @@ def _header_word_hits(texts: list[str]) -> int:
     return len(hits)
 
 
+def _longest_x_run(tags: list[TextItem]) -> tuple[int, float]:
+    """Size and x of the biggest cluster of tags sharing a column."""
+    tag_run, tag_x = 0, 0.0
+    start = 0
+    for end in range(len(tags)):
+        while tags[end].x0 - tags[start].x0 > _TAG_X_TOL:
+            start += 1
+        run = end - start + 1
+        if run > tag_run:
+            tag_run = run
+            tag_x = tags[start].x0
+    return tag_run, tag_x
+
+
 def score_page(items: list[TextItem], page_number: int, *,
                min_header_hits: int = 5, min_tag_run: int = 8) -> PageCandidate:
     horizontal = [i for i in items if i.horizontal]
@@ -95,23 +113,59 @@ def score_page(items: list[TextItem], page_number: int, *,
         _ = key
 
     # --- 2. tag column below the header band ---------------------------------
-    tags = [i for i in horizontal if i.y0 > header_y + 1 and TAG_RE.match(i.text)]
-    tags.sort(key=lambda i: i.x0)
-
-    tag_run, tag_x = 0, 0.0
-    start = 0
-    for end in range(len(tags)):
-        while tags[end].x0 - tags[start].x0 > _TAG_X_TOL:
-            start += 1
-        run = end - start + 1
-        if run > tag_run:
-            tag_run = run
-            tag_x = tags[start].x0
+    tags = sorted((i for i in horizontal
+                   if i.y0 > header_y + 1 and TAG_RE.match(i.text)),
+                  key=lambda i: i.x0)
+    tag_run, tag_x = _longest_x_run(tags)
 
     passed = header_hits >= min_header_hits and tag_run >= min_tag_run
     score = header_hits * 2 + min(tag_run, 30)
     return PageCandidate(page_number, header_hits, header_y, tag_run, tag_x, score,
                          passed, len(horizontal))
+
+
+def header_bands(items: list[TextItem], page_number: int, *,
+                 min_header_hits: int = 5, min_tag_run: int = 8
+                 ) -> list[PageCandidate]:
+    """Every header row on the page, not just the strongest.
+
+    One sheet routinely carries several schedules stacked down the page -- a
+    main door schedule, then one for residential units, then one for guestrooms.
+    Scoring only the best band reads one of them and silently drops the rest.
+    """
+    horizontal = [i for i in items if i.horizontal]
+    if len(horizontal) < _MIN_ITEMS:
+        return []
+
+    buckets: dict[int, list[TextItem]] = defaultdict(list)
+    for item in horizontal:
+        buckets[int(round(item.y0 / _Y_BUCKET))].append(item)
+
+    found: list[PageCandidate] = []
+    for band in buckets.values():
+        hits = _header_word_hits([i.text for i in band])
+        if hits < min_header_hits:
+            continue
+        header_y = min(i.y0 for i in band)
+        x0 = min(i.x0 for i in band) - _BAND_X_MARGIN
+        x1 = max(i.x1 for i in band) + _BAND_X_MARGIN
+
+        # Tags belonging to *this* table: below its header and within its width.
+        tags = sorted(
+            (i for i in horizontal
+             if i.y0 > header_y + 1 and x0 <= i.x0 <= x1 and TAG_RE.match(i.text)),
+            key=lambda i: i.x0,
+        )
+        tag_run, tag_x = _longest_x_run(tags)
+        if tag_run < min_tag_run:
+            continue
+        found.append(PageCandidate(
+            page_number, hits, header_y, tag_run, tag_x,
+            hits * 2 + min(tag_run, 30), True, len(horizontal),
+        ))
+
+    found.sort(key=lambda c: c.header_y)
+    return found
 
 
 def find_schedule_pages(doc: PdfDoc, *, min_header_hits: int = 5,

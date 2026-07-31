@@ -1,4 +1,4 @@
-"""Tier orchestration.
+﻿"""Tier orchestration.
 
 Try each tier in order, record which one won, and never let a failed tier kill
 the request -- a failure becomes a warning and the next tier runs. Only an
@@ -13,15 +13,17 @@ import time
 from app.ai.client import AiUpstreamError
 from app.config import get_settings
 from app.core import page_finder
-from app.core.extractor import extract_pages
+from app.core.extractor import PageExtraction, extract_page, extract_pages
 from app.core.pdf_doc import PdfDoc
-from app.schemas import ExtractionMethod, ExtractionResult, PageScore
+from app.schemas import ExtractionMethod, ExtractionResult, PageScore, ScheduleTable
 
 log = logging.getLogger(__name__)
 
 # Below this page count it is cheap enough to let the AI look at the best-
 # scoring page even though no page passed the structural gates.
 _SMALL_DOC_PAGES = 20
+# Below this many unplaced columns the alias table is doing fine on its own.
+_AI_HEADER_THRESHOLD = 2
 # Never render more than this many pages to the model, whatever the page count.
 _MAX_AI_PAGES = 2
 
@@ -94,25 +96,57 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
 
         # --- Tier 1: deterministic ------------------------------------------
         best = None
+        found: list[PageExtraction] = []
         if candidates:
-            for extraction in extract_pages(doc, candidates):
-                warnings.extend(extraction.warnings)
-                if extraction.rows and (best is None or len(extraction.rows) > len(best.rows)):
+            extractions = extract_pages(doc, candidates)
+            found = [e for e in extractions if e.rows]
+            for extraction in found:
+                if best is None or len(extraction.rows) > len(best.rows):
                     best = extraction
+            for extraction in extractions:
+                if not extraction.rows:
+                    warnings.extend(extraction.warnings)
 
         if best is not None and best.rows:
+            # Columns the alias table could not place. No firm names them the
+            # same way, so resolve the leftovers instead of shipping them as
+            # extras -- headers only, never the table.
+            if (len(best.unmapped) >= _AI_HEADER_THRESHOLD and allow_ai
+                    and settings.ai_enabled and best.candidate is not None):
+                from app.ai.header_map import resolve_headers
+
+                overrides, hint_warnings = await resolve_headers(best.unmapped)
+                warnings.extend(hint_warnings)
+                if overrides:
+                    retried = extract_page(doc, best.candidate, overrides)
+                    if retried.rows:
+                        found = [retried if e is best else e for e in found]
+                        best = retried
+            warnings.extend(best.warnings)
+
+            tables = [
+                ScheduleTable(title=e.title, page=e.page, headers=e.headers,
+                              row_count=len(e.rows), rows=e.rows)
+                for e in sorted(found, key=lambda e: (e.page, -len(e.rows)))
+            ]
+            if len(tables) > 1:
+                warnings.append(
+                    f"{len(tables)} schedules found on this sheet; "
+                    f"'rows' holds the largest"
+                )
             duration = int((time.perf_counter() - started) * 1000)
             log.info("extracted method=%s page=%s rows=%s ms=%s",
                      best.method.value, best.page, len(best.rows), duration)
             return ExtractionResult(
                 method=best.method,
                 pages_scanned=pages_scanned,
-                source_pages=[best.page],
+                source_pages=sorted({t.page for t in tables}),
                 row_count=len(best.rows),
                 duration_ms=duration,
                 warnings=warnings,
                 headers=best.headers,
                 rows=best.rows,
+                tables=tables,
                 page_scores=page_scores,
             )
 
@@ -182,3 +216,4 @@ async def extract(pdf_bytes: bytes, *, allow_ai: bool = True,
                 )
 
         raise _give_up()
+

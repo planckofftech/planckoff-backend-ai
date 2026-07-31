@@ -18,13 +18,10 @@ from PIL import Image, ImageDraw, ImageFont
 from app.core.page_finder import PageCandidate
 from app.core.pdf_doc import PdfDoc
 from app.core.table_locator import (
-    _MERGE_TOL,
-    _ROW_LINE_COVERAGE,
     TableGrid,
     TableNotFoundError,
-    _coverage,
-    _group_by_pos,
     locate_table,
+    table_title,
 )
 
 _OUTLINE = (200, 25, 25)
@@ -51,40 +48,9 @@ def _table_bottom(grid: TableGrid, doc: PdfDoc, page_index: int) -> float:
 
 def _title_band(grid: TableGrid, doc: PdfDoc, page_index: int,
                 rulings) -> tuple[float | None, str]:
-    """The table's own caption, in the ruled band directly above the headers.
-
-    A schedule's title row is part of the table -- it sits inside the same outer
-    rule as the columns it names -- so the outline should contain it, and it is
-    a better caption than anything hard-coded: whatever this sheet calls its
-    schedule is what the drawing should be labelled.
-    """
-    span = grid.right - grid.left
-    if span <= 0:
-        return None, ""
-
-    boundaries = sorted(
-        pos for pos, segs in _group_by_pos(rulings.horizontal, _MERGE_TOL)
-        if _coverage(segs, grid.left, grid.right) >= span * _ROW_LINE_COVERAGE
-        and pos < grid.header_top - 0.5
-    )
-    if not boundaries:
-        return None, ""
-
-    top = boundaries[-1]
-    items = [
-        i for i in doc.text_items(page_index)
-        if i.horizontal and top - 0.5 <= i.cy <= grid.header_top + 0.5
-        and grid.left - 1 <= i.cx <= grid.right + 1
-    ]
-    if not items:
-        return None, ""
-
-    items.sort(key=lambda i: (round(i.cy / 3), i.x0))
-    text = " ".join(i.text for i in items).strip()
-    # A band full of column-ish text is another header row, not a caption.
-    if len(text) > 80:
-        return None, ""
-    return top, text
+    """The table's own caption. Shared with extraction so the outline and the
+    table's reported title always agree."""
+    return table_title(grid, doc.text_items(page_index), rulings)
 
 
 def _font(size: int) -> ImageFont.ImageFont:
