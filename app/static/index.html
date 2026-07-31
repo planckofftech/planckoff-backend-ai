@@ -177,7 +177,8 @@
     <div class="actions">
       <button id="go">Extract schedule</button>
       <button id="preview" class="ghost">Show page</button>
-      <button id="master" class="ghost">Master sheet</button>
+      <button id="master" class="ghost" disabled
+              title="Run Extract schedule first">Master sheet</button>
       <button id="csv" class="ghost" style="display:none">Download CSV</button>
       <span class="working" id="working"></span>
       <span style="flex:1"></span>
@@ -248,6 +249,9 @@ function clearOutput() {
   $("csv").style.display = "none";
   if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
   masterData = null;
+  lastResult = null;
+  $("master").disabled = true;
+  $("master").title = "Run Extract schedule first";
   showView("table");
 }
 
@@ -264,8 +268,11 @@ function showView(name) {
 function busy(button, on, text) {
   if (button) button.disabled = on;
   $("preview").disabled = on;
-  $("master").disabled = on;
   $("go").disabled = on;
+  // The master sheet needs rows to map, so it stays out of reach until an
+  // extraction has produced some.
+  $("master").disabled = on || !lastResult;
+  $("master").title = lastResult ? "" : "Run Extract schedule first";
   $("working").innerHTML = on ? '<span class="spinner"></span>' + esc(text) : "";
 }
 
@@ -527,17 +534,18 @@ $("master").addEventListener("click", async () => {
     showView($("mastersheet").style.display === "none" ? "master" : "table");
     return;
   }
-  const f = $("file").files[0];
-  if (!f) { fail("Choose a PDF first."); return; }
+  // Built from the rows already on screen. Re-reading the PDF here meant a
+  // second wait, a second AI charge, and a second chance to fail after the
+  // first read had already worked.
+  if (!lastResult) { fail("Run Extract schedule first."); return; }
 
   busy($("master"), true, "Building the master sheet…");
-  const body = new FormData();
-  body.append("file", f);
 
   try {
-    const res = await fetch(base() + "/api/v1/door-schedule/master-sheet?preview=true" +
-      "&allow_ai=" + ($("allowAi").checked ? "true" : "false"), {
-      method: "POST", headers: { "X-API-Key": $("key").value }, body
+    const res = await fetch(base() + "/api/v1/master-sheet?preview=true", {
+      method: "POST",
+      headers: { "X-API-Key": $("key").value, "Content-Type": "application/json" },
+      body: JSON.stringify(lastResult)
     });
     const data = await res.json().catch(() => null);
     if (!res.ok) {
@@ -602,21 +610,24 @@ function renderMaster(d) {
 }
 
 async function downloadMaster() {
+  if (!lastResult) return;
   const f = $("file").files[0];
-  if (!f) return;
+  const stem = f ? f.name.replace(/\.pdf$/i, "") : "door-schedule";
+
   busy($("masterdl"), true, "Building the spreadsheet…");
-  const body = new FormData();
-  body.append("file", f);
   try {
-    const res = await fetch(base() + "/api/v1/door-schedule/master-sheet?allow_ai=" +
-      ($("allowAi").checked ? "true" : "false"), {
-      method: "POST", headers: { "X-API-Key": $("key").value }, body
+    // Same rows the preview was built from -- no re-extraction.
+    const res = await fetch(base() + "/api/v1/master-sheet?filename=" +
+      encodeURIComponent(stem), {
+      method: "POST",
+      headers: { "X-API-Key": $("key").value, "Content-Type": "application/json" },
+      body: JSON.stringify(lastResult)
     });
     if (!res.ok) { fail("Download failed.", res.status); return; }
     const url = URL.createObjectURL(await res.blob());
     const a = document.createElement("a");
     a.href = url;
-    a.download = f.name.replace(/\.pdf$/i, "") + " - master.xlsx";
+    a.download = stem + " - master.xlsx";
     a.click();
     URL.revokeObjectURL(url);
   } finally {

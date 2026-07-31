@@ -27,5 +27,8 @@ def get_client() -> AsyncOpenAI:
         api_key=settings.openrouter_api_key,
         base_url=settings.openrouter_base_url,
         timeout=120.0,
-        max_retries=1,
+        # 429s and provider 5xx are routine and transient. One retry gave up
+        # too early and surfaced a passing hiccup as a hard 502; the SDK backs
+        # off between attempts, so a few more cost nothing when calls succeed.
+        max_retries=4,
     )

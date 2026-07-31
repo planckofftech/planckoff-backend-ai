@@ -62,8 +62,17 @@ def _upstream_reason(exc: Exception) -> str:
         403: "OpenRouter refused this model for this key",
         404: "OpenRouter does not recognise the configured AI_MODEL",
         429: "OpenRouter rate-limited this key; retry shortly",
+        500: "the model provider failed on OpenRouter's side; this is usually "
+             "transient -- retry",
+        502: "OpenRouter could not reach the model provider; usually transient "
+             "-- retry",
+        503: "the model provider is unavailable on OpenRouter; usually "
+             "transient -- retry",
     }
     hint = hints.get(status)
+    if hint is None and status is None:
+        hint = ("could not reach OpenRouter at all -- check network access to "
+                "openrouter.ai")
     return f"{hint} [{exc}]" if hint else str(exc)
 
 

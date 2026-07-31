@@ -84,6 +84,9 @@ async def extract_door_schedule(
                             detail=str(exc)) from exc
     except AiUpstreamError as exc:
         # A billing or auth failure upstream must never read as "no rows found".
+        # Log it too: the caller sees the detail, but whoever is watching the
+        # server saw only a bare "502 Bad Gateway" with no reason at all.
+        log.error("ai upstream failed: %s", exc)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
                             detail=f"AI provider error: {exc}") from exc
 
@@ -97,37 +100,30 @@ async def extract_door_schedule(
 
 
 @router.post(
-    "/api/v1/door-schedule/master-sheet",
-    tags=["extraction"],
-    summary="Extract, then return the filled master door format sheet (.xlsx)",
+    "/api/v1/master-sheet",
+    tags=["master sheet"],
+    summary="Map an already-extracted schedule onto the master door format sheet",
     response_class=Response,
     responses={200: {"content": {
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}}}},
 )
 async def master_sheet(
-    file: UploadFile = File(...),
-    allow_ai: bool = Query(True, description="Permit the vision fallback tier"),
+    result: ExtractionResult,
     preview: bool = Query(False, description="Return JSON rows instead of .xlsx"),
+    filename: str = Query("door-schedule", description="Stem for the download"),
     _key: str = Depends(require_api_key),
 ) -> Response:
-    """The master sheet with every extracted door as a row.
+    """Map an extraction onto the master sheet. Takes rows, not a PDF.
 
-    Columns no door schedule can answer are left empty rather than guessed --
+    Deliberately does no extraction of its own. Taking a PDF here meant the
+    document was read twice to produce one sheet: twice the wait, twice the AI
+    cost, and a second chance to fail after the first read had already
+    succeeded -- which is exactly what happened.
+
+    Columns no door schedule can answer are left empty rather than guessed:
     they belong to sources that have not been loaded yet.
     """
     from app.core.master_sheet import BANDS, COLUMNS, build_rows, build_workbook
-
-    data = await _read_upload(file)
-    try:
-        result = await extract(data, allow_ai=allow_ai)
-    except NotAPdfError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="File is not a readable PDF.") from exc
-    except (NoScheduleFoundError, NoRowsError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except AiUpstreamError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
-                            detail=f"AI provider error: {exc}") from exc
 
     if preview:
         # Same builder as the spreadsheet, so the screen and the download can
@@ -144,10 +140,10 @@ async def master_sheet(
             "source_pages": result.source_pages,
         })
 
-    xlsx, stats = build_workbook(result, source_name=file.filename or "")
-    stem = Path(file.filename or "door-schedule").stem
-    log.info("master_sheet file=%s rows=%s filled=%s of %s",
-             file.filename, stats.rows, len(stats.filled_columns),
+    xlsx, stats = build_workbook(result)
+    stem = Path(filename or "door-schedule").stem
+    log.info("master_sheet rows=%s filled=%s of %s", stats.rows,
+             len(stats.filled_columns),
              len(stats.filled_columns) + len(stats.empty_columns))
 
     return Response(

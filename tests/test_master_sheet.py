@@ -95,26 +95,60 @@ async def test_every_schedule_on_the_sheet_reaches_the_master(multi_schedule_byt
     assert ws.max_row == 2 + expected
 
 
-def test_preview_and_download_are_built_from_the_same_rows(ellis_p21_bytes):
+@pytest.mark.asyncio
+async def test_endpoint_maps_rows_and_never_re_extracts(ellis_p21_bytes, monkeypatch):
+    """The master sheet takes an extraction, not a PDF.
+
+    Taking a PDF meant the document was read twice for one sheet: twice the
+    wait, twice the AI cost, and a second chance to fail after the first read
+    had already succeeded.
+    """
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    import app.pipeline as pipeline
+    from app.config import get_settings
+    from app.main import app
+
+    result = await extract(ellis_p21_bytes, allow_ai=False)
+    payload = _json.loads(result.model_dump_json())
+
+    async def explode(*_a, **_kw):
+        raise AssertionError("master sheet re-extracted the document")
+
+    monkeypatch.setattr(pipeline, "extract", explode)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/master-sheet?preview=true",
+            headers={"X-API-Key": get_settings().api_key}, json=payload,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["row_count"] == 23
+
+
+@pytest.mark.asyncio
+async def test_preview_and_download_are_built_from_the_same_rows(ellis_p21_bytes):
     """What the screen shows must be what the spreadsheet contains -- a preview
     that disagrees with the download is worse than no preview."""
+    import json as _json
+
     from fastapi.testclient import TestClient
 
     from app.config import get_settings
     from app.main import app
 
+    result = await extract(ellis_p21_bytes, allow_ai=False)
+    payload = _json.loads(result.model_dump_json())
     headers = {"X-API-Key": get_settings().api_key}
+
     with TestClient(app) as client:
-        shown = client.post(
-            "/api/v1/door-schedule/master-sheet?preview=true&allow_ai=false",
-            headers=headers,
-            files={"file": ("p21.pdf", ellis_p21_bytes, "application/pdf")},
-        ).json()
-        downloaded = client.post(
-            "/api/v1/door-schedule/master-sheet?allow_ai=false",
-            headers=headers,
-            files={"file": ("p21.pdf", ellis_p21_bytes, "application/pdf")},
-        )
+        shown = client.post("/api/v1/master-sheet?preview=true",
+                            headers=headers, json=payload).json()
+        downloaded = client.post("/api/v1/master-sheet",
+                                 headers=headers, json=payload)
 
     assert shown["columns"] == COLUMNS
     ws = openpyxl.load_workbook(io.BytesIO(downloaded.content)).active
