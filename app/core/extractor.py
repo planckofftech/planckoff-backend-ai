@@ -1,7 +1,9 @@
-"""Deterministic extraction of one candidate page: grid -> cells -> DoorRows."""
+﻿"""Deterministic extraction of one candidate page: grid -> cells -> DoorRows."""
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass, field
 
 from app.core import cell_mapper, header_mapper, page_finder, row_builder
@@ -10,10 +12,35 @@ from app.core.pdf_doc import PdfDoc
 from app.core.table_locator import TableNotFoundError, locate_table, table_title
 from app.schemas import DoorRow, ExtractionMethod
 
+log = logging.getLogger(__name__)
+
 
 # Tag-column length required of a *further* table on a page that already
 # qualified. The page-level gate stays at its full strength.
 _SECONDARY_TAG_RUN = 3
+
+# A sheet carries other schedules that share a door schedule's vocabulary --
+# WIDTH, HEIGHT, TYPE, MATERIAL, FINISH, HEAD, JAMB -- so keyword scoring alone
+# cannot tell them apart. The printed caption can.
+_DOOR_WORDS = ("DOOR", "OPENING", "FRAME", "LEAF")
+_OTHER_SCHEDULES = ("WINDOW", "GLAZING", "GLASS", "ROOM FINISH", "FINISH SCHEDULE",
+                    "LOUVER", "STOREFRONT", "CASEWORK", "PARTITION", "WALL TYPE",
+                    "EQUIPMENT", "LIGHTING", "PLUMBING", "SIGNAGE")
+
+
+def is_other_schedule(title: str) -> bool:
+    """True when the caption names a schedule that is plainly not about doors.
+
+    An untitled table is kept: it cannot be proven innocent or guilty, and
+    dropping untitled tables would lose sheets whose door schedule has no
+    caption of its own.
+    """
+    text = re.sub(r"\s+", " ", (title or "").upper())
+    if not text:
+        return False
+    if any(word in text for word in _DOOR_WORDS):
+        return False
+    return any(word in text for word in _OTHER_SCHEDULES)
 
 
 @dataclass(slots=True)
@@ -110,6 +137,7 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
     for all of its header rows rather than just the strongest.
     """
     out: list[PageExtraction] = []
+    skipped: list[PageExtraction] = []
     seen: set[tuple[int, int]] = set()
 
     for candidate in candidates:
@@ -127,11 +155,31 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
                 continue
             seen.add(key)
             try:
-                out.append(extract_page(doc, band))
+                extraction = extract_page(doc, band)
             except (TableNotFoundError, IndexError, ValueError) as exc:
                 out.append(PageExtraction(
                     band.page, ExtractionMethod.NONE, [], [],
                     [f"page {band.page}: a table at y={band.header_y:.0f} "
                      f"could not be read ({exc})"],
                 ))
+                continue
+
+            if is_other_schedule(extraction.title):
+                log.info("skipping %r on page %s (%s rows): not a door schedule",
+                         extraction.title, extraction.page, len(extraction.rows))
+                skipped.append(extraction)
+                continue
+            out.append(extraction)
+
+    # Only worth mentioning when it is the difference between rows and nothing:
+    # otherwise it is noise on every multi-schedule sheet.
+    if skipped and not any(e.rows for e in out):
+        names = ", ".join(f"{e.title} ({len(e.rows)} rows)" for e in skipped)
+        out.append(PageExtraction(
+            skipped[0].page, ExtractionMethod.NONE, [], [],
+            [f"Found no door schedule. Other schedules on this sheet: {names}."],
+        ))
     return out
+
+
+
