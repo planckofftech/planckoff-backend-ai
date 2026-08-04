@@ -24,6 +24,10 @@ log = logging.getLogger(__name__)
 # this service is stateless by design, so nothing is persisted.
 _CACHE: dict[tuple[str, ...], dict[str, str]] = {}
 
+# Example cells shown per column. Enough to tell an identifier from a code,
+# few enough that this stays a header question rather than a table dump.
+_SAMPLE_VALUES = 3
+
 _SYSTEM = (
     "You map column headers from a construction door schedule onto a fixed set "
     "of field names. You never invent data and never guess when a header has no "
@@ -48,12 +52,26 @@ _FIELD_NOTES = {
 }
 
 
-def _prompt(unknown: list[str]) -> str:
+def _prompt(unknown: list[str], samples: dict[str, list[str]] | None) -> str:
     fields = "\n".join(f"  {name}: {note}" for name, note in _FIELD_NOTES.items())
+
+    if samples:
+        # A heading alone cannot say whether a column is the row's identifier or
+        # a type code: "TYPE" holding 1, 2, 3 is the door number, and a column
+        # headed SIGN was being mapped to hw_set on its name alone.
+        listing = "\n".join(
+            f"  {header}: {', '.join(samples[header][:_SAMPLE_VALUES])}"
+            for header in unknown if samples.get(header)
+        )
+        columns = f"Headers, with example values from each column:\n{listing}\n"
+    else:
+        columns = f"Headers: {json.dumps(unknown)}\n"
+
     return (
         "Map each column header to one of these fields, or to null when no field "
         "genuinely fits.\n\n"
         f"Fields:\n{fields}\n\n"
+        f"{columns}\n"
         "Rules:\n"
         "- Ignore group prefixes that only say which part of the assembly a "
         "column belongs to, such as 'DOOR (AS APPLICABLE)'. Judge the column by "
@@ -62,16 +80,27 @@ def _prompt(unknown: list[str]) -> str:
         "'FRAME TYPE' is NOT frame_material; return null for it.\n"
         "- HDW, HW, HDWE, HARDWARE and HARDWARE SET all mean hw_set.\n"
         "- Thickness, gauge, detail references (head/jamb/sill), glazing, "
-        "louvers and lock function have no field here. Return null.\n"
+        "louvers, signage and lock function have no field here. Return null.\n"
+        "- Judge by the example values as much as the heading. A column of "
+        "short values that identify each row one by one -- 101, 102, 103A -- is "
+        "door_tag, whatever it is headed.\n"
         "- Do not map two headers to the same field.\n"
-        "- Prefer null over a loose fit. A wrong mapping silently corrupts a row.\n\n"
-        f"Headers: {json.dumps(unknown)}\n\n"
+        "- Prefer null over a loose fit. A wrong mapping silently corrupts a "
+        "row.\n\n"
         'Return JSON: {"mapping": {"<header>": "<field or null>"}}'
     )
 
 
-async def resolve_headers(unknown: list[str]) -> tuple[dict[str, str], list[str]]:
+async def resolve_headers(unknown: list[str],
+                          samples: dict[str, list[str]] | None = None
+                          ) -> tuple[dict[str, str], list[str]]:
     """Map unrecognised headers to canonical fields. Returns (mapping, warnings).
+
+    `samples` gives a few example values per column. A heading alone cannot say
+    whether a column identifies the row or classifies it, which is how door
+    numbers ended up in door_type and a SIGN column became hw_set.
+
+    Still no full table: a handful of cells, never the rows themselves.
 
     Failure is never fatal: an unresolved header simply stays in `extra`, which
     is where it already was.
@@ -99,7 +128,7 @@ async def resolve_headers(unknown: list[str]) -> tuple[dict[str, str], list[str]
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": _prompt(cleaned)},
+                {"role": "user", "content": _prompt(cleaned, samples)},
             ],
         )
         payload = json.loads(response.choices[0].message.content or "{}")

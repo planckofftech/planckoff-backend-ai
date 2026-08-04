@@ -39,7 +39,17 @@ HEADER_ALIASES: list[tuple[str, list[str]]] = [
     ("comments", ["COMMENTS", "REMARKS", "NOTES", "COMMENT"]),
 ]
 
-_PUNCT = re.compile(r"[^A-Z0-9#. ]+")
+# Periods are dropped, not kept: sheets abbreviate with them -- DR. TYPE, NO.,
+# MAT'L -- and keeping them stopped every such heading matching its alias.
+_PUNCT = re.compile(r"[^A-Z0-9# ]+")
+
+# What a door tag looks like when we have to recognise it from the data alone.
+_MIN_PREFIX_ALIAS = 3
+# Which door field a repeated heading hands over to the frame.
+_DOOR_TO_FRAME = {"door_material": "frame_material", "door_finish": "frame_finish"}
+_MAX_TAG_LEN = 10
+_MIN_TAG_ROWS = 3
+_MIN_TAG_UNIQUENESS = 0.9
 
 
 def normalize(header: str) -> str:
@@ -79,15 +89,45 @@ def map_headers(headers: list[str],
             for idx, text in enumerate(normalized):
                 if mapped[idx] is not None or not text:
                     continue
-                hit = (
-                    text in aliases if exact_pass
-                    else any(text.startswith(a + " ") or a.startswith(text + " ")
-                             for a in aliases)
-                )
+                if exact_pass:
+                    hit = text in aliases
+                else:
+                    # Two-letter aliases match exactly or not at all: FR meant
+                    # fire rating, so "FR. TYPE" -- a frame type -- was being
+                    # read as the fire rating on every row.
+                    hit = any(
+                        len(a) >= _MIN_PREFIX_ALIAS
+                        and (text.startswith(a + " ") or a.startswith(text + " ")
+                             # A multi-word alias may sit in the middle:
+                             # "OPENING FIRE RATING" is a fire rating. Only
+                             # multi-word, because containing "TYPE" would make
+                             # every FRAME TYPE column a door type.
+                             or (" " in a and f" {a} " in f" {text} "))
+                        for a in aliases
+                    )
                 if hit:
                     mapped[idx] = field
                     claimed.add(field)
                     break
+
+    # A repeated heading is the frame's. Schedules group the door's columns
+    # first and the frame's second, printing MATERIAL and FINISH twice and
+    # relying on the group heading above to tell them apart. Where that group
+    # heading cannot be recovered, the second occurrence is still the frame's --
+    # and without this it stayed unmapped, leaving frame_material empty on every
+    # row while the value sat in extras.
+    for idx, text in enumerate(normalized):
+        if mapped[idx] is not None or not text:
+            continue
+        earlier = next((j for j in range(idx)
+                        if normalized[j] == text and mapped[j] in _DOOR_TO_FRAME),
+                       None)
+        if earlier is None:
+            continue
+        frame_field = _DOOR_TO_FRAME[mapped[earlier]]
+        if frame_field not in claimed:
+            mapped[idx] = frame_field
+            claimed.add(frame_field)
 
     # Overrides fill the gaps the alias table left -- they never displace it.
     # Applied first, a suggestion like "FRAME TYPE -> frame_material" claims the
@@ -110,6 +150,65 @@ def extra_key(header: str, index: int) -> str:
     """Stable snake_case key for a column that did not map. Never dropped."""
     key = re.sub(r"[^a-z0-9]+", "_", header.lower()).strip("_")
     return key or f"column_{index + 1}"
+
+
+def infer_tag_column(mapped: list[str | None], columns: list[list[str]],
+                     headers: list[str] | None = None) -> list[str | None]:
+    """Claim a door_tag column from the data when no heading gave us one.
+
+    The tag is the row's identity and the key every other source joins on, so
+    losing it costs more than any other field. Headings alone are not enough: a
+    model transcribing "DR. NO." as "DR. TYP" mapped a column of 1, 2, 3 to
+    door_type and left the schedule with no tags at all.
+
+    A tag column is short, near enough unique, and populated on most rows.
+    """
+    if "door_tag" in mapped:
+        return mapped
+
+    # A door *type* schedule genuinely uses its TYPE column as the row's
+    # identity, so door_type is only reclaimed when a second, still-unplaced
+    # column is plainly the type -- the DR. TYP. / DR. TYPE pair that a
+    # misread heading creates.
+    names = headers or []
+    spare_type = any(
+        "TYPE" in normalize(names[i])
+        for i in range(min(len(names), len(mapped)))
+        if mapped[i] is None
+    )
+
+    best: tuple[float, int] | None = None
+    for index, values in enumerate(columns):
+        if index >= len(mapped):
+            continue
+        if mapped[index] is not None and not (
+            mapped[index] == "door_type" and spare_type
+        ):
+            continue
+        filled = [v.strip() for v in values if v and v.strip()]
+        if len(filled) < _MIN_TAG_ROWS or len(filled) < len(values) * 0.6:
+            continue
+        if any(len(v) > _MAX_TAG_LEN for v in filled):
+            continue
+        uniqueness = len(set(filled)) / len(filled)
+        if uniqueness < _MIN_TAG_UNIQUENESS:
+            continue
+        # Leftmost wins on a tie: schedules put the tag first.
+        score = (uniqueness, -index)
+        if best is None or score > best:
+            best = score
+            chosen = index
+
+    if best is None:
+        return mapped
+    updated = list(mapped)
+    updated[chosen] = "door_tag"
+    return updated
+
+
+def unmapped_headers(headers: list[str], mapped: list[str | None]) -> list[str]:
+    return [headers[i] for i, field in enumerate(mapped)
+            if field is None and i < len(headers) and headers[i]]
 
 
 def tag_column_index(mapped: list[str | None]) -> int:

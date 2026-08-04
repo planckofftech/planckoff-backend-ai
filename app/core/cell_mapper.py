@@ -66,9 +66,13 @@ def header_texts(grid: TableGrid, headers: list[TextItem], items: list[TextItem]
     two identical "MAT'L" columns.
     """
     if grid.mode == "ruled":
+        # Rotated text is kept here, unlike everywhere else: a narrow column is
+        # routinely headed sideways. Dropping those left six columns of one
+        # sheet all called "PANEL", and the mapper then had nothing to tell
+        # WIDTH from MATERIAL -- the values came back under the wrong names.
         band = [
             i for i in items
-            if i.horizontal and grid.header_top - 0.5 <= i.cy <= grid.header_bottom + 0.5
+            if grid.header_top - 0.5 <= i.cy <= grid.header_bottom + 0.5
         ]
     else:
         span = max((h.y1 - h.y0) for h in headers)
@@ -82,7 +86,13 @@ def header_texts(grid: TableGrid, headers: list[TextItem], items: list[TextItem]
 
     buckets: list[list[tuple[float, float, str]]] = [[] for _ in range(grid.n_cols)]
     for item in band:
-        if vertical_groups is not None:
+        if not item.horizontal:
+            # A sideways heading spans its column's whole height, so the
+            # group-span rule would read it as covering every column. It heads
+            # exactly the column it sits in.
+            col = grid.column_of(item.cx)
+            columns = [] if col is None else [col]
+        elif vertical_groups is not None:
             columns = _spanned_columns(grid, vertical_groups, item)
         else:
             col = grid.column_of(item.x0)

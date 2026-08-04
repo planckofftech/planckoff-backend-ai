@@ -1,4 +1,4 @@
-﻿"""Phase 1 -- find the page(s) holding a door schedule.
+"""Phase 1 -- find the page(s) holding a door schedule.
 
 Keyword matching alone returns 17 of 102 pages on the Ellis County set; page 19
 contains the literal string "DOOR SCHEDULE" in a sheet index and no table. Two
@@ -151,8 +151,9 @@ def _header_word_hits(texts: list[str]) -> int:
 
 
 def _scored_bands(horizontal: list[TextItem]
-                  ) -> list[tuple[set[str], float, list[TextItem]]]:
-    """Every candidate header row as (words, header_y, cells), best first.
+                  ) -> list[tuple[set[str], float, list[TextItem], list[TextItem]]]:
+    """Every candidate header row as (words, header_y, cells, leaf cells), best
+    first.
 
     Headings are routinely stacked -- DOOR and FRAME on one line, WIDTH and
     HEIGHT on the next -- and land in different y buckets. Scored separately
@@ -168,14 +169,14 @@ def _scored_bands(horizontal: list[TextItem]
         buckets[int(round(item.y0 / _Y_BUCKET))].append(item)
 
     keys = sorted(buckets)
-    scored: list[tuple[int, float, list[TextItem]]] = []
+    scored: list[tuple[set[str], float, list[TextItem], list[TextItem]]] = []
 
     for index, key in enumerate(keys):
         merged = list(buckets[key])
         leaf = buckets[key]
         top = min(i.y0 for i in buckets[key])
         scored.append((_header_words_found([i.text for i in merged]),
-                       min(i.y0 for i in leaf), merged))
+                       min(i.y0 for i in leaf), merged, leaf))
 
         # Group rows can sit well above the leaf row -- one sheet prints
         # LOCATION / PANEL / FRAME 88 pt above NO. / FROM / TO -- so merging
@@ -190,7 +191,7 @@ def _scored_bands(horizontal: list[TextItem]
             if len(band) >= len(leaf):
                 leaf = band
             scored.append((_header_words_found([i.text for i in merged]),
-                           min(i.y0 for i in leaf), merged))
+                           min(i.y0 for i in leaf), merged, leaf))
 
     scored.sort(key=lambda s: (-len(s[0]), s[1]))
     return scored
@@ -239,9 +240,9 @@ def score_page(items: list[TextItem], page_number: int, *,
     # sheet a window schedule's header outscored the door schedule below it, so
     # the page was rejected on the window table's missing tag run.
     best: PageCandidate | None = None
-    for words, header_y, band in _scored_bands(horizontal)[:_MAX_BANDS_SCORED]:
+    for words, header_y, band, leaf in _scored_bands(horizontal)[:_MAX_BANDS_SCORED]:
         candidate = _judge(horizontal, band, words, header_y, page_number,
-                           min_header_hits, min_tag_run)
+                           min_header_hits, min_tag_run, leaf)
         if best is None or (candidate.passed, candidate.score) > (best.passed, best.score):
             best = candidate
     return best or PageCandidate(page_number, 0, 0.0, 0, 0.0, 0, False,
@@ -250,10 +251,19 @@ def score_page(items: list[TextItem], page_number: int, *,
 
 def _judge(horizontal: list[TextItem], band: list[TextItem], words: set[str],
            header_y: float, page_number: int, min_header_hits: int,
-           min_tag_run: int) -> PageCandidate:
-    """Score one header band together with the tag column beneath it."""
-    x0 = min(i.x0 for i in band) - _BAND_X_MARGIN
-    x1 = max(i.x1 for i in band) + _BAND_X_MARGIN
+           min_tag_run: int, leaf: list[TextItem] | None = None) -> PageCandidate:
+    """Score one header band together with the tag column beneath it.
+
+    The tag column is searched under the *leaf* row, not the merged band. A
+    merged band reaches up into group headings, and where two schedules sit
+    side by side on one sheet it reaches sideways into the neighbour: on one
+    drawing the door schedule's header was paired with the room-finish
+    schedule's Level column 1000 pt to its left, and the grid built from that
+    pair contained neither table.
+    """
+    span = leaf or band
+    x0 = min(i.x0 for i in span) - _BAND_X_MARGIN
+    x1 = max(i.x1 for i in span) + _BAND_X_MARGIN
     tags = [i for i in horizontal
             if i.y0 > header_y + 1 and x0 <= i.x0 <= x1 and TAG_RE.match(i.text)]
     tag_run, tag_x = _longest_x_run(tags)
@@ -281,7 +291,7 @@ def header_bands(items: list[TextItem], page_number: int, *,
         return []
 
     found: list[PageCandidate] = []
-    for words, header_y, band in _scored_bands(horizontal):
+    for words, header_y, band, leaf in _scored_bands(horizontal):
         if len(words) < min_header_hits:
             continue
         # One table yields several bands -- itself, and itself merged with the
@@ -291,7 +301,7 @@ def header_bands(items: list[TextItem], page_number: int, *,
         if any(abs(header_y - c.header_y) <= _SAME_TABLE_Y for c in found):
             continue
         candidate = _judge(horizontal, band, words, header_y, page_number,
-                           min_header_hits, min_tag_run)
+                           min_header_hits, min_tag_run, leaf)
         if candidate.passed:
             found.append(candidate)
 

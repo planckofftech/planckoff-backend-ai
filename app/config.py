@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     api_key: str = "dev-key"
-    max_upload_mb: float = 50.0
+    max_upload_mb: float = 500.0
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # AI fallback (Phase 4). Absent key => the AI tier is skipped, not an error.
@@ -34,3 +34,4 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+

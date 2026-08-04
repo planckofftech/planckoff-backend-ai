@@ -22,6 +22,7 @@ from app.core.table_locator import (
     TableNotFoundError,
     locate_table,
     table_title,
+    table_top,
 )
 
 _OUTLINE = (200, 25, 25)
@@ -32,18 +33,28 @@ _PDF_DPI = 72.0
 
 
 def _table_bottom(grid: TableGrid, doc: PdfDoc, page_index: int) -> float:
-    """Where the table ends. Ruled grids say so directly; otherwise take the
-    lowest text still inside a column band."""
-    if grid.row_bounds:
-        return grid.row_bounds[-1]
-    bottoms = [
-        item.y1
-        for item in doc.text_items(page_index)
-        if item.horizontal
-        and item.y0 > grid.header_bottom
+    """Where the table ends -- the last ruled line that still has rows above it.
+
+    Taking the last ruled line outright drew the box past the schedule and
+    around whatever was ruled beneath it: on one sheet it swallowed the GLAZING
+    TYPES and DEMOUNTABLE REQUIREMENTS tables below. Those bands are empty as
+    far as *this* grid's columns are concerned, so the last band holding text is
+    the real edge.
+    """
+    inside = [
+        item for item in doc.text_items(page_index)
+        if item.horizontal and item.cy > grid.header_bottom
         and grid.column_of(item.x0) is not None
     ]
-    return max(bottoms) if bottoms else grid.header_bottom + 40.0
+    lowest = max((i.y1 for i in inside), default=None)
+
+    if grid.row_bounds:
+        if lowest is None:
+            return grid.row_bounds[-1]
+        # The first boundary at or below the lowest row of text.
+        return next((b for b in grid.row_bounds if b >= lowest - 1),
+                    grid.row_bounds[-1])
+    return lowest if lowest is not None else grid.header_bottom + 40.0
 
 
 def _title_band(grid: TableGrid, doc: PdfDoc, page_index: int,
@@ -65,7 +76,9 @@ def _font(size: int) -> ImageFont.ImageFont:
 
 
 def render_preview(doc: PdfDoc, candidate: PageCandidate, *, dpi: int = 110,
-                   located: bool = True) -> bytes:
+                   located: bool = True,
+                   box: tuple[float, float, float, float] | None = None,
+                   box_label: str = "") -> bytes:
     """PNG of the page, with the door schedule boxed when it was actually found.
 
     `located` must be False when the page did not pass the structural gates. On
@@ -74,6 +87,10 @@ def render_preview(doc: PdfDoc, candidate: PageCandidate, *, dpi: int = 110,
     Drawing that is worse than drawing nothing: it asserts a result the finder
     never reached. The page is still shown, because it is what the vision tier
     read.
+
+    `box` overrides both, given as fractions of the page. That is how an AI-read
+    page gets an outline at all: the model returns text, never geometry, so the
+    rectangle is worked out afterwards and handed back in here.
     """
     page_index = candidate.page - 1
     image = Image.open(io.BytesIO(doc.render_png(page_index, dpi=dpi))).convert("RGB")
@@ -89,8 +106,23 @@ def render_preview(doc: PdfDoc, candidate: PageCandidate, *, dpi: int = 110,
         except (TableNotFoundError, IndexError, ValueError):
             grid = None
 
-    if grid is not None:
-        top = min(grid.header_top, grid.header_bottom)
+    if box is not None:
+        # Supplied by the caller because the AI tier read this page: the grid
+        # could not be measured, so the outline comes from where the extracted
+        # values were found instead. Drawn in the same red as a measured one,
+        # because it means the same thing -- this is what was read.
+        x0, y0, x1, y1 = box
+        draw.rectangle(
+            (x0 * image.width, y0 * image.height,
+             x1 * image.width, y1 * image.height),
+            outline=_OUTLINE, width=_BORDER_WIDTH,
+        )
+        label = box_label or "DOOR SCHEDULE"
+        box = (x0 * image.width, y0 * image.height, 0, 0)
+    elif grid is not None:
+        top = min(grid.header_top, grid.header_bottom,
+                  table_top(grid, doc.text_items(page_index),
+                            doc.rulings(page_index)))
         title_top, title = _title_band(grid, doc, page_index, doc.rulings(page_index))
         if title_top is not None:
             top = min(top, title_top)

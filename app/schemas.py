@@ -69,6 +69,27 @@ class PageScore(BaseModel):
     )
 
 
+class TableBox(BaseModel):
+    """Where a table sits on its page, as fractions of the page (0-1).
+
+    Fractions rather than points, because the only consumer is the preview,
+    which draws onto an image rendered at whatever dpi it likes.
+
+    Only the AI tier fills this in. The deterministic tier does not need it:
+    the preview re-measures the grid itself and gets the exact rulings.
+    """
+
+    page: int
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    source: str = Field(
+        description="'text' when the extracted values were found in the page's "
+        "own text layer, 'model' when the model estimated it from the image"
+    )
+
+
 class ScheduleTable(BaseModel):
     """One schedule. A sheet often carries several stacked down the page --
     a main door schedule, then residential units, then guestrooms."""
@@ -103,6 +124,11 @@ class ExtractionResult(BaseModel):
     )
     page_scores: list[PageScore] = Field(
         default_factory=list, description="Diagnostics; only when ?debug=true"
+    )
+    box: TableBox | None = Field(
+        None,
+        description="Where the table was found, when the AI tier read it. The "
+        "preview draws this; without it an AI-read page shows no outline.",
     )
 
 

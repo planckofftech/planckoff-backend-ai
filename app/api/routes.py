@@ -1,8 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
+import tempfile
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import JSONResponse
@@ -18,6 +21,8 @@ from app.schemas import ExtractionResult, HealthResponse
 log = logging.getLogger(__name__)
 router = APIRouter()
 
+_UPLOAD_CHUNK = 1024 * 1024
+
 
 @router.get("/health", response_model=HealthResponse, tags=["meta"])
 async def health() -> HealthResponse:
@@ -32,27 +37,54 @@ def _too_large(actual_mb: float | None, limit_mb: float) -> HTTPException:
     )
 
 
-async def _read_upload(file: UploadFile) -> bytes:
+@asynccontextmanager
+async def _spooled_upload(file: UploadFile) -> AsyncIterator[Path]:
+    """Stream the upload to a temp file and yield its path; always clean up.
+
+    Buffering the upload into one blob and handing that to PyMuPDF meant the
+    file sat in memory twice -- around a gigabyte for a 500 MB drawing set
+    before a page was read. From disk, pages are read as they are needed.
+    """
     settings = get_settings()
     limit = int(settings.max_upload_mb * 1024 * 1024)
 
-    # Starlette knows the part size up front; reject before buffering anything.
+    # Starlette knows the part size up front; reject before writing anything.
     declared = getattr(file, "size", None)
     if declared is not None and declared > limit:
         raise _too_large(declared / 1024 / 1024, settings.max_upload_mb)
 
-    chunks: list[bytes] = []
+    handle = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    path = Path(handle.name)
     total = 0
-    while chunk := await file.read(1024 * 1024):
-        total += len(chunk)
-        if total > limit:
-            # Read no further -- the point of the cap is to not hold the file.
-            raise _too_large(None, settings.max_upload_mb)
-        chunks.append(chunk)
-    if not total:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="File is empty.")
-    return b"".join(chunks)
+    try:
+        try:
+            while chunk := await file.read(_UPLOAD_CHUNK):
+                total += len(chunk)
+                if total > limit:
+                    raise _too_large(total / 1024 / 1024, settings.max_upload_mb)
+                handle.write(chunk)
+        finally:
+            handle.close()
+
+        if not total:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="File is empty.")
+        yield path
+    finally:
+        _discard(path)
+
+
+def _discard(path: Path) -> None:
+    """Delete the temp upload, tolerating a lock we cannot break.
+
+    A malformed PDF can leave PyMuPDF holding a handle, and Windows refuses to
+    delete an open file. Losing a temp file to the OS cleaner is a far smaller
+    problem than turning a rejected upload into a 500.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("could not remove temp upload %s: %s", path, exc)
 
 
 @router.post(
@@ -68,31 +100,27 @@ async def extract_door_schedule(
     _key: str = Depends(require_api_key),
 ) -> ExtractionResult:
     started = time.perf_counter()
-    data = await _read_upload(file)
-
-    try:
-        result = await extract(data, allow_ai=allow_ai, debug=debug)
-    except NotAPdfError as exc:
-        log.warning("rejected upload: %s", exc)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="File is not a readable PDF.") from exc
-    except NoScheduleFoundError as exc:
-        raise HTTPException(status_code=422,
-                            detail=str(exc)) from exc
-    except NoRowsError as exc:
-        raise HTTPException(status_code=422,
-                            detail=str(exc)) from exc
-    except AiUpstreamError as exc:
-        # A billing or auth failure upstream must never read as "no rows found".
-        # Log it too: the caller sees the detail, but whoever is watching the
-        # server saw only a bare "502 Bad Gateway" with no reason at all.
-        log.error("ai upstream failed: %s", exc)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
-                            detail=f"AI provider error: {exc}") from exc
+    async with _spooled_upload(file) as path:
+        size_mb = path.stat().st_size / 1024 / 1024
+        try:
+            result = await extract(path, allow_ai=allow_ai, debug=debug)
+        except NotAPdfError as exc:
+            log.warning("rejected upload: %s", exc)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="File is not a readable PDF.") from exc
+        except (NoScheduleFoundError, NoRowsError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AiUpstreamError as exc:
+            # A billing or auth failure upstream must never read as "no rows
+            # found". Log it too: the caller sees the detail, but whoever is
+            # watching the server saw only a bare 502 with no reason at all.
+            log.error("ai upstream failed: %s", exc)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                                detail=f"AI provider error: {exc}") from exc
 
     log.info(
         "extract file=%s size_mb=%.1f pages=%s method=%s rows=%s ms=%s",
-        file.filename, len(data) / 1024 / 1024, result.pages_scanned,
+        file.filename, size_mb, result.pages_scanned,
         result.method.value, result.row_count,
         int((time.perf_counter() - started) * 1000),
     )
@@ -159,6 +187,23 @@ async def master_sheet(
     )
 
 
+def _parse_box(raw: str | None) -> tuple[float, float, float, float] | None:
+    """'x0,y0,x1,y1' as fractions of the page, or None.
+
+    A malformed box is ignored rather than rejected: it is a drawing hint, and
+    refusing the whole preview over it would hide the page as well as the box.
+    """
+    if not raw:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(part) for part in raw.split(","))
+    except ValueError:
+        return None
+    if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+        return None
+    return x0, y0, x1, y1
+
+
 @router.post(
     "/api/v1/door-schedule/preview",
     tags=["extraction"],
@@ -168,19 +213,41 @@ async def master_sheet(
 )
 async def preview(
     file: UploadFile = File(...),
+    box: str | None = Query(
+        None,
+        description="Rectangle to outline, as 'x0,y0,x1,y1' fractions of the "
+        "page. Pass the `box` from an extraction that the AI tier answered: "
+        "the model returns no geometry, so without it that page has nothing "
+        "to outline.",
+    ),
+    page: int | None = Query(None, ge=1, description="Page the box belongs to"),
+    label: str | None = Query(None, description="Caption drawn on the box"),
     _key: str = Depends(require_api_key),
 ) -> Response:
-    """Visual confirmation that the right region was located. No AI, ever."""
+    """Visual confirmation that the right region was located. No AI, ever.
+
+    Never calls the model, including when drawing a box the model's output led
+    to: the caller supplies that rectangle, so opening the preview twice costs
+    nothing and cannot return a different answer from the extraction.
+    """
     from app.core import page_finder
     from app.core.preview import render_preview
     from app.pipeline import select_fallback_pages
 
-    data = await _read_upload(file)
-    try:
-        with PdfDoc(data) as doc:
+    rect = _parse_box(box)
+
+    async with _spooled_upload(file) as path:
+      try:
+        with PdfDoc(path) as doc:
             scores = page_finder.find_schedule_pages(doc)
             candidates = page_finder.passing(scores)
-            if candidates:
+            by_page = {c.page: c for c in scores}
+            if rect is not None and page is not None and page in by_page:
+                # The caller already knows where the table is, so neither the
+                # gates nor the locator get a say -- they are what failed on
+                # this page in the first place.
+                chosen, located = by_page[page], True
+            elif candidates:
                 chosen, located = candidates[0], True
             else:
                 # No recoverable geometry -- most likely a scan. Show the page
@@ -192,10 +259,10 @@ async def preview(
                         detail=f"No door schedule found - scanned "
                                f"{doc.page_count} pages.",
                     )
-                by_page = {c.page: c for c in scores}
                 chosen, located = by_page[fallback[0]], False
-            png = render_preview(doc, chosen, located=located)
-    except NotAPdfError as exc:
+            png = render_preview(doc, chosen, located=located, box=rect,
+                                 box_label=label or "")
+      except NotAPdfError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="File is not a readable PDF.") from exc
 
@@ -205,6 +272,7 @@ async def preview(
         headers={
             "X-Source-Page": str(chosen.page),
             "X-Table-Located": "true" if located else "false",
+            "X-Box-Source": "supplied" if rect is not None else "measured",
         },
     )
 
@@ -218,20 +286,21 @@ async def inspect(
     """Scores every page. Use this to retune thresholds against new bid sets."""
     from app.core import page_finder
 
-    data = await _read_upload(file)
     started = time.perf_counter()
-    try:
-        with PdfDoc(data) as doc:
-            scores = page_finder.find_schedule_pages(doc)
-            pages = doc.page_count
-    except NotAPdfError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="File is not a readable PDF.") from exc
+    async with _spooled_upload(file) as path:
+        size_mb = path.stat().st_size / 1024 / 1024
+        try:
+            with PdfDoc(path) as doc:
+                scores = page_finder.find_schedule_pages(doc)
+                pages = doc.page_count
+        except NotAPdfError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="File is not a readable PDF.") from exc
 
     return {
         "filename": file.filename,
         "pages_scanned": pages,
-        "size_mb": round(len(data) / 1024 / 1024, 2),
+        "size_mb": round(size_mb, 2),
         "duration_ms": int((time.perf_counter() - started) * 1000),
         "passing_pages": [c.page for c in page_finder.passing(scores)],
         "scores": [c.as_dict() for c in sorted(scores, key=lambda c: c.score, reverse=True)

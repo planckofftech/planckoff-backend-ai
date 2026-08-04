@@ -1,4 +1,4 @@
-﻿"""Deterministic extraction of one candidate page: grid -> cells -> DoorRows."""
+"""Deterministic extraction of one candidate page: grid -> cells -> DoorRows."""
 
 from __future__ import annotations
 
@@ -19,13 +19,66 @@ log = logging.getLogger(__name__)
 # qualified. The page-level gate stays at its full strength.
 _SECONDARY_TAG_RUN = 3
 
+# How much of a block has to make sense before we call it a schedule.
+_MIN_MAPPED_FIELDS = 4
+_MIN_FIELDS_WITH_TAG = 3
+_MIN_SCHEDULE_ROWS = 2
+
 # A sheet carries other schedules that share a door schedule's vocabulary --
 # WIDTH, HEIGHT, TYPE, MATERIAL, FINISH, HEAD, JAMB -- so keyword scoring alone
 # cannot tell them apart. The printed caption can.
 _DOOR_WORDS = ("DOOR", "OPENING", "FRAME", "LEAF")
 _OTHER_SCHEDULES = ("WINDOW", "GLAZING", "GLASS", "ROOM FINISH", "FINISH SCHEDULE",
                     "LOUVER", "STOREFRONT", "CASEWORK", "PARTITION", "WALL TYPE",
-                    "EQUIPMENT", "LIGHTING", "PLUMBING", "SIGNAGE")
+                    "EQUIPMENT", "LIGHTING", "PLUMBING", "SIGNAGE",
+                    # A toilet-accessories block is tagged TA1, TA2, TA3 -- which
+                    # is tag-shaped, distinct and sequential, so nothing about
+                    # its data says "not doors". Its caption does.
+                    "ACCESSOR", "SPECIALT", "APPLIANCE", "MILLWORK")
+
+
+def _names_doors(rows: list[DoorRow]) -> bool:
+    """Does the tag column actually hold door numbers?
+
+    A hardware-group list prints the door it belongs to as a heading -- "DOOR
+    #: X7.101" -- and its QTY column of 1s and 2s is tag-shaped, which was
+    enough to let a catalogue of hinges and closers through as a 34-row
+    schedule beside the real 14-row one.
+
+    So: tag-shaped, and mostly distinct. Numbering doors is what a door
+    schedule is for, and a column that repeats the same few values is counting
+    something instead.
+    """
+    tags = [r.door_tag for r in rows if r.door_tag]
+    if len(tags) < _MIN_SCHEDULE_ROWS:
+        return False
+    if len(set(tags)) * 2 < len(tags):
+        return False
+    return sum(bool(page_finder.TAG_RE.match(t)) for t in tags) * 2 >= len(tags)
+
+
+def looks_like_a_schedule(mapped: list[str | None], headers: list[str],
+                          rows: list[DoorRow]) -> bool:
+    """Does this block behave like a door schedule, or merely sit in a box?
+
+    Searching a sheet for *every* table finds the extra door schedules it was
+    meant to find, and also finds hardware group lists, finish legends and
+    drawing notes -- anything ruled. One sheet returned seven "schedules" and
+    181 rows, of which one was real.
+
+    A title cannot settle it, because these blocks have no title. What settles
+    it is how much of the block we could understand: a real schedule names
+    several door fields, junk names one and fills the rest with Column 24.
+    """
+    fields = {f for f in mapped if f}
+    if len(rows) < _MIN_SCHEDULE_ROWS:
+        return False
+    if len(fields) >= _MIN_MAPPED_FIELDS:
+        return True
+    # A genuine door tag is worth a lot: with one, fewer other fields will do.
+    # It has to be a genuine one, though -- see _names_doors.
+    return ("door_tag" in fields and len(fields) >= _MIN_FIELDS_WITH_TAG
+            and _names_doors(rows))
 
 
 def is_other_schedule(title: str) -> bool:
@@ -96,6 +149,18 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
     if raw_rows and _looks_like_header(raw_rows[0], header_strings):
         raw_rows = raw_rows[1:]
 
+    columns = [[r[i] if i < len(r) else "" for r in raw_rows]
+               for i in range(len(header_strings))]
+    before = list(mapped)
+    mapped = header_mapper.infer_tag_column(mapped, columns, header_strings)
+    if mapped != before:
+        claimed = header_strings[mapped.index("door_tag")]
+        warnings.append(
+            f"no column named the door tag; read it from the data in {claimed!r}"
+        )
+        unmapped = [h for h in unmapped if h != claimed]
+    tag_col = header_mapper.tag_column_index(mapped)
+
     if unmapped:
         warnings.append(
             f"unmapped column headers kept under 'extra': {', '.join(unmapped)}"
@@ -138,6 +203,7 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
     """
     out: list[PageExtraction] = []
     skipped: list[PageExtraction] = []
+    rejected: list[PageExtraction] = []
     seen: set[tuple[int, int]] = set()
 
     for candidate in candidates:
@@ -165,11 +231,33 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
                 continue
 
             if is_other_schedule(extraction.title):
-                log.info("skipping %r on page %s (%s rows): not a door schedule",
+                log.info("skipping %r on page %s (%s rows): another schedule",
                          extraction.title, extraction.page, len(extraction.rows))
                 skipped.append(extraction)
                 continue
+
+            if not looks_like_a_schedule(extraction.mapped, extraction.headers,
+                                         extraction.rows):
+                log.info("skipping block on page %s at y=%.0f (%s rows, %s fields "
+                         "understood): does not behave like a schedule",
+                         extraction.page, band.header_y, len(extraction.rows),
+                         len({f for f in extraction.mapped if f}))
+                rejected.append(extraction)
+                continue
             out.append(extraction)
+
+    # The test above is meant to remove junk that sits *alongside* a real
+    # schedule. When it rejects everything, the page still passed the full
+    # structural gates, so the strongest block is more likely a schedule we
+    # mapped badly than a legend -- return it rather than nothing, and say so.
+    if not any(e.rows for e in out) and rejected:
+        best = max(rejected, key=lambda e: (len({f for f in e.mapped if f}),
+                                            len(e.rows)))
+        best.warnings.append(
+            "only a few columns on this table could be identified; check the "
+            "rows against the drawing"
+        )
+        out.append(best)
 
     # Only worth mentioning when it is the difference between rows and nothing:
     # otherwise it is noise on every multi-schedule sheet.
@@ -180,6 +268,7 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
             [f"Found no door schedule. Other schedules on this sheet: {names}."],
         ))
     return out
+
 
 
 

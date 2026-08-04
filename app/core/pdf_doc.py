@@ -7,12 +7,25 @@ is Python and not an extension of the TypeScript app (PLAN.md section 3).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import fitz
 
 
 class NotAPdfError(ValueError):
     pass
+
+
+# Producers sometimes emit junk before the header, so look in a window rather
+# than demanding it at byte zero.
+_SIGNATURE_WINDOW = 2048
+
+
+def _require_pdf_signature(path: Path) -> None:
+    with path.open("rb") as handle:
+        head = handle.read(_SIGNATURE_WINDOW)
+    if b"%PDF" not in head:
+        raise NotAPdfError("file does not start with a PDF signature")
 
 
 @dataclass(slots=True)
@@ -83,14 +96,40 @@ def _is_horizontal(direction: tuple[float, float], matrix: "fitz.Matrix") -> boo
 class PdfDoc:
     """Owns a fitz.Document. Use as a context manager."""
 
-    def __init__(self, data: bytes):
+    def __init__(self, source: bytes | str | Path):
+        """Open from bytes, or from a path.
+
+        A path is the cheap route for a large set: PyMuPDF reads pages from
+        disk as they are needed, so memory stays roughly flat. Handing it bytes
+        means the whole file sits in memory twice -- ours and its copy -- which
+        is around a gigabyte for a 500 MB drawing set before a page is read.
+        """
+        doc = None
         try:
-            self.doc = fitz.open(stream=data, filetype="pdf")
+            if isinstance(source, (str, Path)):
+                # Check the signature ourselves first. On a file it cannot
+                # parse, PyMuPDF raises *after* taking a handle and does not
+                # release it, and Windows will not delete an open file -- so a
+                # rejected upload could not be cleaned up.
+                _require_pdf_signature(Path(source))
+                doc = fitz.open(str(source))
+                self.size_bytes = Path(source).stat().st_size
+            else:
+                doc = fitz.open(stream=source, filetype="pdf")
+                self.size_bytes = len(source)
+            if doc.page_count == 0:
+                raise NotAPdfError("PDF contains no pages")
         except Exception as exc:  # noqa: BLE001 - any failure means unreadable
-            raise NotAPdfError(str(exc)) from exc
-        if self.doc.page_count == 0:
-            raise NotAPdfError("PDF contains no pages")
-        self.size_bytes = len(data)
+            # Release the handle before propagating. Windows will not delete a
+            # file that is still open, so a half-opened temp upload would leave
+            # the caller unable to clean it up.
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:  # noqa: BLE001 - close must never mask this
+                    pass
+            raise exc if isinstance(exc, NotAPdfError) else NotAPdfError(str(exc))
+        self.doc = doc
         self._text_cache: dict[int, list[TextItem]] = {}
 
     def __enter__(self) -> PdfDoc:

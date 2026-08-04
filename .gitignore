@@ -20,3 +20,8 @@ build/
 pytest.ini
 tests
 test
+PLAN.md
+VALIDATION.md
+postman_collection.json
+mailmap.txt
+corpus_results.json

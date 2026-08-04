@@ -117,6 +117,13 @@
   tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg) 55%, transparent); }
   tbody tr:hover td { background: var(--bg); }
   td.blank { color: transparent; }
+  /* The drawing's own heading leads; the field we mapped it to sits under it,
+     quieter, so the column can be checked against the paper at a glance and
+     still be traced into the master sheet. */
+  th .mapped {
+    display: block; margin-top: 3px; font-weight: 400; font-size: 10px;
+    text-transform: none; letter-spacing: 0; opacity: .6;
+  }
   /* A column no source has answered -- visibly waiting, not visibly wrong. */
   th.unfilled { color: var(--line); font-style: italic; }
   td.tag { font-weight: 650; }
@@ -376,7 +383,10 @@ function tableHtml(t) {
   const cols = columnsFor(t);
   if (!cols.length) return "";
   let html = '<div class="tablewrap"><table><thead><tr>';
-  for (const c of cols) html += "<th>" + esc(c.label) + "</th>";
+  for (const c of cols) {
+    html += "<th>" + esc(c.label) +
+      (c.sub ? '<span class="mapped">' + esc(c.sub) + "</span>" : "") + "</th>";
+  }
   html += "</tr></thead><tbody>";
 
   for (const r of t.rows) {
@@ -418,7 +428,14 @@ function columnsFor(t) {
     const field = (t.field_map || [])[i] || null;
     if (field) {
       used.add(field);
-      cols.push({ key: field, label: LABELS.get(field) || nice(field),
+      // Head the column the way the drawing heads it. Showing our own name
+      // instead -- "Width" over a column the sheet calls PANEL WIDTH -- made
+      // the table on screen impossible to check against the paper, and looked
+      // like the values had been shuffled when they had not. The field we
+      // mapped it to still shows underneath, because that is what drives the
+      // master sheet.
+      cols.push({ key: field, label: header || LABELS.get(field) || nice(field),
+                  sub: header ? (LABELS.get(field) || nice(field)) : "",
                   get: r => r[field] || "" });
     } else {
       const k = slug(header);
@@ -499,8 +516,21 @@ $("preview").addEventListener("click", async () => {
   const body = new FormData();
   body.append("file", f);
 
+  // The AI tier reads a page the locator could not measure, so the service has
+  // no geometry to re-derive here. It works the rectangle out during
+  // extraction and returns it; hand it back rather than showing a bare page.
+  const params = new URLSearchParams();
+  const b = lastResult && lastResult.box;
+  if (b) {
+    params.set("box", [b.x0, b.y0, b.x1, b.y1].map(n => n.toFixed(4)).join(","));
+    params.set("page", b.page);
+    const t = (lastResult.tables || [])[0];
+    if (t && t.title) params.set("label", t.title);
+  }
+  const query = params.toString() ? "?" + params.toString() : "";
+
   try {
-    const res = await fetch(base() + "/api/v1/door-schedule/preview", {
+    const res = await fetch(base() + "/api/v1/door-schedule/preview" + query, {
       method: "POST", headers: { "X-API-Key": $("key").value }, body
     });
     if (!res.ok) {
@@ -517,7 +547,12 @@ $("preview").addEventListener("click", async () => {
       'rel="noopener"><img src="' + previewUrl + '" alt="Page ' + esc(page) +
       '"></a></div>' +
       "<figcaption>" + (located
-        ? "Page " + esc(page) + " — the schedule is outlined in red. Click to enlarge."
+        ? "Page " + esc(page) + " — the schedule is outlined in red" +
+          (b ? (b.source === "text"
+                 ? ", placed by matching the extracted values back to the page"
+                 : ", placed by the AI — approximate")
+             : "") +
+          ". Click to enlarge."
         : "Page " + esc(page) + " — this is the page that was read. No outline " +
           "is shown because its layout could not be measured.") +
       "</figcaption></figure>";
