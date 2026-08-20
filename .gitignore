@@ -6,6 +6,21 @@
 # Scratch folder for validate_corpus.py inputs.
 corpus/
 
+# Real drawing sets. Never commit these -- git keeps every byte forever, and
+# they are a client's documents, not ours.
+test/
+
+# What a run produced from those sets: door schedules with real numbers and
+# widths, and rendered crops of client drawings. Same reasoning as the PDFs --
+# the output of a confidential document is still confidential.
+*_detect*.json
+*_results.json
+corpus_results.json
+bakeoff/
+
+# A stakeholder's own file, kept locally for reference. Somebody else's work.
+Door detection- *.html
+
 .env
 .venv/
 venv/
@@ -25,3 +40,6 @@ VALIDATION.md
 postman_collection.json
 mailmap.txt
 corpus_results.json
+scripts
+Door Takeoff - Component Logic.xlsx
+DOCUMENTATION.md

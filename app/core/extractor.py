@@ -34,7 +34,15 @@ _OTHER_SCHEDULES = ("WINDOW", "GLAZING", "GLASS", "ROOM FINISH", "FINISH SCHEDUL
                     # A toilet-accessories block is tagged TA1, TA2, TA3 -- which
                     # is tag-shaped, distinct and sequential, so nothing about
                     # its data says "not doors". Its caption does.
-                    "ACCESSOR", "SPECIALT", "APPLIANCE", "MILLWORK")
+                    "ACCESSOR", "SPECIALT", "APPLIANCE", "MILLWORK",
+                    # Mechanical and electrical schedules share a door
+                    # schedule's whole vocabulary -- MARK, TYPE, MATERIAL,
+                    # FINISH -- so they clear every structural test there is.
+                    # One 187-page set returned its door schedule and three
+                    # AIR DEVICE SCHEDULEs, 39 diffusers priced as doors.
+                    "AIR DEVICE", "AIR TERMINAL", "DIFFUSER", "GRILLE",
+                    "REGISTER", "MECHANICAL", "ELECTRICAL", "PANELBOARD",
+                    "LUMINAIRE", "FIXTURE", "VAV", "RTU", "FAN ", "PUMP")
 
 
 def _names_doors(rows: list[DoorRow]) -> bool:
@@ -177,13 +185,123 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
                 continue
             field = mapped[idx]
             if field:
-                values[field] = text
+                values[field] = _join_split_mark(text) if field == "door_tag" \
+                    else text
             elif text:
                 extra[header_mapper.extra_key(header_strings[idx], idx)] = text
+        # A second line of the heading, wearing a door's clothes.
+        if _is_heading_row(values.get("door_tag", "")):
+            continue
+        _split_run_on_tag(values)
         rows.append(DoorRow(**values, extra=extra))
+
+    # A mark carrying a character no font could have meant. One sheet's embedded
+    # font has a damaged ToUnicode map -- every glyph it gets wrong comes back
+    # 29 code points low, so TYPE reads "T<PE" and door 106 reads "10" plus a
+    # control character. Left unsaid, that door is quietly unmatchable: its
+    # number is not what the plan prints, and stripping the bad character would
+    # turn 106 and 108 into two doors both called 10.
+    damaged = [r.door_tag for r in rows
+               if any(ord(c) < 32 for c in r.door_tag)]
+    if damaged:
+        warnings.append(
+            f"{len(damaged)} door number(s) could not be read: this sheet's "
+            "embedded font has a damaged character map. Check them against the "
+            "drawing before pricing -- they will not match the floor plan."
+        )
 
     return PageExtraction(candidate.page, method, header_strings, rows, warnings,
                           unmapped, candidate, title, mapped)
+
+
+# A door mark printed as a number and a letter with air between them. Real
+# schedules do this: the number is set under the room-number column rule and the
+# suffix a little to its right, so the text layer gives back "105 B" for what
+# the drawing calls 105B and what is stencilled 105B on the plan.
+#
+# One letter, or two. Never more: "101 HM" is a mark and a material that have
+# run together, and gluing those would invent a door.
+_SPLIT_MARK = re.compile(r"^(\d{1,4})\s+([A-Za-z]{1,2})$")
+
+
+# A door number with a room name stuck to it. Where a column boundary falls
+# slightly wrong the neighbouring cell's text lands in the number's cell, and
+# "114 ALTERATIOM ROOM" is then the door's name everywhere downstream -- it
+# matches nothing on the plan and is reported as a door in the schedule that
+# was never drawn.
+_TRAILING_WORDS = re.compile(r"^(\S+)\s+(.*[A-Za-z]{3}.*)$")
+
+
+def _split_run_on_tag(values: dict[str, str]) -> None:
+    """Separate a door number from the room name that ran into its cell.
+
+    Where a column boundary falls slightly wrong the neighbouring cell's text
+    lands in the number's: "114 ALTERATIOM ROOM" becomes the door's name
+    everywhere downstream, matches nothing on the plan, and is reported as a
+    scheduled door that was never drawn.
+
+    The words are *moved*, not dropped. They are the room this door comes from,
+    and that cell is empty precisely because its text ended up here -- so
+    trimming the tag and stopping would fix the number by losing the location.
+
+    Only ever splits when the first token is tag-shaped on its own and what
+    follows holds a real word. "105 B" is a mark and is joined before this runs.
+    """
+    tag = values.get("door_tag", "")
+    found = _TRAILING_WORDS.match(tag.strip())
+    if not found or not page_finder.TAG_RE.match(found.group(1)):
+        return
+    values["door_tag"] = found.group(1)
+    if not values.get("from_space"):
+        values["from_space"] = found.group(2).strip()
+
+
+# A heading that survived into the rows. The first line is dropped by matching
+# it against the joined header text, but a schedule with a stacked heading has a
+# second line -- "DOOR NO. | W | SIZE HT | TYPE | MATL" -- that matches nothing
+# and becomes a door. It is then reported as scheduled and never drawn, which is
+# the most expensive wrong answer this service gives.
+_HEADING_TAGS = frozenset(
+    header_mapper.normalize(a)
+    for field, aliases in header_mapper.HEADER_ALIASES if field == "door_tag"
+    for a in aliases
+) | {"DOOR", "MARK", "NO", "DOOR NO", "NUMBER", "TAG", "SYMBOL"}
+
+
+def _is_heading_row(tag: str) -> bool:
+    """Is this row's "door number" a label rather than a door?
+
+    Two kinds, and both were being priced as doors. A stacked heading's second
+    line lands in the rows as "DOOR NO."; and a schedule that groups its doors
+    by storey prints "FIRST FLOOR" across the number column as a band, which
+    came back four times over on one set.
+
+    A door number always carries a digit -- that is what `TAG_RE` is built on
+    and what the whole matcher relies on -- so a run of letters in the number
+    column is a caption, whatever it says.
+    """
+    text = header_mapper.normalize(tag)
+    if not text:
+        return False
+    if text in _HEADING_TAGS:
+        return True
+    return not any(ch.isdigit() for ch in text) and len(text) >= _MIN_LABEL_LEN
+
+
+# Shorter than this and a letters-only mark could be a real door -- some sets
+# letter their openings A, B, C.
+_MIN_LABEL_LEN = 3
+
+
+def _join_split_mark(tag: str) -> str:
+    """"105 B" is door 105B. Everything downstream matches on this string.
+
+    Left alone it fails twice over: the plan prints 105B, so the door is never
+    located, and the schedule reads as though 105 and B were separate marks. On
+    one 34-door schedule every single row was split this way.
+    """
+    found = _SPLIT_MARK.match(tag.strip())
+    return f"{found.group(1)}{found.group(2)}" if found else tag
 
 
 def _looks_like_header(cells: list[str], header_strings: list[str]) -> bool:
@@ -192,6 +310,47 @@ def _looks_like_header(cells: list[str], header_strings: list[str]) -> bool:
     if not norm_row or not norm_hdr:
         return False
     return len(norm_row & norm_hdr) >= max(2, len(norm_row) // 2)
+
+
+def _one_reading_per_table(found: list[PageExtraction]) -> list[PageExtraction]:
+    """Drop a table we have already read, however we came to read it twice.
+
+    Looking for every schedule on a sheet means offering the locator several
+    header bands, and more than one of them can land on the same table -- a
+    stray band on one sheet produced a third "table" that was the left-hand
+    schedule again, its rows sheared across the wrong columns.
+
+    Door numbers settle it. Two readings of one page that share most of their
+    numbers are one table, and the better reading is the one that understood
+    more columns, then the one with more rows. Nothing here can merge two
+    genuinely different schedules: side by side or stacked, they have entirely
+    different door numbers.
+    """
+    # More columns breaks the remaining ties. Two readings of one table differ
+    # by where they took the header from, and a stacked header read at the group
+    # row yields one column where the sheet has three: "DETAILS JAMB SILL HEAD"
+    # holding all three details in a single cell. Neither reading maps those to
+    # a canonical field, so they tied, and the merged one won on list order --
+    # losing the split on every set built that way. Between two readings of the
+    # same rows, the one that resolved more columns has strictly more of the
+    # sheet in it.
+    kept: list[PageExtraction] = []
+    for extraction in sorted(
+        found, key=lambda e: (-len({f for f in e.mapped if f}),
+                              -len(e.headers), -len(e.rows))
+    ):
+        tags = {r.door_tag for r in extraction.rows if r.door_tag}
+        if tags and any(
+            e.page == extraction.page
+            and len(tags & {r.door_tag for r in e.rows if r.door_tag})
+            > len(tags) / 2
+            for e in kept
+        ):
+            log.info("dropping a second reading of the same table on page %s "
+                     "(%d rows)", extraction.page, len(extraction.rows))
+            continue
+        kept.append(extraction)
+    return sorted(kept, key=lambda e: (e.page, -len(e.rows)))
 
 
 def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtraction]:
@@ -216,7 +375,10 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
             min_tag_run=_SECONDARY_TAG_RUN,
         ) or [candidate]
         for band in bands:
-            key = (band.page, int(round(band.header_y)))
+            # Where the table sits, on both axes. Keyed on height alone, two
+            # schedules printed side by side share a key and the second is
+            # thrown away -- see page_finder.header_bands.
+            key = (band.page, int(round(band.header_y)), int(round(band.tag_x)))
             if key in seen:
                 continue
             seen.add(key)
@@ -258,6 +420,8 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
             "rows against the drawing"
         )
         out.append(best)
+
+    out = _one_reading_per_table(out)
 
     # Only worth mentioning when it is the difference between rows and nothing:
     # otherwise it is noise on every multi-schedule sheet.

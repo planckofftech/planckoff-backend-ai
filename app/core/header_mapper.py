@@ -16,8 +16,12 @@ from app.schemas import CANONICAL_FIELDS
 HEADER_ALIASES: list[tuple[str, list[str]]] = [
     ("frame_material", ["FRAME MATERIAL", "FRAME MATL", "FRM MATERIAL", "FRAME MAT"]),
     ("frame_finish", ["FRAME FINISH", "FRM FINISH", "FRAME FIN"]),
-    ("door_tag", ["#", "NO", "NO.", "MARK", "DOOR NO", "DOOR NO.", "DOOR #", "TAG",
-                  "DOOR MARK", "DR NO"]),
+    # NUMBER is as common as NO. and was missing: two real schedules headed
+    # their door column that way, and both fell through to guessing the tag
+    # from the data. On one of them the guess failed and every row came back
+    # with no door number at all.
+    ("door_tag", ["#", "NO", "NO.", "NUMBER", "DOOR NUMBER", "MARK", "DOOR NO",
+                  "DOOR NO.", "DOOR #", "TAG", "DOOR MARK", "DR NO"]),
     ("from_space", ["FROM", "FROM ROOM", "FROM SPACE"]),
     ("to_space", ["TO", "TO ROOM", "TO SPACE"]),
     # "PANEL WIDTH" first: sheets that group columns under DOOR and FRAME print
@@ -45,6 +49,20 @@ _PUNCT = re.compile(r"[^A-Z0-9# ]+")
 
 # What a door tag looks like when we have to recognise it from the data alone.
 _MIN_PREFIX_ALIAS = 3
+# The longest a stacked header's own name may be for the "leaf" pass to trust
+# it. W, H, HT and WD are what schedules actually print under a SIZE band;
+# anything longer than this has already had its chance at the rules above.
+_MAX_LEAF_ALIAS = 2
+# Single words allowed to match in the middle of a heading, so that
+# "DOOR SIZE WIDTH" is read as a width.
+#
+# A door schedule states exactly one width, one height and one thickness, so
+# those words cannot mean anything else on it. TYPE, RATING, MATERIAL and
+# FINISH are the opposite: every one of them appears twice, qualified -- DOOR
+# TYPE and FRAME TYPE, FIRE RATING and ACOUSTIC RATING. Matching those loose
+# puts the frame's value in the door's column, and an acoustic rating in the
+# fire rating.
+_SAFE_MID_HEADING = frozenset({"WIDTH", "HEIGHT", "THICKNESS", "THK", "UNDERCUT"})
 # Which door field a repeated heading hands over to the frame.
 _DOOR_TO_FRAME = {"door_material": "frame_material", "door_finish": "frame_finish"}
 _MAX_TAG_LEN = 10
@@ -81,28 +99,57 @@ def map_headers(headers: list[str],
     claimed: set[str] = set()
 
 
-    # Exact matches first, so an exact "FINISH" is not stolen by a prefix rule.
-    for exact_pass in (True, False):
+    # Three passes, most specific first, because a heading can legitimately
+    # match several fields and the tightest match is the right one:
+    #
+    #   exact     "FINISH" is a finish, and must not be stolen by a prefix rule
+    #   prefix    "HARDWARE TYPE" starts with HARDWARE, so it is the hardware
+    #             set -- decided before anything gets to notice it ends in TYPE
+    #   contains  "DOOR SIZE WIDTH" is a width; nothing tighter claimed it
+    #
+    # Collapsing prefix and contains into one pass makes "HARDWARE TYPE" a door
+    # type, because door_type is tried before hw_set and TYPE is inside it.
+    # "leaf" runs last and only on what is still unmapped. A stacked header is
+    # read as its group plus its own name -- "SIZE W x H" over "W" arrives here
+    # as "SIZE W X H W" -- and no rule above can see the "W", because a
+    # one-letter alias is too dangerous to match anywhere inside a heading.
+    #
+    # At the end of a grouped heading it is not dangerous: that last token IS
+    # the column's own name and the group in front of it is context. Restricted
+    # to short tokens, because anything longer already matches above. Without
+    # this, every width and height on two real schedules came back empty while
+    # the values sat in `extra` under "size_w_x_h_w_h".
+    for mode in ("exact", "prefix", "contains", "leaf"):
         for field, aliases in _NORMALIZED_ALIASES:
             if field in claimed:
                 continue
             for idx, text in enumerate(normalized):
                 if mapped[idx] is not None or not text:
                     continue
-                if exact_pass:
+                if mode == "exact":
                     hit = text in aliases
-                else:
+                elif mode == "prefix":
                     # Two-letter aliases match exactly or not at all: FR meant
                     # fire rating, so "FR. TYPE" -- a frame type -- was being
                     # read as the fire rating on every row.
                     hit = any(
                         len(a) >= _MIN_PREFIX_ALIAS
-                        and (text.startswith(a + " ") or a.startswith(text + " ")
-                             # A multi-word alias may sit in the middle:
-                             # "OPENING FIRE RATING" is a fire rating. Only
-                             # multi-word, because containing "TYPE" would make
-                             # every FRAME TYPE column a door type.
-                             or (" " in a and f" {a} " in f" {text} "))
+                        and (text.startswith(a + " ") or a.startswith(text + " "))
+                        for a in aliases
+                    )
+                elif mode == "leaf":
+                    leaf = text.rsplit(" ", 1)[-1] if " " in text else ""
+                    hit = bool(leaf) and len(leaf) <= _MAX_LEAF_ALIAS \
+                        and leaf in aliases
+                else:
+                    # A whole word anywhere in the heading. Multi-word aliases
+                    # always -- "OPENING FIRE RATING" is a fire rating. Single
+                    # words only where the word can mean nothing else on a door
+                    # schedule; see _SAFE_MID_HEADING.
+                    hit = any(
+                        len(a) >= _MIN_PREFIX_ALIAS
+                        and (" " in a or a in _SAFE_MID_HEADING)
+                        and f" {a} " in f" {text} "
                         for a in aliases
                     )
                 if hit:

@@ -79,6 +79,20 @@ _TEXT_FLAGS = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
 # Enough to cover the finder handing its candidates to the extractor.
 _TEXT_CACHE_PAGES = 4
 
+# How many straight pieces to cut a bezier into. One set draws every door swing
+# as a single curve, and taking its chord -- one straight line where an arc was
+# -- left the circle fitter nothing to fit: that project measured 0 swings.
+#
+# Four, measured rather than reasoned. More is not better, because each piece
+# gets shorter and the pieces of an ordinary small curve fall through the
+# `_MIN_SEG_LEN` noise floor, taking real arcs with them. Swings found:
+#
+#     steps       1     2     4     8
+#     OBGYN      38    --    41    25
+#     AT&T       37    37    38    38
+#     BMK         0     2     2     2
+_BEZIER_STEPS = 4
+
 
 def _is_horizontal(direction: tuple[float, float], matrix: "fitz.Matrix") -> bool:
     """Is this text line horizontal *as displayed*?
@@ -131,6 +145,8 @@ class PdfDoc:
             raise exc if isinstance(exc, NotAPdfError) else NotAPdfError(str(exc))
         self.doc = doc
         self._text_cache: dict[int, list[TextItem]] = {}
+        self._drawing_page: int = -1
+        self._drawing_cache: list | None = None
 
     def __enter__(self) -> PdfDoc:
         return self
@@ -192,6 +208,132 @@ class PdfDoc:
         self._text_cache[page_index] = items
         return items
 
+    def _drawings(self, page_index: int) -> list | None:
+        """The page's vector paths, parsed once.
+
+        Finding a door's swing asks for the segments in a small window, and a
+        sheet has forty doors on it -- so the same page was being parsed forty
+        times over. On one 36-door plan that was 84 seconds of work to answer a
+        question worth about two. Only the most recent page is kept, because
+        the callers work through a sheet at a time and the parsed form of a
+        busy drawing is large.
+        """
+        if self._drawing_page == page_index:
+            return self._drawing_cache
+        try:
+            paths = self.doc[page_index].get_drawings()
+        except Exception:  # noqa: BLE001 - malformed content streams happen
+            paths = None
+        self._drawing_page, self._drawing_cache = page_index, paths
+        return paths
+
+    def bookmarks(self) -> list[tuple[str, int]]:
+        """The PDF's own outline as (title, 1-indexed page).
+
+        Drawing sets are usually bookmarked one entry per sheet, carrying the
+        sheet number, its title and its page in one place. That is the whole
+        table of contents the pipeline otherwise reconstructs by reading the
+        title block of all 187 pages.
+
+        Empty when the file has no outline, which happens and is not an error.
+        """
+        try:
+            return [(str(title).strip(), int(page))
+                    for _level, title, page in self.doc.get_toc()
+                    if page and page > 0]
+        except Exception:  # noqa: BLE001 - a malformed outline is not fatal
+            return []
+
+    def segments(self, page_index: int,
+                 within: tuple[float, float, float, float] | None = None
+                 ) -> list[tuple[float, float, float, float]]:
+        """Every vector segment on the page, at any angle, in display space.
+
+        `rulings()` keeps only the horizontal and vertical lines, because tables
+        are made of those. A door swing is made of neither: it is an arc, drawn
+        as a chain of short segments at every angle in between, and finding one
+        needs all of them.
+
+        `within` bounds the search to a rectangle in display points. That matters
+        for more than speed: a sheet carries tens of thousands of segments, and
+        the only reason arcs can be found at all is that something else has
+        already said roughly where to look.
+        """
+        page = self.doc[page_index]
+        matrix = page.rotation_matrix
+        out: list[tuple[float, float, float, float]] = []
+
+        def add(x0: float, y0: float, x1: float, y1: float) -> None:
+            a = fitz.Point(x0, y0) * matrix
+            b = fitz.Point(x1, y1) * matrix
+            if a.x == b.x and a.y == b.y:
+                return
+            if within is not None:
+                lo_x, lo_y, hi_x, hi_y = within
+                if (max(a.x, b.x) < lo_x or min(a.x, b.x) > hi_x
+                        or max(a.y, b.y) < lo_y or min(a.y, b.y) > hi_y):
+                    return
+            out.append((a.x, a.y, b.x, b.y))
+
+        drawings = self._drawings(page_index)
+        if drawings is None:
+            return []
+
+        clip = fitz.Rect(*within) if within else None
+        for path in drawings:
+            # Whole paths can be skipped on their bounding box; most of a sheet
+            # is nowhere near any given door.
+            #
+            # The rect has to be rotated first. `within` is in display space --
+            # it comes from a door tag's position, and text is reported rotated
+            # -- while `path["rect"]` is raw PDF space. On a /Rotate 270 sheet
+            # the two do not overlap at all, so this test rejected every path on
+            # the page and the arc finder saw an empty drawing. One 85-door set
+            # is rotated on every sheet and reported 0 swings because of it.
+            if clip is not None:
+                try:
+                    if not (fitz.Rect(path["rect"]) * matrix).intersects(clip):
+                        continue
+                except (KeyError, ValueError):
+                    pass
+            for item in path["items"]:
+                kind = item[0]
+                if kind == "l":
+                    a, b = item[1], item[2]
+                    add(a.x, a.y, b.x, b.y)
+                elif kind == "c":
+                    # Walk the curve, do not take its chord.
+                    #
+                    # The chord was "good enough" on the assumption that CAD
+                    # exports arcs as chains of short straight lines. Plenty do
+                    # not: one set draws every door swing as a single bezier,
+                    # and a single bezier reduced to a chord is one straight
+                    # line -- so the arc finder, which needs a chain of at
+                    # least four touching pieces to fit a circle to, saw
+                    # nothing at all. That set reported 2 swings across 144
+                    # doors while its drawings show an arc at almost every one.
+                    #
+                    # Flattening costs a handful of points per curve and makes
+                    # those arcs measurable exactly like any other.
+                    p0, p1, p2, p3 = item[1], item[2], item[3], item[4]
+                    previous = (p0.x, p0.y)
+                    for step in range(1, _BEZIER_STEPS + 1):
+                        t = step / _BEZIER_STEPS
+                        s = 1.0 - t
+                        px = (s * s * s * p0.x + 3 * s * s * t * p1.x
+                              + 3 * s * t * t * p2.x + t * t * t * p3.x)
+                        py = (s * s * s * p0.y + 3 * s * s * t * p1.y
+                              + 3 * s * t * t * p2.y + t * t * t * p3.y)
+                        add(previous[0], previous[1], px, py)
+                        previous = (px, py)
+                elif kind == "re":
+                    r = item[1]
+                    add(r.x0, r.y0, r.x1, r.y0)
+                    add(r.x0, r.y1, r.x1, r.y1)
+                    add(r.x0, r.y0, r.x0, r.y1)
+                    add(r.x1, r.y0, r.x1, r.y1)
+        return out
+
     def rulings(self, page_index: int) -> Rulings:
         """Every vector line on the page, split into vertical and horizontal.
 
@@ -215,9 +357,8 @@ class PdfDoc:
             elif dy < _STRAIGHT_TOL and dx >= _MIN_SEG_LEN:
                 horizontal.append(Segment((y0 + y1) / 2, min(x0, x1), max(x0, x1)))
 
-        try:
-            drawings = page.get_drawings()
-        except Exception:  # noqa: BLE001 - malformed content streams happen
+        drawings = self._drawings(page_index)
+        if drawings is None:
             return Rulings([], [])
 
         for path in drawings:

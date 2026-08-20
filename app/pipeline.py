@@ -17,6 +17,7 @@ from app.core import header_mapper, page_finder
 from app.core.extractor import PageExtraction, extract_page, extract_pages
 from app.core.pdf_doc import PdfDoc
 from app.schemas import (
+    DoorRow,
     ExtractionMethod,
     ExtractionResult,
     PageScore,
@@ -38,6 +39,26 @@ _MIN_REAL_COLUMNS = 5
 _MIN_FILL_RATIO = 0.30
 # Never render more than this many pages to the model, whatever the page count.
 _MAX_AI_PAGES = 2
+
+
+# A ruling this long, as a fraction of the page, is a table rule or a wall --
+# not the hatching and symbols that make up most of a drawing's ink.
+_LONG_RULE = 0.10
+# How many text-less candidates to measure. Measuring is a page parse each, and
+# the answer is always near the front of the architectural block.
+_MAX_MEASURED = 30
+
+
+def _long_rules(doc: PdfDoc, page: int) -> int:
+    """How much of this page is drawn as long straight lines -- a grid, or a
+    plan's walls. A schedule scores high on it even with no text at all."""
+    try:
+        width, height = doc.page_size(page - 1)
+        lines = doc.rulings(page - 1)
+    except Exception:  # noqa: BLE001 - an unreadable page simply ranks last
+        return 0
+    return (sum(1 for s in lines.vertical if s.length >= height * _LONG_RULE)
+            + sum(1 for s in lines.horizontal if s.length >= width * _LONG_RULE))
 
 
 def select_fallback_pages(doc: PdfDoc, scores: list, pages_scanned: int) -> list[int]:
@@ -66,8 +87,72 @@ def select_fallback_pages(doc: PdfDoc, scores: list, pages_scanned: int) -> list
         shortlist.update({c.page: c for c in scores
                           if doc.has_raster(c.page - 1)})
 
-    ranked = sorted(shortlist.values(), key=lambda c: (-c.score, c.page))
+    # A door schedule is on an architectural sheet. Where a title block names
+    # another discipline the page is not a candidate, whatever is drawn on it --
+    # the same rule that stops an electrical sheet's dimensions being read as
+    # door numbers. On one set this removes all sixteen M/E/P sheets and leaves
+    # the eleven that carry no title block at all, which are the ones we want.
+    elsewhere: set[int] = set()
+    try:
+        from app.core import plan_index
+
+        elsewhere = {s.page for s in plan_index.index_sheets(doc)
+                     if s.number and not s.is_architectural}
+    except Exception:  # noqa: BLE001 - the index is an optimisation, not a gate
+        elsewhere = set()
+    architectural = {p: c for p, c in shortlist.items() if p not in elsewhere}
+    if architectural:
+        shortlist = architectural
+
+    # Pages with no text all score zero, so score cannot order them and they
+    # came back in page order -- which handed the model the cover sheet. A
+    # schedule is a grid, and a grid survives its text being flattened to
+    # outlines, which is what a "scan" usually is in a drawing set.
+    #
+    # Long rules only. Counting every ruling ranks a plumbing sheet's pipe
+    # hatching (130,000 segments) above a door schedule (19,711), which is why
+    # this looked like a dead end until the disciplines were excluded above.
+    # Measured on the set whose schedule is on page 11:
+    #
+    #     page 11  147 long rules   <- DOOR SCHEDULE
+    #     page 7   141
+    #     page 1    96
+    measured = sorted(shortlist.values(), key=lambda c: c.page)[:_MAX_MEASURED]
+    grid = {c.page: _long_rules(doc, c.page) for c in measured
+            if not c.score and not c.has_text_layer}
+
+    def rank(c) -> tuple:
+        if c.score:
+            return (0, -c.score, c.page)
+        return (1, -grid.get(c.page, 0), c.page)
+
+    ranked = sorted(shortlist.values(), key=rank)
     return [c.page for c in ranked[:_MAX_AI_PAGES]]
+
+
+# What a door schedule has that a lighting, finish or equipment schedule does
+# not. A door number alone is too weak -- every schedule has a first column of
+# marks -- so the test is the number *and* something dimensional beside it.
+_DOOR_COLUMNS = ("door_width", "door_height", "door_type", "door_material",
+                 "frame_material", "frame_finish", "fire_rating", "hw_set",
+                 "threshold")
+
+
+def _is_a_door_schedule(rows: list[DoorRow]) -> bool:
+    """Do these rows describe doors, or some other schedule on the same sheet?
+
+    A drawing set is full of schedules -- lighting, finish, equipment, plumbing
+    fixtures -- and they are laid out identically. Nothing about the shape of a
+    table says which one it is; what says it is whether the columns are about
+    doors. When they are not, every value lands in `extra` and the door fields
+    stay empty, which is a clear answer as long as somebody asks the question.
+    """
+    if not rows:
+        return False
+    filled = {field for row in rows for field in _DOOR_COLUMNS
+              if getattr(row, field, "")}
+    tagged = sum(1 for row in rows if row.door_tag)
+    return bool(filled) and tagged >= max(1, len(rows) // 2)
 
 
 def _is_thin(extraction: PageExtraction) -> str | None:
@@ -248,6 +333,23 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                     ai_rows, ai_headers, ai_warnings = [], [], [
                         f"image re-read failed: {exc}"]
 
+                if ai_rows and not _is_a_door_schedule(ai_rows):
+                    # More columns is not the same as the right table. This
+                    # branch re-reads a page whose text layer looked thin, and
+                    # on a set whose architectural sheets are all flattened to
+                    # outlines the only page with any text is an electrical one
+                    # -- so the re-read came back with that sheet's LIGHT
+                    # FIXTURE SCHEDULE, nine columns wide, and nine beats the
+                    # four we had. It won on width alone.
+                    warnings.append(
+                        f"Page {best.page} was re-read as an image and returned "
+                        "a schedule that is not a door schedule -- none of its "
+                        "columns name a door. Ignored."
+                    )
+                    log.info("ai re-read rejected on page %s: no door columns",
+                             best.page)
+                    ai_rows = []
+
                 if ai_rows and len(ai_headers) > len(best.headers):
                     warnings.extend(ai_warnings)
                     duration = int((time.perf_counter() - started) * 1000)
@@ -278,23 +380,34 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                               field_map=e.mapped, row_count=len(e.rows), rows=e.rows)
                 for e in sorted(found, key=lambda e: (e.page, -len(e.rows)))
             ]
+            # Every door on the sheet, not the biggest table's doors.
+            #
+            # `rows` used to be the winning table alone. A sheet with two
+            # schedules printed side by side -- doors 101-117 on the left,
+            # 118-126 on the right -- reported fifteen doors out of twenty-five,
+            # and everything downstream inherited the loss: the master sheet,
+            # the plan audit, the count on screen. The other tables were right
+            # there in `tables` and simply never added up.
+            all_rows = [r for t in tables for r in t.rows]
             if len(tables) > 1:
                 warnings.append(
-                    f"{len(tables)} schedules found on this sheet; "
-                    f"'rows' holds the largest"
+                    f"{len(tables)} schedules on this sheet, read together: "
+                    + ", ".join(f"{t.title or 'untitled'} ({t.row_count})"
+                                for t in tables)
                 )
             duration = int((time.perf_counter() - started) * 1000)
-            log.info("extracted method=%s page=%s rows=%s ms=%s",
-                     best.method.value, best.page, len(best.rows), duration)
+            log.info("extracted method=%s page=%s tables=%s rows=%s ms=%s",
+                     best.method.value, best.page, len(tables), len(all_rows),
+                     duration)
             return ExtractionResult(
                 method=best.method,
                 pages_scanned=pages_scanned,
                 source_pages=sorted({t.page for t in tables}),
-                row_count=len(best.rows),
+                row_count=len(all_rows),
                 duration_ms=duration,
                 warnings=warnings,
                 headers=best.headers,
-                rows=best.rows,
+                rows=all_rows,
                 tables=tables,
                 page_scores=page_scores,
             )
@@ -349,6 +462,21 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                 warnings.append(f"AI fallback failed on page {page}: {exc}")
                 continue
             warnings.extend(ai_warnings)
+            if rows and not _is_a_door_schedule(rows):
+                # The model read a table; it was not this one. On a set whose
+                # architectural sheets are all flattened to outlines, the only
+                # page with any text was an electrical sheet, and its LIGHT
+                # FIXTURE SCHEDULE came back as the door schedule: six rows of
+                # LED PANEL and TRAC HEAD, with ITEM, QTY, MANUFACTURER,
+                # CATALOG NO, WATT/VOLTAGE for columns. Every one of those went
+                # to `extra`, and not one door field was filled -- so the answer
+                # announced what it was, and we handed it over anyway.
+                warnings.append(
+                    f"Page {page} carries a schedule, but not a door schedule "
+                    "-- none of its columns name a door. Ignored."
+                )
+                log.info("ai tier rejected page %s: no door columns", page)
+                continue
             if rows:
                 duration = int((time.perf_counter() - started) * 1000)
                 log.info("extracted method=ai_vision page=%s rows=%s ms=%s",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 import time
@@ -7,21 +8,36 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from app import __version__
 from app.ai.client import AiUpstreamError
 from app.api.deps import require_api_key
+from app.api.offload import in_worker
 from app.config import get_settings
 from app.core.pdf_doc import NotAPdfError, PdfDoc
 from app.pipeline import NoRowsError, NoScheduleFoundError, extract
-from app.schemas import ExtractionResult, HealthResponse
+from app.plan_pipeline import NoDoorScheduleError, audit
+from app.schemas import DoorRow, ExtractionResult, HealthResponse, PlanAudit
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 _UPLOAD_CHUNK = 1024 * 1024
+# Beyond this a sheet is solid red and the view stops informing anyone.
+_MAX_MARKS = 200
 
 
 @router.get("/health", response_model=HealthResponse, tags=["meta"])
@@ -103,7 +119,8 @@ async def extract_door_schedule(
     async with _spooled_upload(file) as path:
         size_mb = path.stat().st_size / 1024 / 1024
         try:
-            result = await extract(path, allow_ai=allow_ai, debug=debug)
+            result = await in_worker(
+                extract(path, allow_ai=allow_ai, debug=debug))
         except NotAPdfError as exc:
             log.warning("rejected upload: %s", exc)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
@@ -187,6 +204,148 @@ async def master_sheet(
     )
 
 
+@router.post(
+    "/api/v1/door-schedule/plan-audit",
+    tags=["extraction"],
+    summary="Locate every scheduled door on the floor plans and report the gaps",
+    response_model=PlanAudit,
+)
+async def plan_audit(
+    file: UploadFile = File(...),
+    schedule: str | None = Form(
+        None,
+        description="A schedule already extracted, as the JSON of an "
+        "ExtractionResult (or just its `rows`). Pass it and this endpoint does "
+        "not read one: no second scan of the same file, no chance of the audit "
+        "disagreeing with the table on screen, and a schedule that lives in a "
+        "*different* PDF can be audited against these drawings.",
+    ),
+    detect: bool = Query(
+        False,
+        description="Also find doors as shapes with the vision model, so a door "
+        "with no number can be seen. This is the only part that costs money -- "
+        "roughly $0.12 and 7 minutes per floor-plan sheet.",
+    ),
+    dry_run: bool = Query(
+        False,
+        description="With detect=true, report the tiles and the predicted cost "
+        "and send nothing. Call this first: it is the only way to see the "
+        "price before paying it.",
+    ),
+    budget_usd: float | None = Query(
+        None, gt=0,
+        description="Ceiling for this request in USD. The scan stops when it "
+        "is reached and says how much of the drawing it did not read. "
+        "Defaults to DETECT_BUDGET_USD.",
+    ),
+    _key: str = Depends(require_api_key),
+) -> PlanAudit:
+    """Set the schedule against the drawings.
+
+    Without `detect` this makes no AI call at all: every door is placed from
+    text the drawing already carries, so it is free and cannot invent a
+    location. With `detect` the doors are found as shapes as well, which is the
+    only way to see a door that carries no number.
+    """
+    started = time.perf_counter()
+    async with _spooled_upload(file) as path:
+        try:
+            result = await in_worker(
+                audit(path, detect=detect, dry_run=dry_run,
+                      budget_usd=budget_usd, **_supplied(schedule)))
+        except NotAPdfError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="File is not a readable PDF.") from exc
+        except NoDoorScheduleError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AiUpstreamError as exc:
+            # Billing or auth trouble upstream must read as itself, never as
+            # "no doors found".
+            log.error("ai upstream failed during detection: %s", exc)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                                detail=f"AI provider error: {exc}") from exc
+
+    log.info("plan_audit file=%s pages=%s doors=%s located=%s detected=%s "
+             "cost=%s ms=%s",
+             file.filename, result.pages_scanned, result.door_count,
+             len(result.located), len(result.detected),
+             result.scan_cost.estimated_usd if result.scan_cost else 0,
+             int((time.perf_counter() - started) * 1000))
+    return result
+
+
+def _supplied(raw: str | None) -> dict:
+    """Rows handed in by the caller, ready to pass to `audit`.
+
+    Accepts a whole ExtractionResult or a bare list of rows, because both are
+    natural things for a caller to have. Unparseable input falls back to
+    re-reading the file rather than failing: a bad hint should cost time, not
+    the request.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        log.warning("plan_audit: schedule was not valid JSON; reading the file")
+        return {}
+
+    if isinstance(parsed, dict):
+        raw_rows, page = parsed.get("rows") or [], parsed.get("source_pages") or []
+        page = page[0] if page else 0
+    elif isinstance(parsed, list):
+        raw_rows, page = parsed, 0
+    else:
+        return {}
+
+    rows = []
+    for entry in raw_rows:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            rows.append(DoorRow(**entry))
+        except ValidationError:
+            continue
+    if not rows:
+        log.warning("plan_audit: schedule carried no usable rows; reading the file")
+        return {}
+    return {"rows": rows, "schedule_page": page}
+
+
+def _parse_marks(raw: str | None) -> list[tuple[float, float, float, float, str]]:
+    """Many rectangles to outline, from a JSON array of page fractions.
+
+    Malformed entries are dropped one by one rather than failing the request:
+    this is a drawing hint, and losing one door's box is a far smaller problem
+    than losing the sheet it was going to be drawn on.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        log.warning("preview: marks was not valid JSON, ignoring")
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    out: list[tuple[float, float, float, float, str]] = []
+    for entry in parsed[:_MAX_MARKS]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            x0, y0, x1, y1 = (float(entry[k]) for k in ("x0", "y0", "x1", "y1"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+            continue
+        out.append((x0, y0, x1, y1, str(entry.get("label", ""))[:12]))
+    if len(parsed) > _MAX_MARKS:
+        log.warning("preview: %d marks requested, drawing the first %d",
+                    len(parsed), _MAX_MARKS)
+    return out
+
+
 def _parse_box(raw: str | None) -> tuple[float, float, float, float] | None:
     """'x0,y0,x1,y1' as fractions of the page, or None.
 
@@ -213,6 +372,25 @@ def _parse_box(raw: str | None) -> tuple[float, float, float, float] | None:
 )
 async def preview(
     file: UploadFile = File(...),
+    marks: str | None = Form(
+        None,
+        description="JSON array of {x0,y0,x1,y1,label} in page fractions -- "
+        "every door on one sheet, outlined together. Sent as a form field "
+        "rather than a query parameter because a busy plan carries dozens.",
+    ),
+    draw: bool = Query(
+        True,
+        description="Draw the marks on the image. Pass false to get the same "
+        "crop with nothing on it -- for a caller laying its own overlay over "
+        "the plan, which can show a door's actual swing rather than a box.",
+    ),
+    whole: bool = Query(
+        False,
+        description="Render the entire sheet rather than cropping to the doors "
+        "that were found. Needed to check the answer: a crop drawn around the "
+        "hits cannot show a door that was missed, because it cut that part of "
+        "the building away.",
+    ),
     box: str | None = Query(
         None,
         description="Rectangle to outline, as 'x0,y0,x1,y1' fractions of the "
@@ -235,6 +413,7 @@ async def preview(
     from app.pipeline import select_fallback_pages
 
     rect = _parse_box(box)
+    marked = _parse_marks(marks)
 
     async with _spooled_upload(file) as path:
       try:
@@ -242,7 +421,9 @@ async def preview(
             scores = page_finder.find_schedule_pages(doc)
             candidates = page_finder.passing(scores)
             by_page = {c.page: c for c in scores}
-            if rect is not None and page is not None and page in by_page:
+            if marked and page is not None and page in by_page:
+                chosen, located = by_page[page], True
+            elif rect is not None and page is not None and page in by_page:
                 # The caller already knows where the table is, so neither the
                 # gates nor the locator get a say -- they are what failed on
                 # this page in the first place.
@@ -260,8 +441,12 @@ async def preview(
                                f"{doc.page_count} pages.",
                     )
                 chosen, located = by_page[fallback[0]], False
+            clip: list[float] = []
+            drawn: list[tuple[float, float, float, float]] = []
             png = render_preview(doc, chosen, located=located, box=rect,
-                                 box_label=label or "")
+                                 box_label=label or "", marks=marked,
+                                 clip_out=clip, drawn_out=drawn, draw=draw,
+                                 whole=whole)
       except NotAPdfError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="File is not a readable PDF.") from exc
@@ -272,7 +457,21 @@ async def preview(
         headers={
             "X-Source-Page": str(chosen.page),
             "X-Table-Located": "true" if located else "false",
-            "X-Box-Source": "supplied" if rect is not None else "measured",
+            "X-Box-Source": ("marks" if marked else
+                             "supplied" if rect is not None else "measured"),
+            "X-Mark-Count": str(len(marked)),
+            # Page fractions of the region rendered, so a caller can place
+            # clickable areas over the image it just received.
+            "X-Clip": ",".join(f"{v:.6f}" for v in clip),
+            # The rectangles as they were actually drawn, in the order the
+            # marks were sent. A small door's box is grown to stay visible, so
+            # these are not the marks that went in -- and an overlay built from
+            # those would not sit on the boxes a person can see.
+            "X-Drawn": ";".join(
+                ",".join(f"{v:.6f}" for v in box) for box in drawn),
+            "Access-Control-Expose-Headers":
+                "X-Source-Page, X-Table-Located, X-Box-Source, X-Mark-Count, "
+                "X-Clip, X-Drawn",
         },
     )
 
