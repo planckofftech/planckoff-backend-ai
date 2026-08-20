@@ -246,7 +246,21 @@ def header_items(items: list[TextItem], header_y: float, tag_x: float) -> list[T
     end = anchor
     while end + 1 < len(band) and band[end + 1].x0 - band[end].x1 < budget:
         end += 1
-    return band[start:end + 1]
+    run = band[start:end + 1]
+
+    # Spacing gets the run to roughly the right place; it cannot find the seam
+    # when the next schedule is printed hard against this one, because the gap
+    # between the two is no wider than the gap between two of their own
+    # columns. The run then walks out of one table and into the next, and the
+    # header comes back "Door Number ... Comments Door Number ... Comments" --
+    # a grid with two of every column, belonging to neither table.
+    #
+    # A schedule has exactly one column of door numbers, so a second one is
+    # where the next table begins. Keep the piece holding our own tag column.
+    from app.core.page_finder import split_at_table_starts
+
+    pieces = split_at_table_starts(run) or [run]
+    return min(pieces, key=lambda g: min(abs(i.x0 - tag_x) for i in g))
 
 
 # --------------------------------------------------------------------------- #
@@ -568,11 +582,101 @@ def _trim_to_tagged_rows(grid: TableGrid, items: list[TextItem],
         grid.row_bounds = bounds[:keep + 1]
 
 
+# Header cells within this many points of each other, vertically, are on the
+# same printed line.
+_HEADING_LINE_TOL = 4.0
+# What share of a line's cells must carry a digit before it is read as a row of
+# values rather than a row of headings.
+_DATA_LINE_SHARE = 0.6
+
+
+def _heading_lines(headers: list[TextItem]) -> list[list[TextItem]]:
+    """The heading cells grouped into the printed lines they sit on."""
+    lines: dict[int, list[TextItem]] = {}
+    for item in headers:
+        lines.setdefault(round(item.cy / _HEADING_LINE_TOL), []).append(item)
+    return [lines[k] for k in sorted(lines)]
+
+
+def _reads_as_data(line: list[TextItem]) -> bool:
+    """Is this line of "headings" actually the table's first row of values?
+
+    Headings are words; values are measurements. On one schedule the header run
+    reached one line too far and took `104A CONFERENCE FG 2 6'-0" 8'-10 1/2"`
+    with it, so every column was named after the first door -- "DOOR LEAF
+    INFORMATION WIDTH 6'-0"" -- and that door then vanished from the rows.
+
+    Digits settle it. A heading almost never carries one; a schedule row is made
+    of them. Counted per cell rather than per character so a single footnote
+    marker beside a heading cannot tip the line over.
+    """
+    if len(line) < _MIN_HEADING_CELLS:
+        return False
+    numeric = sum(any(ch.isdigit() for ch in i.text) for i in line)
+    return numeric >= len(line) * _DATA_LINE_SHARE
+
+
+def _drop_data_lines(headers: list[TextItem]) -> list[TextItem]:
+    """Headings with any trailing row of values removed."""
+    lines = _heading_lines(headers)
+    while len(lines) > 1 and _reads_as_data(lines[-1]):
+        lines.pop()
+    return [item for line in lines for item in line]
+
+
+def _bottom_heading_line(headers: list[TextItem]) -> list[TextItem]:
+    """The line of a stacked heading that names the columns, and what follows it.
+
+    Chosen as the line with the most cells, not the lowest. The row that names
+    the columns has one cell per column, so it is the fullest; the rows above
+    are group bands covering several columns at once, and what sits below is a
+    heading too long for its cell, wrapped ("T" / "YPE" on one sheet).
+
+    Taking the lowest line instead picks up whatever trailing fragment happens
+    to sit deepest -- two characters of one heading -- and picking the topmost
+    gets the superscript footnote markers a schedule prints beside its column
+    names, which were being read as five columns of their own.
+    """
+    if not headers:
+        return headers
+    lines: dict[float, int] = {}
+    for item in headers:
+        key = round(item.cy / _HEADING_LINE_TOL)
+        lines[key] = lines.get(key, 0) + 1
+    fullest = max(lines, key=lambda k: (lines[k], k))
+    floor = fullest * _HEADING_LINE_TOL - _HEADING_LINE_TOL / 2
+    return [h for h in headers if h.cy >= floor]
+
+
 def locate_table(items: list[TextItem], rulings: Rulings, header_y: float,
                  tag_x: float) -> tuple[TableGrid, list[TextItem]]:
     """Returns the grid and the header cells it was built from."""
     headers = header_items(items, header_y, tag_x)
+    # Where the header run overshot into the table, give the surplus row back.
+    #
+    # Not attempted here: the case where the run lands *entirely* on the first
+    # row of values, which is what one schedule does. Climbing to the nearest
+    # heading-looking line above finds an acoustics note block sharing the
+    # sheet, and every door number then comes back empty -- worse than the
+    # wrong column names it was meant to fix. That one belongs in the page
+    # finder's scoring, where the band is chosen, not in a patch here.
+    headers = _drop_data_lines(headers) or headers
     grid = _ruled_grid(headers, items, rulings, tag_x)
+    if grid is None:
+        # Try again on the bottom line of the heading alone.
+        #
+        # A stacked header stretches the header box upward -- "DOOR" and "FRAME"
+        # band across the top, the real column names sit under them -- and the
+        # column rules only run through the lower row. Measured against the full
+        # box, no rule covers enough of it to count as crossing the header, the
+        # grid is refused, and a table with twelve ruled columns is guessed at
+        # instead. One schedule came back as 21 columns of debris that way.
+        #
+        # Only ever a second attempt, so a sheet the first pass already
+        # understood cannot be changed by it.
+        leaf = _bottom_heading_line(headers)
+        if len(leaf) < len(headers):
+            grid = _ruled_grid(leaf, items, rulings, tag_x)
     if grid is not None:
         _trim_to_tagged_rows(grid, items, tag_x)
         return grid, headers

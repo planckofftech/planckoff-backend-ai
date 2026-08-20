@@ -1,0 +1,29 @@
+# What Docker must not even be handed, let alone copy in.
+#
+# The Dockerfile only COPYs `app`, so none of this reaches the image today. The
+# build *context* is a different matter: everything not listed here is sent to
+# the daemon before the first instruction runs, which on this repo means a
+# hundred megabytes of client drawing sets on every build. It is also one
+# careless `COPY . .` away from putting them, and the .env, inside the image.
+
+.env
+.env.*
+!.env.example
+
+# Client drawings and anything derived from them.
+test/
+corpus/
+bakeoff/
+*.pdf
+*_detect*.json
+*_results.json
+Door detection- *.html
+
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

@@ -78,6 +78,23 @@ _HEADER_STACK_SPAN = 40.0
 _HEADER_STACK_ROWS = 3
 # Two header rows this close describe one table, not two.
 _SAME_TABLE_Y = 60.0
+# ...and how near in x. Two views of one table put their tag column in exactly
+# the same place; two tables side by side are a table's width apart, so this
+# only has to be wider than a column and narrower than a table.
+_SAME_TABLE_X = 60.0
+# A gap in a row of headings wider than this is the space between two tables
+# rather than the space between two columns. Adaptive, because a column on a
+# 36-inch sheet is wider than one on a letter page: the row's own typical gap
+# times the tolerance, held between the floor and the ceiling.
+_BAND_GAP_TOLERANCE = 4.0
+_MIN_BAND_GAP = 120.0
+_MAX_BAND_GAP = 400.0
+# How far outside a band's own width to look when collecting the heading rows
+# stacked above or below it. Generous on purpose: a column headed only on the
+# group row -- NOTES, HARDWARE GROUP, REMARKS -- sits beyond the last cell of
+# the row beneath it, and on one sheet cutting those off removed the only word
+# that proved the table was about doors at all.
+_BAND_MERGE_MARGIN = 200.0
 
 
 @dataclass(slots=True)
@@ -105,6 +122,23 @@ class PageCandidate:
 # structural bolt table lists Frm, Qty, Width, Thick and Loc, which is five
 # generic hits and was passing as a door schedule. Requiring one of these makes
 # the test about doors rather than about tables.
+# The heading over a schedule's column of door numbers, as printed. A table has
+# exactly one, so a second one in the same row means a second table -- see
+# `_where_headings_repeat`.
+#
+# Matched against the cell's own text rather than through HEADER_WORDS, because
+# these have to be recognised without also becoming keywords that raise every
+# page's score. "NUMBER" alone is the giveaway: one real sheet stacks the
+# heading as "Door" over "Number", so neither line says "DOOR NO".
+_TABLE_START_TEXT = frozenset({
+    "NO", "NUMBER", "DOOR NO", "DOOR NUMBER", "MARK", "DOOR MARK", "DR NO",
+})
+
+
+def _starts_a_table(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", text.strip().upper()).rstrip(".:")
+    return cleaned in _TABLE_START_TEXT
+
 _DOOR_MARKERS = frozenset({
     "DOOR NO", "THRESHOLD", "HARDWARE", "HW", "LOUVER", "GLAZ", "GLAZING",
     "JAMB", "SILL", "HEAD", "LABEL", "F.R", "F_R", "MARK",
@@ -150,6 +184,77 @@ def _header_word_hits(texts: list[str]) -> int:
     return len(_header_words_found(texts))
 
 
+def split_row_into_tables(row: list[TextItem]) -> list[list[TextItem]]:
+    """Split one line of text into the separate tables it belongs to.
+
+    A sheet routinely carries two schedules side by side at the same height --
+    DOOR SCHEDULE on the left, DOOR HARDWARE on the right. Bucketing text by y
+    alone makes those one band, and the merged band scores higher than either
+    real one: on one project the merge scored 12 keyword hits against the door
+    schedule's 5, so every page of that set read the hardware matrix and the
+    door schedule was never seen.
+
+    Columns inside a table sit close together; a different table is far away.
+    The threshold comes from the row's own spacing rather than a fixed number,
+    because a column on a 36-inch sheet is wider than one on a letter page.
+    """
+    if len(row) < 2:
+        return [row] if row else []
+
+    ordered = sorted(row, key=lambda i: i.x0)
+    gaps = sorted(b.x0 - a.x1 for a, b in zip(ordered, ordered[1:]) if b.x0 > a.x1)
+    typical = gaps[len(gaps) // 2] if gaps else 0.0
+    budget = min(_MAX_BAND_GAP, max(typical * _BAND_GAP_TOLERANCE, _MIN_BAND_GAP))
+
+    groups: list[list[TextItem]] = []
+    current = [ordered[0]]
+    for previous, item in zip(ordered, ordered[1:]):
+        if item.x0 - previous.x1 > budget:
+            groups.append(current)
+            current = []
+        current.append(item)
+    groups.append(current)
+    return [part for group in groups for part in split_at_table_starts(group)]
+
+
+def split_at_table_starts(row: list[TextItem]) -> list[list[TextItem]]:
+    """Split a header row again wherever a column heading comes round twice.
+
+    Spacing is not always enough to tell two tables apart. One real sheet
+    prints two door schedules butted up against each other, so the gap between
+    them is no wider than the gap between two columns inside either -- and the
+    split above either merges them or cuts them in the wrong places. Merged,
+    the pair reads as one table and the right-hand schedule's ten doors are
+    never returned; cut wrongly, neither half keeps enough headings to qualify.
+
+    But a table has exactly one column of door numbers. So a second one is not
+    another column, it is the start of the next table -- which needs no
+    spacing, no threshold and no tuning.
+
+    Only the door-number heading counts. Splitting on any repeated heading was
+    tried and it is wrong: a door schedule routinely carries MATERIAL and
+    FINISH twice, once for the door and once for its frame, under DOOR and
+    FRAME group headings. That rule cut one real schedule down the middle,
+    leaving a left half with no door markers in it at all.
+    """
+    ordered = sorted(row, key=lambda i: i.x0)
+    groups: list[list[TextItem]] = []
+    current: list[TextItem] = []
+    numbered = False
+
+    for item in ordered:
+        starts_a_table = _starts_a_table(item.text)
+        if starts_a_table and numbered:
+            groups.append(current)
+            current = []
+            numbered = False
+        numbered = numbered or starts_a_table
+        current.append(item)
+
+    groups.append(current)
+    return [g for g in groups if g]
+
+
 def _scored_bands(horizontal: list[TextItem]
                   ) -> list[tuple[set[str], float, list[TextItem], list[TextItem]]]:
     """Every candidate header row as (words, header_y, cells, leaf cells), best
@@ -159,6 +264,9 @@ def _scored_bands(horizontal: list[TextItem]
     HEIGHT on the next -- and land in different y buckets. Scored separately
     neither reaches the gate; scored together they clear it easily. So each
     band is scored alone *and* merged with the band below it.
+
+    Bands are also split across the page, because two schedules can share a
+    height without sharing anything else -- see `split_row_into_tables`.
 
     `header_y` comes from whichever line carries more cells: that is the leaf
     row, and `table_locator.header_items()` uses this y to collect the cells
@@ -172,26 +280,36 @@ def _scored_bands(horizontal: list[TextItem]
     scored: list[tuple[set[str], float, list[TextItem], list[TextItem]]] = []
 
     for index, key in enumerate(keys):
-        merged = list(buckets[key])
-        leaf = buckets[key]
-        top = min(i.y0 for i in buckets[key])
-        scored.append((_header_words_found([i.text for i in merged]),
-                       min(i.y0 for i in leaf), merged, leaf))
+        for group in split_row_into_tables(buckets[key]):
+            # The stacked rows below have to be taken from this table's own
+            # columns, not the whole width of the sheet, or splitting the first
+            # row achieves nothing.
+            lo = min(i.x0 for i in group) - _BAND_MERGE_MARGIN
+            hi = max(i.x1 for i in group) + _BAND_MERGE_MARGIN
 
-        # Group rows can sit well above the leaf row -- one sheet prints
-        # LOCATION / PANEL / FRAME 88 pt above NO. / FROM / TO -- so merging
-        # only the neighbouring bucket is not enough.
-        for step in range(1, _HEADER_STACK_ROWS + 1):
-            if index + step >= len(keys):
-                break
-            band = buckets[keys[index + step]]
-            if min(i.y0 for i in band) - top > _HEADER_STACK_SPAN:
-                break
-            merged = merged + band
-            if len(band) >= len(leaf):
-                leaf = band
+            merged = list(group)
+            leaf = group
+            top = min(i.y0 for i in group)
             scored.append((_header_words_found([i.text for i in merged]),
                            min(i.y0 for i in leaf), merged, leaf))
+
+            # Group rows can sit well above the leaf row -- one sheet prints
+            # LOCATION / PANEL / FRAME 88 pt above NO. / FROM / TO -- so merging
+            # only the neighbouring bucket is not enough.
+            for step in range(1, _HEADER_STACK_ROWS + 1):
+                if index + step >= len(keys):
+                    break
+                below = [i for i in buckets[keys[index + step]]
+                         if lo <= i.cx <= hi]
+                if not below:
+                    continue
+                if min(i.y0 for i in below) - top > _HEADER_STACK_SPAN:
+                    break
+                merged = merged + below
+                if len(below) >= len(leaf):
+                    leaf = below
+                scored.append((_header_words_found([i.text for i in merged]),
+                               min(i.y0 for i in leaf), merged, leaf))
 
     scored.sort(key=lambda s: (-len(s[0]), s[1]))
     return scored
@@ -297,11 +415,21 @@ def header_bands(items: list[TextItem], page_number: int, *,
         # One table yields several bands -- itself, and itself merged with the
         # group rows above it -- each with a different leaf row. They describe
         # the same table, so keep only the strongest. Bands are already sorted
-        # by word count, so the first to claim a y-window is the best one.
-        if any(abs(header_y - c.header_y) <= _SAME_TABLE_Y for c in found):
-            continue
+        # by word count, so the first to claim a place is the best one.
+        #
+        # A table is identified by where it sits on *both* axes. Height alone
+        # was enough for schedules stacked down a page, and silently wrong for
+        # schedules printed side by side: those share a header row, so the
+        # second was discarded as a repeat of the first. One real sheet prints
+        # doors 101-117 in a left-hand table and 118-126 in a right-hand one,
+        # both headed "Door Schedule" at the same height, and ten of its
+        # twenty-five doors were never read.
         candidate = _judge(horizontal, band, words, header_y, page_number,
                            min_header_hits, min_tag_run, leaf)
+        if any(abs(header_y - c.header_y) <= _SAME_TABLE_Y
+               and abs(candidate.tag_x - c.tag_x) <= _SAME_TABLE_X
+               for c in found):
+            continue
         if candidate.passed:
             found.append(candidate)
 
