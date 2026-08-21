@@ -9,6 +9,8 @@ openai==2.49.0
 pillow==12.3.0
 openpyxl==3.1.5
 supabase==2.31.0
+# Cloudflare R2 speaks the S3 API, so the AWS client is what talks to it.
+boto3==1.43.77
 
 # Optional. Reads sheets that were flattened to outlines and carry no text at
 # all -- without it those sets fail as they always did, and nothing else

@@ -1,0 +1,69 @@
+# Running the service as a container -- locally, or on a VM.
+#
+# Not used by Cloud Run, which takes a single image and its own configuration.
+# This is for a machine you control: the Oracle free instance, or whatever gets
+# rented in October. Same image either way.
+#
+# One service only, and deliberately. The database is Supabase and the files are
+# in R2, both hosted -- so there is nothing here to run alongside the API. What
+# compose still buys is one command instead of a long `docker run`, an env file
+# rather than a screenful of -e flags, and a restart policy.
+#
+#     docker compose up -d --build
+#     docker compose logs -f
+#
+# With Caddy for HTTPS on a public VM:
+#
+#     docker compose --profile public up -d
+
+services:
+  api:
+    build: .
+    # Everything the service needs comes from here. The image contains no .env
+    # -- .dockerignore keeps it out -- so this file is the whole configuration.
+    env_file: .env
+    environment:
+      # Overrides for a real deployment, whatever .env happens to say.
+      REQUIRE_REAL_API_KEY: "true"
+      MAX_CONCURRENT_EXTRACTIONS: "1"
+    ports:
+      # Bound to localhost when Caddy is in front. Change to "8000:8000" to
+      # reach it directly, which is fine locally and wrong on a public box.
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    # Matches the smallest host we would deploy on, so a container that would
+    # be killed there is killed here too -- where somebody is watching. One
+    # drawing set peaked at 434 MB; two at once is what this is protecting
+    # against, together with MAX_CONCURRENT_EXTRACTIONS.
+    mem_limit: 2g
+    healthcheck:
+      # python, not curl: the slim image has no curl and adding one to carry a
+      # health check is a package to keep patched for no reason.
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Uploads are spooled here before they are read. Sized for a few concurrent
+    # 500 MB sets; on tmpfs so they never touch the disk and cannot outlive the
+    # container if cleanup is ever missed.
+    tmpfs:
+      - /tmp:size=2g
+
+  # HTTPS, only when asked for. Gets and renews a certificate automatically,
+  # which is the one job that is tedious to do by hand on a VM.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["public"]
+    depends_on: [api]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
