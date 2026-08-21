@@ -1,0 +1,36 @@
+# HTTPS for the API when it runs on a VM.
+#
+# Caddy gets and renews a Let's Encrypt certificate on its own, which is the
+# only fiddly part of putting a container on a public box. Used by the "public"
+# profile in docker-compose.yml; Cloud Run does none of this because it
+# terminates TLS itself.
+#
+# Replace the domain, point an A record at the VM, then:
+#
+#     docker compose --profile public up -d
+
+api.example.com {
+	reverse_proxy api:8000 {
+		# A drawing set takes eighty seconds to read and the default proxy
+		# timeout is shorter than that, so an upload would be cut off part way
+		# through and read as a failure by the caller.
+		transport http {
+			response_header_timeout 10m
+			read_timeout 10m
+		}
+	}
+
+	# Uploads go straight to R2 with a signed link, so nothing large should
+	# arrive here. The cap is a backstop against a caller using the multipart
+	# route with a 500 MB set: better a clear rejection than a proxy that
+	# buffers half a gigabyte to disk.
+	request_body {
+		max_size 512MB
+	}
+
+	encode gzip
+	log {
+		output stdout
+		format console
+	}
+}

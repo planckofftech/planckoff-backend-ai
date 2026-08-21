@@ -54,6 +54,25 @@ class Settings(BaseSettings):
     # says nothing, because you cannot tell what was different about them.
     app_version: str = "dev"
 
+    # Where the drawing sets themselves live. Cloudflare R2 speaks the S3 API,
+    # so this is boto3 pointed somewhere other than AWS.
+    #
+    # The files have to outlive the request that uploaded them: the plan viewer
+    # re-renders sheets from the original PDF, so a temp file deleted when the
+    # upload finishes leaves the viewer with nothing to draw.
+    r2_endpoint: str = ""
+    r2_bucket: str = ""
+    r2_access_key: str = ""
+    r2_secret_key: str = ""
+    # How long a browser has to use an upload link before it expires.
+    upload_url_ttl: int = 900
+
+    # How many drawing sets may be read at once. One peaked at 434 MB, so two
+    # together is an out-of-memory kill on a 1 GB host -- and the kernel takes
+    # the whole process, losing both jobs and every request in flight. Raise it
+    # with the memory, not with the core count.
+    max_concurrent_extractions: int = 1
+
     # Page-finder thresholds. Fitted to one document -- see PLAN.md section 8.
     min_header_hits: int = 5
     min_tag_run: int = 8
@@ -75,6 +94,11 @@ class Settings(BaseSettings):
     @property
     def db_enabled(self) -> bool:
         return bool(self.supabase_url and self.supabase_service_key)
+
+    @property
+    def files_enabled(self) -> bool:
+        return bool(self.r2_endpoint and self.r2_bucket
+                    and self.r2_access_key and self.r2_secret_key)
 
 
 @lru_cache

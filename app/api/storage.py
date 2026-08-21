@@ -12,6 +12,7 @@ change goes to `corrections`, alongside the original rather than over it.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from fastapi import (
     APIRouter,
@@ -25,9 +26,10 @@ from fastapi import (
 from pydantic import BaseModel, Field
 
 from app.api.deps import require_api_key
+from app.config import get_settings
 from app.api.offload import in_worker
 from app.core.pdf_doc import NotAPdfError
-from app.db import store
+from app.db import files, store
 from app.db.client import NoDatabase, client
 from app.pipeline import NoRowsError, NoScheduleFoundError, extract
 from app.plan_pipeline import audit
@@ -86,6 +88,135 @@ async def list_projects(_key: str = Depends(require_api_key)):
     return _db().table("project_summary").select("*").execute().data
 
 
+class UploadRequest(BaseModel):
+    filename: str
+    sha256: str = Field(description="SHA-256 of the file, computed by the "
+                                    "caller. It names the object, so the same "
+                                    "set re-uploaded lands on the same key "
+                                    "instead of filling the bucket.")
+
+
+@router.post("/projects/{project_id}/uploads")
+async def signed_upload(project_id: str, body: UploadRequest,
+                        _key: str = Depends(require_api_key)):
+    """A link the browser may PUT one file to, and the key it will live under.
+
+    The file never passes through this service. That is what removes every
+    request-size limit between the browser and storage -- a 115 MB drawing set
+    goes straight to R2 -- and it is why this can run on a host that caps
+    request bodies at 32 MB.
+
+    The link is signed for one key and expires shortly, so the caller holds no
+    credential and can reach nothing else. It also means the client never names
+    a path, which is what would otherwise have to be defended against.
+    """
+    if not files.available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No file store configured; upload the PDF directly instead.")
+    _db()
+    key = files.key_for(project_id, body.sha256)
+    if files.exists(key):
+        # Already here. Say so rather than issuing a link to overwrite it with
+        # bytes that, by definition, are identical.
+        return {"key": key, "upload_url": None, "already_stored": True}
+    return {"key": key, "upload_url": files.upload_url(key),
+            "already_stored": False,
+            "expires_in": get_settings().upload_url_ttl}
+
+
+class StoredUpload(BaseModel):
+    key: str = Field(description="The key returned by /uploads, now uploaded")
+    filename: str
+    revision: str | None = None
+
+
+@router.post("/projects/{project_id}/documents/from-storage",
+             status_code=status.HTTP_201_CREATED)
+async def add_uploaded_document(
+    project_id: str,
+    body: StoredUpload,
+    plans: bool = Query(True, description="Also locate the doors on the plans"),
+    allow_ai: bool = Query(True, description="Permit the vision fallback tier"),
+    reuse: bool = Query(True, description="Return a stored reading if this "
+                                          "exact file is already in this job"),
+    _key: str = Depends(require_api_key),
+):
+    """Read a set the browser has already put in storage.
+
+    The counterpart to `/uploads`: the bytes are in R2, this fetches them and
+    does the work. The file stays there afterwards, because the plan viewer
+    needs the original PDF to draw doors on a sheet long after this request has
+    finished.
+    """
+    if not files.available():
+        raise HTTPException(status_code=503,
+                            detail="No file store configured.")
+    _db()
+    if not body.key.startswith(f"{project_id}/"):
+        # The key was issued by `/uploads` for this project. One that is not
+        # cannot have been, so it is either a mistake or an attempt to read
+        # another job's drawings.
+        raise HTTPException(status_code=400,
+                            detail="That key does not belong to this project.")
+    if not files.exists(body.key):
+        raise HTTPException(status_code=404,
+                            detail="Nothing has been uploaded under that key.")
+
+    sha256 = Path(body.key).stem
+    if reuse:
+        found = store.find_document(project_id, sha256)
+        if found:
+            return {"document_id": found["id"], "reused": True,
+                    "filename": found["filename"]}
+
+    path = files.fetch(body.key)
+    try:
+        return await _read_and_store(
+            project_id, path, filename=body.filename, sha256=sha256,
+            size_bytes=files.size_of(body.key), revision=body.revision,
+            source_uri=body.key, plans=plans, allow_ai=allow_ai)
+    finally:
+        files.discard(path)
+
+
+async def _read_and_store(project_id: str, path, *, filename: str,
+                          sha256: str, size_bytes: int, revision: str | None,
+                          source_uri: str | None, plans: bool, allow_ai: bool):
+    """Extract, store, then audit -- shared by both ways a file arrives."""
+    try:
+        result = await in_worker(extract(path, allow_ai=allow_ai))
+    except (NotAPdfError, NoScheduleFoundError, NoRowsError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    document_id = store.save_extraction(
+        project_id=project_id, filename=filename, result=result,
+        sha256=sha256, size_bytes=size_bytes, revision=revision,
+        source_uri=source_uri)
+    if not document_id:
+        raise HTTPException(status_code=503,
+                            detail="Read the schedule but could not store it. "
+                                   "The result was not saved.")
+
+    # Locating the doors on the drawings is a second, slower pass, and it can
+    # fail on its own without costing the schedule that was just read.
+    located = None
+    if plans:
+        try:
+            found = await in_worker(audit(
+                path, rows=result.rows,
+                schedule_page=result.source_pages[0]
+                if result.source_pages else None))
+            store.save_audit(document_id, found)
+            located = len(found.located)
+        except Exception as exc:  # noqa: BLE001 - the schedule still stands
+            log.warning("db: schedule stored, plan audit failed: %s", exc)
+
+    return {"document_id": document_id, "reused": False,
+            "doors": result.row_count, "method": result.method.value,
+            "located_on_plans": located}
+
+
 @router.post("/projects/{project_id}/documents",
              status_code=status.HTTP_201_CREATED)
 async def add_document(
@@ -119,37 +250,21 @@ async def add_document(
                 return {"document_id": found["id"], "reused": True,
                         "filename": found["filename"]}
 
-        try:
-            result = await in_worker(extract(path, allow_ai=allow_ai))
-        except (NotAPdfError, NoScheduleFoundError, NoRowsError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        document_id = store.save_extraction(
-            project_id=project_id, filename=file.filename or "upload.pdf",
-            result=result, sha256=sha256, size_bytes=size_bytes,
-            revision=revision)
-        if not document_id:
-            raise HTTPException(status_code=503,
-                                detail="Read the schedule but could not store "
-                                       "it. The result was not saved.")
-
-        # Locating the doors on the drawings is a second, slower pass, and it
-        # can fail on its own without costing the schedule that was just read.
-        located = None
-        if plans:
+        # Keep the bytes if there is somewhere to keep them. The viewer needs
+        # the original PDF later, and this route is the one where we hold it.
+        source_uri = None
+        if files.available():
+            source_uri = files.key_for(project_id, sha256)
             try:
-                found = await in_worker(audit(
-                    path, rows=result.rows,
-                    schedule_page=result.source_pages[0]
-                    if result.source_pages else None))
-                store.save_audit(document_id, found)
-                located = len(found.located)
-            except Exception as exc:  # noqa: BLE001 - the schedule still stands
-                log.warning("db: schedule stored, plan audit failed: %s", exc)
+                files.put(source_uri, path)
+            except Exception as exc:  # noqa: BLE001 - reading still works
+                log.warning("r2: could not store %s: %s", file.filename, exc)
+                source_uri = None
 
-        return {"document_id": document_id, "reused": False,
-                "doors": result.row_count, "method": result.method.value,
-                "located_on_plans": located}
+        return await _read_and_store(
+            project_id, path, filename=file.filename or "upload.pdf",
+            sha256=sha256, size_bytes=size_bytes, revision=revision,
+            source_uri=source_uri, plans=plans, allow_ai=allow_ai)
 
 
 @router.get("/projects/{project_id}/documents")
