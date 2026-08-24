@@ -97,6 +97,20 @@ def find_document(project_id: str, sha256: str) -> dict[str, Any] | None:
     return found.data[0] if found.data else None
 
 
+def stored_pdf(document_id: str) -> dict[str, Any] | None:
+    """Where a document's original drawing set lives, if it is still on file.
+
+    `source_uri` is null for a set that arrived as a multipart upload: it was
+    read from a temp file and that file is gone. Only the signed-link route
+    keeps the bytes, and only those documents can be re-rendered later.
+    """
+    db = client()
+    found = (db.table("documents")
+             .select("id,filename,project_id,source_uri")
+             .eq("id", document_id).execute())
+    return found.data[0] if found.data else None
+
+
 def _upsert_document(org_id: str, project_id: str, *, sha256: str,
                      filename: str, size_bytes: int, page_count: int | None,
                      revision: str | None, source_uri: str | None) -> str:
