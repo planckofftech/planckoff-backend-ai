@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import tempfile
@@ -101,6 +102,73 @@ def _discard(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError as exc:
         log.warning("could not remove temp upload %s: %s", path, exc)
+
+
+@asynccontextmanager
+async def _stored_pdf(document_id: str) -> AsyncIterator[Path]:
+    """The original drawing set behind a stored document, pulled back from R2.
+
+    A set is 12-120 MB, so re-uploading it to look at one sheet is not
+    something a browser can be asked to do -- and days later it no longer has
+    the file to upload. The bytes are already in storage; this fetches them by
+    document id, which is the only identifier the viewer has.
+    """
+    from app.db import files, store
+    from app.db.client import NoDatabase
+
+    try:
+        found = store.stored_pdf(document_id)
+    except NoDatabase as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"No database configured: {exc}") from exc
+    if not found:
+        raise HTTPException(status_code=404, detail="No such document.")
+
+    key = found.get("source_uri")
+    if not key:
+        raise HTTPException(
+            status_code=409,
+            detail="That set was uploaded straight to the API and its file was "
+                   "not kept, so there is nothing to render. Only sets "
+                   "uploaded through /uploads can be viewed later.")
+    if not files.available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="No file store configured.")
+
+    # Up to 120 MB over the network. On the event loop it would stall every
+    # other request for the length of the download, so it goes to a thread.
+    # Not through `in_worker`: that gate exists to keep two extractions from
+    # running at once, and a render must not queue behind an eighty-second
+    # read of somebody else's set.
+    try:
+        path = await asyncio.to_thread(files.fetch, key)
+    except Exception as exc:  # noqa: BLE001 - boto3 raises its own hierarchy
+        log.warning("preview: could not fetch %s: %s", key, exc)
+        raise HTTPException(
+            status_code=404,
+            detail="The stored file for that document could not be read.",
+        ) from exc
+    try:
+        yield path
+    finally:
+        files.discard(path)
+
+
+@asynccontextmanager
+async def _pdf_to_render(file: UploadFile | None,
+                         document_id: str | None) -> AsyncIterator[Path]:
+    """Whichever way the caller named a PDF: an upload, or a stored document."""
+    if (file is None) == (document_id is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Send either a file or a document_id, not both and not "
+                   "neither.")
+    if document_id is not None:
+        async with _stored_pdf(document_id) as path:
+            yield path
+    else:
+        async with _spooled_upload(file) as path:
+            yield path
 
 
 @router.post(
@@ -371,7 +439,17 @@ def _parse_box(raw: str | None) -> tuple[float, float, float, float] | None:
     responses={200: {"content": {"image/png": {}}}},
 )
 async def preview(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(
+        None,
+        description="The drawing set. Omit it and pass `document_id` instead "
+        "for a set already in storage.",
+    ),
+    document_id: str | None = Query(
+        None,
+        description="Render from a stored document rather than an upload. The "
+        "set stays in storage after it is read, so a viewer can ask for any "
+        "sheet of a job read weeks ago without the browser holding the file.",
+    ),
     marks: str | None = Form(
         None,
         description="JSON array of {x0,y0,x1,y1,label} in page fractions -- "
@@ -415,9 +493,27 @@ async def preview(
     rect = _parse_box(box)
     marked = _parse_marks(marks)
 
-    async with _spooled_upload(file) as path:
+    async with _pdf_to_render(file, document_id) as path:
       try:
         with PdfDoc(path) as doc:
+            if page is not None and 1 <= page <= doc.page_count and (
+                    marked or rect is not None or whole):
+                # The caller named the sheet, so there is nothing to search
+                # for. Scoring all 120 pages to render one of them is the cost
+                # this avoids -- and worse, the search below would win: asking
+                # for page 9 of a plan set used to return the schedule page,
+                # because only a mark or a box made the page count.
+                chosen = page_finder.score_page(doc.text_items(page - 1), page)
+                located = bool(marked) or rect is not None or chosen.passed
+                clip = []
+                drawn = []
+                png = render_preview(doc, chosen, located=located, box=rect,
+                                     box_label=label or "", marks=marked,
+                                     clip_out=clip, drawn_out=drawn,
+                                     draw=draw, whole=whole)
+                return _preview_response(png, chosen, located, rect, marked,
+                                         clip, drawn)
+
             scores = page_finder.find_schedule_pages(doc)
             candidates = page_finder.passing(scores)
             by_page = {c.page: c for c in scores}
@@ -451,6 +547,12 @@ async def preview(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="File is not a readable PDF.") from exc
 
+    return _preview_response(png, chosen, located, rect, marked, clip, drawn)
+
+
+def _preview_response(png: bytes, chosen, located: bool, rect, marked: list,
+                      clip: list, drawn: list) -> Response:
+    """The PNG plus everything a caller needs to lay an overlay over it."""
     return Response(
         content=png,
         media_type="image/png",
