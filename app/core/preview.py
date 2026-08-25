@@ -265,6 +265,17 @@ def render_preview(doc: PdfDoc, candidate: PageCandidate, *, dpi: int = 110,
         image.save(out, format="PNG", optimize=True)
         return out.getvalue()
 
+    if not draw:
+        # Nothing to crop to and nothing to draw: the caller wants the sheet
+        # itself. Everything below this line is the view that checks the
+        # extractor -- the table outline, and the "no schedule located" banner
+        # a plan sheet always earns because it carries no schedule. Burned into
+        # the PNG, that banner sits on the drawing and cannot be taken off
+        # again, which is the opposite of what `draw=False` promises.
+        if clip_out is not None:
+            clip_out.extend([0.0, 0.0, 1.0, 1.0])
+        return doc.render_png(page_index, dpi=dpi)
+
     image = Image.open(io.BytesIO(doc.render_png(page_index, dpi=dpi))).convert("RGB")
     scale = dpi / _PDF_DPI
     draw = ImageDraw.Draw(image)
