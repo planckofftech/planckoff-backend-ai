@@ -34,6 +34,7 @@ from app.db import files, store
 from app.db.client import NoDatabase, client
 from app.pipeline import NoRowsError, NoScheduleFoundError, extract
 from app.plan_pipeline import audit
+from app.schemas import DoorRow
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["storage"])
@@ -404,6 +405,98 @@ async def remove_project(
              project_id, name, removed)
     return {"project_id": project_id, "deleted": True, "name": name,
             "files_removed": removed, "files_found": len(keys)}
+
+
+# `doors_current` keeps the extracted value and publishes the corrected one
+# beside it. The audit should reconcile against what a person has since fixed,
+# not against what the extractor first read.
+_CORRECTED = {"door_width": "width", "door_height": "height",
+              "door_type": "type", "door_material": "material"}
+
+
+def _stored_rows(db, document_id: str) -> list[DoorRow]:
+    """The schedule as it stands now, back in the shape the audit expects."""
+    stored = (db.table("doors_current").select("*")
+              .eq("document_id", document_id)
+              .order("row_index").execute().data)
+    rows = []
+    for row in stored:
+        data = {k: v for k, v in row.items()
+                if k in DoorRow.model_fields and v is not None}
+        for field, corrected in _CORRECTED.items():
+            if row.get(corrected) is not None:
+                data[field] = row[corrected]
+        rows.append(DoorRow(**data))
+    return rows
+
+
+@router.post("/documents/{document_id}/audit")
+async def audit_document(
+    document_id: str,
+    detect: bool = Query(False, description="Also find doors as shapes with "
+                                            "the vision model. This is the "
+                                            "only part that costs money."),
+    budget_usd: float | None = Query(None, gt=0,
+                                     description="Ceiling for this request"),
+    _key: str = Depends(require_api_key),
+):
+    """Locate a stored schedule's doors on the plans, as a separate call.
+
+    Reading the table is steady at about ten seconds whatever the set; locating
+    the doors runs from thirty seconds to over two minutes and is what the wait
+    is actually made of. Uploading with `plans=false` and calling this after
+    puts the schedule on screen as soon as it exists, instead of holding it back
+    for the slower half.
+
+    The schedule is not read again. The stored rows are what get located, so
+    this cannot disagree with the table already on screen -- and a correction
+    made in between is the number it goes looking for.
+    """
+    db = _db()
+    found = store.stored_pdf(document_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="No such document.")
+    key = found.get("source_uri")
+    if not key:
+        raise HTTPException(
+            status_code=409,
+            detail="That set's file was not kept, so its plans cannot be read. "
+                   "Only sets uploaded through /uploads can be audited later.")
+    if not files.available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="No file store configured.")
+
+    rows = _stored_rows(db, document_id)
+    if not rows:
+        raise HTTPException(
+            status_code=422,
+            detail="That document has no doors stored, so there is nothing to "
+                   "locate. Read the schedule first.")
+
+    pages = (db.table("schedules").select("page")
+             .eq("document_id", document_id).order("page").execute().data)
+
+    path = await asyncio.to_thread(files.fetch, key)
+    try:
+        result = await in_worker(audit(
+            path, rows=rows, detect=detect, budget_usd=budget_usd,
+            schedule_page=pages[0]["page"] if pages else None))
+    except NotAPdfError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        files.discard(path)
+
+    # The audit is worth returning even when it could not be written down --
+    # the caller asked where the doors are, and a storage failure is not an
+    # answer to that question.
+    saved = store.save_audit(document_id, result)
+    return {"document_id": document_id, "doors": len(rows),
+            "located_on_plans": len(result.located),
+            "not_on_plans": len(result.not_on_plans),
+            "sheets_scanned": len(result.floor_plans),
+            "duration_ms": result.duration_ms,
+            "stored": saved, "warnings": result.warnings,
+            "coverage_note": result.coverage_note}
 
 
 @router.post("/documents/{document_id}/restore")
