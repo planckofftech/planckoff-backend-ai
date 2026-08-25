@@ -111,6 +111,68 @@ def stored_pdf(document_id: str) -> dict[str, Any] | None:
     return found.data[0] if found.data else None
 
 
+def set_document_status(document_id: str, status: str) -> bool:
+    """Archive or restore one drawing set. False if there is no such document.
+
+    Nothing is thrown away: the doors, sheets and detections stay exactly as
+    they were, and so does the file. Restoring is the same call the other way
+    round, which is the whole reason archiving is the default.
+    """
+    db = client()
+    done = (db.table("documents").update({"status": status})
+            .eq("id", document_id).execute())
+    return bool(done.data)
+
+
+def set_project_status(project_id: str, status: str) -> bool:
+    """Archive or restore a whole job, documents included.
+
+    The documents are set too rather than left to be inferred from the project,
+    so that `documents.status` means one thing everywhere and a query never has
+    to join to find out whether a set counts.
+    """
+    db = client()
+    done = (db.table("projects").update({"status": status})
+            .eq("id", project_id).execute())
+    if not done.data:
+        return False
+    db.table("documents").update({"status": status}) \
+        .eq("project_id", project_id).execute()
+    return True
+
+
+def stored_keys(project_id: str) -> list[str]:
+    """Every stored file under a job, for deleting them alongside the rows."""
+    db = client()
+    found = (db.table("documents").select("source_uri")
+             .eq("project_id", project_id).execute())
+    return [r["source_uri"] for r in found.data if r.get("source_uri")]
+
+
+def delete_document(document_id: str) -> bool:
+    """Destroy one drawing set and everything read from it.
+
+    The schedule, sheets, detections and corrections go with it -- every table
+    referencing `documents` is `on delete cascade`, so this is one statement
+    and cannot half-succeed.
+    """
+    db = client()
+    done = db.table("documents").delete().eq("id", document_id).execute()
+    return bool(done.data)
+
+
+def delete_project(project_id: str) -> bool:
+    """Destroy a job and every document under it.
+
+    This also takes the job's `run_log` rows, which are the record of what was
+    spent reading it. That history cannot be reconstructed -- the runs are gone
+    and the money is not coming back -- which is why the endpoint asks twice.
+    """
+    db = client()
+    done = db.table("projects").delete().eq("id", project_id).execute()
+    return bool(done.data)
+
+
 def _upsert_document(org_id: str, project_id: str, *, sha256: str,
                      filename: str, size_bytes: int, page_count: int | None,
                      revision: str | None, source_uri: str | None) -> str:

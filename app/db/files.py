@@ -155,6 +155,29 @@ def put(key: str, path: Path) -> None:
     log.info("r2: stored %s (%.1f MB)", key, path.stat().st_size / 1048576)
 
 
+def remove(key: str) -> bool:
+    """Delete one stored set. True if it is gone, False if it could not be.
+
+    Safe to call for a document because a key is `{project}/{sha256}.pdf` and
+    `documents` is unique on (project_id, sha256): one row, one object. The
+    same bytes in another project are a different key and are untouched.
+
+    Storage is the reason this exists at all. Without it a job deleted in the
+    morning still costs for its 120 MB every month afterwards, and nothing in
+    the product ever mentions it again -- the bucket only grows.
+    """
+    settings = get_settings()
+    try:
+        client().delete_object(Bucket=settings.r2_bucket, Key=key)
+    except Exception as exc:  # noqa: BLE001 - boto3 raises its own hierarchy
+        # Not fatal. The row is going either way; a file left behind is a
+        # cleanup job, while refusing the delete leaves a job nobody can remove.
+        log.warning("r2: could not delete %s: %s", key, exc)
+        return False
+    log.info("r2: deleted %s", key)
+    return True
+
+
 def discard(path: Path) -> None:
     """Delete a fetched temp file, tolerating a lock we cannot break."""
     try:
