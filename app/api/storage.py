@@ -11,6 +11,7 @@ change goes to `corrections`, alongside the original rather than over it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -79,13 +80,22 @@ async def create_project(body: NewProject, _key: str = Depends(require_api_key))
 
 
 @router.get("/projects")
-async def list_projects(_key: str = Depends(require_api_key)):
+async def list_projects(
+    archived: bool = Query(False, description="Show archived jobs instead of "
+                                              "active ones"),
+    _key: str = Depends(require_api_key),
+):
     """Every job, with what is in it -- read from `project_summary`.
 
     The view, not the tables. It is the shape the frontend is promised, so the
     tables underneath stay free to change.
+
+    Archived jobs are hidden rather than gone: pass `archived=true` to see them,
+    which is also how anything archived by mistake is found again.
     """
-    return _db().table("project_summary").select("*").execute().data
+    wanted = "archived" if archived else "active"
+    return (_db().table("project_summary").select("*")
+            .eq("status", wanted).execute().data)
 
 
 class UploadRequest(BaseModel):
@@ -268,11 +278,22 @@ async def add_document(
 
 
 @router.get("/projects/{project_id}/documents")
-async def list_documents(project_id: str, _key: str = Depends(require_api_key)):
-    """The drawing sets in a job, newest first."""
+async def list_documents(
+    project_id: str,
+    archived: bool = Query(False, description="Show archived sets instead of "
+                                              "active ones"),
+    _key: str = Depends(require_api_key),
+):
+    """The drawing sets in a job, newest first.
+
+    `source_uri` is null for a set whose file was never kept -- it cannot be
+    re-rendered, so a viewer needs to know before it offers the option.
+    """
+    wanted = "archived" if archived else "active"
     return (_db().table("documents").select(
-        "id, filename, revision, page_count, size_bytes, created_at")
-        .eq("project_id", project_id)
+        "id, filename, revision, page_count, size_bytes, created_at, "
+        "status, source_uri")
+        .eq("project_id", project_id).eq("status", wanted)
         .order("created_at", desc=True).execute().data)
 
 
@@ -304,6 +325,105 @@ async def stored_document(
         out["detections"] = (db.table("detections").select("*")
                              .eq("document_id", document_id).execute().data)
     return out
+
+
+@router.delete("/documents/{document_id}")
+async def remove_document(
+    document_id: str,
+    hard: bool = Query(False, description="Destroy it instead of archiving. "
+                                          "The doors, sheets, detections and "
+                                          "corrections go too, and so does the "
+                                          "stored PDF. There is no undo."),
+    _key: str = Depends(require_api_key),
+):
+    """Archive a drawing set, or destroy it outright.
+
+    Archiving by default is not timidity. Reading a set costs eighty seconds
+    and, with the detector on, real money -- and a person who has since
+    corrected forty doors by hand has put work into this row that no re-run
+    brings back. Hiding it is reversible; deleting it is not.
+    """
+    db = _db()
+    found = (db.table("documents").select("id, filename, source_uri")
+             .eq("id", document_id).execute())
+    if not found.data:
+        raise HTTPException(status_code=404, detail="No such document.")
+    doc = found.data[0]
+
+    if not hard:
+        store.set_document_status(document_id, "archived")
+        return {"document_id": document_id, "archived": True,
+                "filename": doc["filename"]}
+
+    # Rows first. A file left behind is recoverable waste; a row pointing at a
+    # file that is already gone is a document nobody can open and nobody can
+    # explain.
+    store.delete_document(document_id)
+    file_removed = False
+    if doc.get("source_uri") and files.available():
+        file_removed = await asyncio.to_thread(files.remove, doc["source_uri"])
+    log.info("db: deleted document %s (%s)", document_id, doc["filename"])
+    return {"document_id": document_id, "deleted": True,
+            "filename": doc["filename"], "file_removed": file_removed}
+
+
+@router.delete("/projects/{project_id}")
+async def remove_project(
+    project_id: str,
+    hard: bool = Query(False, description="Destroy the job and everything "
+                                          "under it, including its stored "
+                                          "files and its spend history."),
+    _key: str = Depends(require_api_key),
+):
+    """Archive a job, or destroy it and everything under it.
+
+    A hard delete also takes the `run_log` rows -- what each read cost and how
+    long it took. That is the only record of money actually spent on this job,
+    it cannot be reconstructed, and it is usually wanted long after the drawings
+    are not. Archive unless you specifically mean to lose it.
+    """
+    db = _db()
+    found = (db.table("projects").select("id, name")
+             .eq("id", project_id).execute())
+    if not found.data:
+        raise HTTPException(status_code=404, detail="No such project.")
+    name = found.data[0]["name"]
+
+    if not hard:
+        store.set_project_status(project_id, "archived")
+        return {"project_id": project_id, "archived": True, "name": name}
+
+    keys = store.stored_keys(project_id)
+    store.delete_project(project_id)
+    removed = 0
+    if keys and files.available():
+        for key in keys:
+            if await asyncio.to_thread(files.remove, key):
+                removed += 1
+    log.info("db: deleted project %s (%s) and %d file(s)",
+             project_id, name, removed)
+    return {"project_id": project_id, "deleted": True, "name": name,
+            "files_removed": removed, "files_found": len(keys)}
+
+
+@router.post("/documents/{document_id}/restore")
+async def restore_document(document_id: str,
+                           _key: str = Depends(require_api_key)):
+    """Put an archived drawing set back. Nothing was lost, so nothing re-runs."""
+    _db()
+    if not store.set_document_status(document_id, "active"):
+        raise HTTPException(status_code=404, detail="No such document.")
+    return {"document_id": document_id, "archived": False}
+
+
+@router.post("/projects/{project_id}/restore")
+async def restore_project(project_id: str,
+                          _key: str = Depends(require_api_key)):
+    """Put an archived job back, documents included."""
+    _db()
+    if not store.set_project_status(project_id, "active"):
+        raise HTTPException(status_code=404, detail="No such project.")
+    return {"project_id": project_id, "archived": False}
 
 
 @router.post("/documents/{document_id}/corrections",
