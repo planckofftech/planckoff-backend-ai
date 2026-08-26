@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Literal
 
 from fastapi import (
     APIRouter,
@@ -26,7 +27,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
-from app.api.deps import require_api_key
+from app.api.deps import Caller, require_api_key, require_caller
 from app.config import get_settings
 from app.api.offload import in_worker
 from app.core.pdf_doc import NotAPdfError
@@ -56,6 +57,26 @@ class NewProject(BaseModel):
     code: str | None = Field(None, description="The firm's own job number")
 
 
+# What a person may change, as a closed list.
+#
+# A literal rather than a free string for two reasons. It becomes an enum in
+# the OpenAPI schema, so a caller can read the allowed fields instead of
+# guessing them. And it is checked before the value reaches PostgREST, which
+# used to be the only thing validating it -- `select(field)` accepted any real
+# column, so `org_id` and `row_index` were correctable, and a genuine typo came
+# back as a 500 from the database rather than a 422 from us.
+#
+# `door_tag` is deliberately absent. Corrections are keyed on the door number,
+# so changing it would orphan every correction already made against that door,
+# including this one.
+CorrectableField = Literal[
+    "from_space", "to_space",
+    "door_width", "door_height", "door_type", "door_material", "door_finish",
+    "frame_material", "frame_finish",
+    "threshold", "fire_rating", "hw_set", "comments",
+]
+
+
 class Correction(BaseModel):
     """One field of one door, changed by a person.
 
@@ -66,17 +87,23 @@ class Correction(BaseModel):
     """
 
     door_tag: str
-    field: str = Field(description="Canonical field, e.g. 'door_width'")
+    field: CorrectableField = Field(
+        description="Which field to change. Every door-side field of the "
+        "schedule is correctable, including ones the drawing never carried -- "
+        "across six real sets `fire_rating` was absent from three, and a rated "
+        "opening is a different product to buy.")
     value: str = Field(description="What it should be")
     note: str | None = None
 
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)
-async def create_project(body: NewProject, _key: str = Depends(require_api_key)):
+async def create_project(body: NewProject,
+                         caller: Caller = Depends(require_caller)):
     """Create a job, or return the one already there under that name."""
     _db()
     org_id = store.ensure_org(body.org)
-    project_id = store.ensure_project(org_id, body.name, body.code)
+    project_id = store.ensure_project(org_id, body.name, body.code,
+                                      created_by=caller.user_id)
     return {"id": project_id, "org_id": org_id, "name": body.name}
 
 
@@ -323,8 +350,20 @@ async def stored_document(
               .eq("document_id", document_id).order("page").execute().data)
     out = {"document": found.data[0], "doors": doors, "sheets": sheets}
     if detections:
-        out["detections"] = (db.table("detections").select("*")
-                             .eq("document_id", document_id).execute().data)
+        measured = (db.table("detections").select("*")
+                    .eq("document_id", document_id).execute().data)
+        # Hand-placed boxes key on the page, because sheet ids are rebuilt by
+        # every audit. Resolve them back so a caller sees one kind of row.
+        page_id = {s["page"]: s["id"] for s in sheets}
+        placed = [
+            {**row, "source": "manual", "is_primary": True,
+             "sheet_id": page_id.get(row["page"]),
+             "radius": None, "hinge_x": None, "hinge_y": None,
+             "start_deg": None, "end_deg": None, "also_on": []}
+            for row in store.manual_detections(document_id)
+        ]
+        out["detections"] = measured + placed
+        out["suppressed"] = len(store.tombstones(document_id))
     return out
 
 
@@ -407,15 +446,14 @@ async def remove_project(
             "files_removed": removed, "files_found": len(keys)}
 
 
-# `doors_current` keeps the extracted value and publishes the corrected one
-# beside it. The audit should reconcile against what a person has since fixed,
-# not against what the extractor first read.
-_CORRECTED = {"door_width": "width", "door_height": "height",
-              "door_type": "type", "door_material": "material"}
-
-
 def _stored_rows(db, document_id: str) -> list[DoorRow]:
-    """The schedule as it stands now, back in the shape the audit expects."""
+    """The schedule as it stands now, back in the shape the audit expects.
+
+    `doors_current` keeps the extracted value and publishes every correction
+    beside it in `corrected`. The audit reconciles against what a person has
+    since fixed, not against what the extractor first read -- so a width
+    corrected this morning is the width it goes looking for.
+    """
     stored = (db.table("doors_current").select("*")
               .eq("document_id", document_id)
               .order("row_index").execute().data)
@@ -423,9 +461,9 @@ def _stored_rows(db, document_id: str) -> list[DoorRow]:
     for row in stored:
         data = {k: v for k, v in row.items()
                 if k in DoorRow.model_fields and v is not None}
-        for field, corrected in _CORRECTED.items():
-            if row.get(corrected) is not None:
-                data[field] = row[corrected]
+        for field, value in (row.get("corrected") or {}).items():
+            if field in DoorRow.model_fields and value is not None:
+                data[field] = value
         rows.append(DoorRow(**data))
     return rows
 
@@ -499,6 +537,177 @@ async def audit_document(
             "coverage_note": result.coverage_note}
 
 
+class NewDetection(BaseModel):
+    """A door an estimator boxed on the drawing."""
+
+    sheet_id: str = Field(description="Which sheet, from GET /documents/{id}")
+    door_tag: str | None = Field(
+        None,
+        description="The schedule number, if this opening has one. Leave it "
+        "out for a door the schedule never carried -- that is the valuable "
+        "case, and a door row is created for it so the takeoff can price it.")
+    x0: float = Field(ge=0, le=1)
+    y0: float = Field(ge=0, le=1)
+    x1: float = Field(ge=0, le=1)
+    y1: float = Field(ge=0, le=1)
+    kind: str | None = Field(None, description="single_swing, sliding, ...")
+    swing: str | None = None
+    note: str | None = None
+
+
+class MoveDetection(BaseModel):
+    x0: float = Field(ge=0, le=1)
+    y0: float = Field(ge=0, le=1)
+    x1: float = Field(ge=0, le=1)
+    y1: float = Field(ge=0, le=1)
+    kind: str | None = None
+    swing: str | None = None
+    note: str | None = None
+
+
+def _page_of(db, document_id: str, sheet_id: str) -> int:
+    """A sheet's page number, which is what manual rows key on.
+
+    Callers hold sheet ids because that is what the read endpoint gives them,
+    but `save_audit` rebuilds `sheets` with new ids on every run. Storing the
+    page instead is what lets a hand-placed box outlive the next audit.
+    """
+    found = (db.table("sheets").select("page")
+             .eq("id", sheet_id).eq("document_id", document_id).execute())
+    if not found.data:
+        raise HTTPException(status_code=404,
+                            detail="That sheet is not in this document.")
+    return found.data[0]["page"]
+
+
+@router.post("/documents/{document_id}/detections",
+             status_code=status.HTTP_201_CREATED)
+async def place_detection(document_id: str, body: NewDetection,
+                          caller: Caller = Depends(require_caller)):
+    """Record a door the plan pass missed.
+
+    If the number is not in the schedule -- or no number is given at all -- a
+    door row is created for it, marked `source: 'plan'`. An opening drawn but
+    never scheduled is the most useful thing a takeoff can surface, and
+    refusing it would discard exactly what the estimator just found.
+    """
+    db = _db()
+    found = db.table("documents").select("org_id").eq(
+        "id", document_id).execute()
+    if not found.data:
+        raise HTTPException(status_code=404, detail="No such document.")
+    org_id = found.data[0]["org_id"]
+    page = _page_of(db, document_id, body.sheet_id)
+
+    created_door = False
+    if body.door_tag:
+        known = (db.table("doors").select("id")
+                 .eq("document_id", document_id)
+                 .eq("door_tag", body.door_tag).execute())
+        if not known.data:
+            last = (db.table("doors").select("row_index")
+                    .eq("document_id", document_id)
+                    .order("row_index", desc=True).limit(1).execute())
+            db.table("doors").insert({
+                "org_id": org_id, "document_id": document_id,
+                "door_tag": body.door_tag, "source": "plan",
+                "row_index": (last.data[0]["row_index"] + 1
+                              if last.data else 0),
+                "extra": {},
+            }).execute()
+            created_door = True
+
+    made = db.table("manual_detections").insert({
+        "org_id": org_id, "document_id": document_id, "page": page,
+        "door_tag": body.door_tag, "x0": body.x0, "y0": body.y0,
+        "x1": body.x1, "y1": body.y1, "kind": body.kind,
+        "swing": body.swing, "note": body.note,
+        "created_by": caller.user_id,
+    }).execute()
+    log.info("db: door boxed by hand on page %d of %s%s",
+             page, document_id, " (new door row)" if created_door else "")
+    return {**made.data[0], "source": "manual",
+            "sheet_id": body.sheet_id, "door_created": created_door}
+
+
+@router.patch("/detections/{detection_id}")
+async def move_detection(detection_id: str, body: MoveDetection,
+                         _key: str = Depends(require_api_key)):
+    """Move or resize a box a person placed.
+
+    Only manual boxes. A measured one is the extent of an arc on the drawing,
+    so dragging it would make it a claim about the plan that the plan does not
+    support -- delete it and place your own instead.
+    """
+    db = _db()
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    done = (db.table("manual_detections").update(patch)
+            .eq("id", detection_id).execute())
+    if not done.data:
+        raise HTTPException(
+            status_code=404,
+            detail="No hand-placed box with that id. Measured detections "
+                   "cannot be moved -- remove it and place your own.")
+    return {**done.data[0], "source": "manual"}
+
+
+@router.delete("/detections/{detection_id}")
+async def remove_detection(detection_id: str,
+                           reason: str | None = Query(None),
+                           caller: Caller = Depends(require_caller)):
+    """Remove a box.
+
+    A hand-placed one is simply deleted -- nothing regenerates it. A measured
+    one is recorded as removed instead, because the geometry pass is
+    deterministic: the same drawing yields the same box every run, so without
+    a record the next audit puts it straight back.
+    """
+    db = _db()
+    mine = (db.table("manual_detections").select("*")
+            .eq("id", detection_id).execute())
+    if mine.data:
+        db.table("manual_detections").delete().eq("id", detection_id).execute()
+        return {"detection_id": detection_id, "deleted": True,
+                "tombstoned": False}
+
+    found = (db.table("detections").select("*")
+             .eq("id", detection_id).execute())
+    if not found.data:
+        raise HTTPException(status_code=404, detail="No such detection.")
+    det = found.data[0]
+
+    sheet = (db.table("sheets").select("page")
+             .eq("id", det["sheet_id"]).execute())
+    db.table("detection_tombstones").insert({
+        "org_id": det["org_id"], "document_id": det["document_id"],
+        "page": sheet.data[0]["page"] if sheet.data else 0,
+        "door_tag": det.get("door_tag"),
+        "x0": det["x0"], "y0": det["y0"], "x1": det["x1"], "y1": det["y1"],
+        "reason": reason,
+        "created_by": caller.user_id,
+    }).execute()
+    db.table("detections").delete().eq("id", detection_id).execute()
+    log.info("db: detection %s removed and recorded", detection_id)
+    return {"detection_id": detection_id, "deleted": True,
+            "tombstoned": True}
+
+
+@router.delete("/documents/{document_id}/suppressions")
+async def clear_suppressions(document_id: str,
+                             _key: str = Depends(require_api_key)):
+    """Forget every removal, so the next audit reports what it actually finds.
+
+    Deliberately its own call rather than something `?detect=true` does. A
+    fresh pass does not make an old removal wrong: `detect=true` adds a vision
+    pass, it does not change the geometry that produced the box in the first
+    place. Clearing should be a decision, not a side effect.
+    """
+    db = _db()
+    done = (db.table("detection_tombstones").delete()
+            .eq("document_id", document_id).execute())
+    return {"document_id": document_id, "cleared": len(done.data)}
+
+
 @router.post("/documents/{document_id}/restore")
 async def restore_document(document_id: str,
                            _key: str = Depends(require_api_key)):
@@ -522,7 +731,7 @@ async def restore_project(project_id: str,
 @router.post("/documents/{document_id}/corrections",
              status_code=status.HTTP_201_CREATED)
 async def correct(document_id: str, body: Correction,
-                  _key: str = Depends(require_api_key)):
+                  caller: Caller = Depends(require_caller)):
     """Record that a person changed a value.
 
     The extracted value is never overwritten. `was` and `now` both stay, because
@@ -550,6 +759,7 @@ async def correct(document_id: str, body: Correction,
         "was": door.data[0].get(body.field),
         "now": body.value,
         "note": body.note,
+        "created_by": caller.user_id,
     }
     made = db.table("corrections").insert(row).execute()
     log.info("db: %s on door %s changed to %r",

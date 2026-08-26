@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 from typing import Any
 
 from app.config import get_settings
@@ -69,7 +70,8 @@ def ensure_org(name: str) -> str:
     return made.data[0]["id"]
 
 
-def ensure_project(org_id: str, name: str, code: str | None = None) -> str:
+def ensure_project(org_id: str, name: str, code: str | None = None,
+                   created_by: str | None = None) -> str:
     """The job, created if new. Named by a person, so matched by name."""
     db = client()
     found = (db.table("projects").select("id")
@@ -79,6 +81,8 @@ def ensure_project(org_id: str, name: str, code: str | None = None) -> str:
     row = {"org_id": org_id, "name": name}
     if code:
         row["code"] = code
+    if created_by:
+        row["created_by"] = created_by
     made = db.table("projects").insert(row).execute()
     log.info("db: created project %r", name)
     return made.data[0]["id"]
@@ -290,6 +294,72 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
 # the drawings
 # --------------------------------------------------------------------------- #
 
+# How near two boxes must be to be the same box, in box-widths between their
+# centres. Half a width: clearly closer than the one-leaf distance at which the
+# plan pipeline decides an arc belongs to the next door along, so suppressing a
+# repeat can never suppress its neighbour.
+#
+# Measured in box-widths rather than points because detections are stored as
+# page fractions, and a fraction means different distances on a 24x36 sheet and
+# an 11x17. A door box is a door box on both.
+_SAME_BOX = 0.5
+
+
+def _centre(box: dict) -> tuple[float, float]:
+    return ((box["x0"] + box["x1"]) / 2, (box["y0"] + box["y1"]) / 2)
+
+
+def is_suppressed(det: dict, tombstones: list[dict]) -> bool:
+    """Has a person already removed this box?
+
+    By number where there is one: a tagged door that comes back on the same
+    sheet is the same door, wherever the box landed this time. By position
+    where there is not -- an untagged box has no other handle, and untagged is
+    most of what gets deleted, because a circle fitted to a structural column
+    has no number by definition.
+    """
+    for dead in tombstones:
+        if dead["page"] != det.get("page"):
+            continue
+        if dead.get("door_tag") and det.get("door_tag"):
+            if dead["door_tag"] == det["door_tag"]:
+                return True
+            continue
+        if dead.get("door_tag") or det.get("door_tag"):
+            continue
+        dx, dy = _centre(dead), _centre(det)
+        width = max(dead["x1"] - dead["x0"], det["x1"] - det["x0"], 1e-6)
+        if math.hypot(dx[0] - dy[0], dx[1] - dy[1]) <= width * _SAME_BOX:
+            return True
+    return False
+
+
+def tombstones(document_id: str) -> list[dict[str, Any]]:
+    """Boxes a person has removed, which must not come back."""
+    try:
+        db = client()
+        return (db.table("detection_tombstones").select("*")
+                .eq("document_id", document_id).execute().data)
+    except NoDatabase:
+        return []
+    except Exception as exc:  # noqa: BLE001 - a missing table must not stop an audit
+        log.warning("db: could not read tombstones: %s", exc)
+        return []
+
+
+def manual_detections(document_id: str) -> list[dict[str, Any]]:
+    """Boxes a person placed. Never rebuilt, never wiped by an audit."""
+    try:
+        db = client()
+        return (db.table("manual_detections").select("*")
+                .eq("document_id", document_id).execute().data)
+    except NoDatabase:
+        return []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("db: could not read manual detections: %s", exc)
+        return []
+
+
 def save_audit(document_id: str, audit: PlanAudit) -> bool:
     """Store where each door was found and what its swing measures."""
     try:
@@ -311,9 +381,19 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
         ])
         sheet_id = {s.page: m["id"] for s, m in zip(audit.floor_plans, made)}
 
-        rows, seen = [], set()
+        # Boxes a person has already removed. The geometry pass is
+        # deterministic, so without this the same wrong box is written back on
+        # every audit and removed again by hand on every audit.
+        dead = tombstones(document_id)
+        rows, seen, suppressed = [], set(), 0
         for door in audit.detected:
             page = door.location.page
+            if dead and is_suppressed(
+                    {"page": page, "door_tag": door.tag or None,
+                     "x0": door.location.x0, "y0": door.location.y0,
+                     "x1": door.location.x1, "y1": door.location.y1}, dead):
+                suppressed += 1
+                continue
             if page not in sheet_id:
                 # Drawn on a sheet the audit did not list as a floor plan.
                 # Nothing to hang it on, and inventing a sheet row would put a
@@ -344,6 +424,9 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
                                if door.other_leaf else None),
             })
         _insert("detections", rows)
+        if suppressed:
+            log.info("db: %d detection(s) left out -- removed by hand earlier",
+                     suppressed)
         log.info("db: stored %d detection(s) on %d sheet(s)",
                  len(rows), len(made))
         _log_run(org_id, document.data[0]["project_id"], document_id, "audit",
