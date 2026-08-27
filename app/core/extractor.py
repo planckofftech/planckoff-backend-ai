@@ -180,14 +180,19 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
             continue
         values: dict[str, str] = {}
         extra: dict[str, str] = {}
-        for idx, text in enumerate(cells):
-            if idx >= len(mapped):
-                continue
-            field = mapped[idx]
+        # Walk the columns, not the cells. A short row -- one whose trailing
+        # cells were never drawn -- used to contribute no keys for the columns
+        # it stopped short of, and a blank cell contributed none either. So the
+        # key set was a property of which doors happened to have values, and a
+        # caller building its columns from `extra` saw a different shape on
+        # every door. The columns belong to the table; they are the same for
+        # every row in it.
+        for idx, field in enumerate(mapped):
+            text = cells[idx] if idx < len(cells) else ""
             if field:
                 values[field] = _join_split_mark(text) if field == "door_tag" \
                     else text
-            elif text:
+            elif idx < len(header_strings):
                 extra[header_mapper.extra_key(header_strings[idx], idx)] = text
         # A second line of the heading, wearing a door's clothes.
         if _is_heading_row(values.get("door_tag", "")):

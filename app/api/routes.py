@@ -212,7 +212,7 @@ async def extract_door_schedule(
     return result
 
 
-@router.post(
+@router.post(     # Master sheet route will be deprecated after the front-end merger with the because it would have designed for the POC purpose.
     "/api/v1/master-sheet",
     tags=["master sheet"],
     summary="Map an already-extracted schedule onto the master door format sheet",
