@@ -348,7 +348,15 @@ async def stored_document(
              .order("row_index").execute().data)
     sheets = (db.table("sheets").select("*")
               .eq("document_id", document_id).order("page").execute().data)
-    out = {"document": found.data[0], "doors": doors, "sheets": sheets}
+    # One row per schedule table found, carrying `headers` -- the column names
+    # exactly as the drawing printed them, in the order it printed them -- and
+    # `field_map`, what each became. Together they turn a door's `extra` keys
+    # back into the architect's own names, and they list the columns that are
+    # blank on every door, which no row can show.
+    schedules = (db.table("schedules").select("*")
+                 .eq("document_id", document_id).order("page").execute().data)
+    out = {"document": found.data[0], "doors": doors, "sheets": sheets,
+           "schedules": schedules}
     if detections:
         measured = (db.table("detections").select("*")
                     .eq("document_id", document_id).execute().data)
