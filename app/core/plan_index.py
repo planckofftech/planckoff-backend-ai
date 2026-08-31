@@ -142,7 +142,17 @@ _ORDINAL = {"FIRST": "1", "SECOND": "2", "THIRD": "3", "FOURTH": "4",
 _PHASE = re.compile(r"\bPHASE\s+([IVX]+|\d)\b")
 # The floor drawn large, in part. Never the sheet to lead with when a plan of
 # the whole storey exists -- it is a corner of the building without its context.
-_ENLARGED = ("ENLARGED", "ENL. PLAN", "PARTIAL")
+# A sheet that draws one part of the floor larger, so a congested area is
+# readable. Presentation only: doors are searched for on every plan sheet
+# whatever its title, and where a door appears on several the primary is chosen
+# by arc, then scale -- not by this.
+#
+# PARTIAL is deliberately absent. A PARTIAL FLOOR PLAN is not an enlargement:
+# it is the floor plan, cut across sheets because the building does not fit on
+# one. The drawings say so themselves -- BMK's three partial sheets carry match
+# lines ("continues on A3.11") and share one 1/8" scale, while its enlarged
+# sheets have no match lines and are drawn at 1/4".
+_ENLARGED = ("ENLARGED", "ENL. PLAN", "UNIT PLAN")
 # A title that says the drawing is of the floor itself.
 _IS_THE_FLOOR = ("FLOOR PLAN", "FLOOR &", "FLOOR AND", "PLAN - FLOOR")
 # Subjects a sheet may carry alongside its floor plan without ceasing to be
