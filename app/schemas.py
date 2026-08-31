@@ -152,6 +152,21 @@ class SheetRef(BaseModel):
         "the whole floor at working scale, not the reduced-scale index that "
         "redraws every floor small, and not an enlargement of one corner.",
     )
+    scanned: bool = Field(
+        False,
+        description="Did the audit actually read this sheet? A sheet can be a "
+        "real floor plan and still be skipped: an overall plan at 1/16\" "
+        "redraws doors the partial plans already show at 1/8\", so scanning it "
+        "again finds nothing new. Without this a deliberate skip and a genuine "
+        "miss both read as zero doors found.",
+    )
+    is_enlargement: bool = Field(
+        False,
+        description="Does this sheet blow up one part of the building rather "
+        "than draw the whole floor? Enlargements and reduced-scale keys are "
+        "worth showing -- they are how a person finds one door on a plan too "
+        "big to read -- but they are not where the count comes from.",
+    )
 
 
 class DoorSwing(BaseModel):

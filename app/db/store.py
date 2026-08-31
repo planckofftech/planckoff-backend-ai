@@ -376,6 +376,7 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
         made = _insert("sheets", [
             {"document_id": document_id, "page": s.page, "number": s.number,
              "title": s.title, "level": s.level, "leads": s.leads,
+             "scanned": s.scanned, "is_enlargement": s.is_enlargement,
              "width_pt": s.width, "height_pt": s.height}
             for s in audit.floor_plans
         ])
