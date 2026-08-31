@@ -1065,10 +1065,17 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         duration_ms=duration,
         schedule_page=best_page,
         floor_plans=[
+            # `scanned` says whether any door number was actually found here.
+            # A sheet can be a genuine floor plan and still yield nothing: an
+            # overall plan at 1/16" redraws doors the partial plans already
+            # carry at 1/8". Without this, a deliberate skip and a real miss
+            # both reach the caller as a bare zero.
             SheetRef(page=s.page, number=s.number, title=s.title,
                      width=sizes.get(s.page, (0.0, 0.0))[0],
                      height=sizes.get(s.page, (0.0, 0.0))[1],
-                     level=s.level, leads=s.page in lead_pages)
+                     level=s.level, leads=s.page in lead_pages,
+                     scanned=bool(tags_on.get(s.page)),
+                     is_enlargement=s.is_enlargement)
             for s in plans
         ],
         door_count=len(tags),

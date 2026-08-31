@@ -44,7 +44,27 @@ SHEET_NUMBER = re.compile(r"^[A-Z]{1,3}[-.]?\d{1,3}(?:[.\-]\d{1,3})?[A-Za-z]?$")
 _TITLE_SPANS = 12
 # The architectural discipline. Doors are drawn and scheduled here; other
 # disciplines reference them but do not define them.
-_ARCHITECTURAL = "A"
+# Sheet-number prefixes whose drawings we treat as the architect's own.
+#
+# An allowlist, and deliberately. The alternative -- excluding the engineering
+# disciplines -- fails open: a sheet whose number could not be read has an empty
+# prefix, matches no exclusion, and is scanned. Measured on the BMK VE set that
+# admits four sheets with no readable number, two of them title-block debris
+# ("DATE:12.30.25 DRAWN BY: CHECKED BY:"). An allowlist fails closed instead:
+# an unknown prefix is skipped, and the price is a list to extend.
+#
+# CR is why this exists at all. A clean-room package numbers its sheets CR1.00,
+# and reading only the first letter called that Civil and threw away four floor
+# plans -- with them, nineteen doors that were printed nowhere else.
+_ARCHITECTURAL = frozenset({
+    "A",     # the architectural set
+    "AD",    # addendum / demolition, depending on the firm
+    "AS",    # architectural site
+    "AI",    # architectural interiors
+    "ID",    # interior design
+    "IN",    # interiors
+    "CR",    # clean room -- its own package, with its own doors
+})
 # A sheet that draws doors in plan view says so in its own title.
 _PLAN_WORDS = ("FLOOR PLAN", "ROOF PLAN", "SITE PLAN", "LEVEL", "PLAN")
 # A plan of some other surface, or of another discipline's work. Never a floor
@@ -155,11 +175,18 @@ class PlanSheet:
 
     @property
     def discipline(self) -> str:
-        return self.number[:1] if self.number else ""
+        """The letters before the first digit: 'A3.10' -> 'A', 'CR1.00' -> 'CR'.
+
+        The whole prefix, not the first character. One character reads CR as C
+        and calls a clean-room package civil; it does the same to ID, FP, FA
+        and EQ, turning them into I, F, F and E.
+        """
+        found = re.match(r"[A-Z]+", (self.number or "").upper())
+        return found.group(0) if found else ""
 
     @property
     def is_architectural(self) -> bool:
-        return self.discipline == _ARCHITECTURAL
+        return self.discipline in _ARCHITECTURAL
 
     @property
     def level(self) -> str:
