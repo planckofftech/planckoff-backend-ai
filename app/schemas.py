@@ -148,9 +148,11 @@ class SheetRef(BaseModel):
     )
     leads: bool = Field(
         False,
-        description="Is this the sheet to open for its level? One per storey: "
-        "the whole floor at working scale, not the reduced-scale index that "
-        "redraws every floor small, and not an enlargement of one corner.",
+        description="Deprecated -- identical to `scanned`, kept so existing "
+        "callers keep working. It used to name one 'lead' sheet per storey, "
+        "elected by comparing each sheet against its own size; two sheets "
+        "contributing the same eight doors could get opposite answers. Read "
+        "`scanned` instead.",
     )
     scanned: bool = Field(
         False,

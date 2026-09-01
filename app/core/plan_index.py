@@ -232,9 +232,22 @@ class PlanSheet:
 
     @property
     def is_enlargement(self) -> bool:
-        """Is this a piece of the floor drawn large, rather than the floor?"""
+        """A room drawn large, rather than an area of the building.
+
+        The word ENLARGED does not settle it. "ENLARGED FLOOR PLAN PART 'A'"
+        is a floor plan -- an area with rooms and corridors, carrying 51 doors
+        and its own key plan -- while "ENLARGED RESTROOM PLAN" beside it is one
+        room blown up to show fixtures. Both say ENLARGED; only one is where a
+        door gets counted.
+
+        What separates them is whether the title still claims to be the floor
+        plan. Where it does, the sheet draws part of the building, however the
+        architect scaled it.
+        """
         title = self.title.upper()
-        return any(word in title for word in _ENLARGED)
+        if not any(word in title for word in _ENLARGED):
+            return False
+        return "FLOOR PLAN" not in title
 
     @property
     def is_floor_plan(self) -> bool:
