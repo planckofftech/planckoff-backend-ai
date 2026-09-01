@@ -93,77 +93,14 @@ class NoDoorScheduleError(RuntimeError):
         )
 
 
-def _plan_per_level(plans, tags_on: dict[int, set[str]]):
-    """The one sheet to lead with for each storey of the building.
-
-    A reader asking for "the floor plan" means one thing per floor. A set gives
-    them five sheets for a three-storey building: the two real floor plans, an
-    OVERALL index that redraws both of them small, and the basement drawn twice
-    over. Listing all five as peers is what made this view unreadable.
-
-    So, per storey named in the titles:
-
-      1. a plan of the whole floor beats an enlargement of part of it, because
-         a corner of a building without its context cannot be checked
-      2. then whichever carries the most of that floor's doors
-      3. then the earlier sheet, so the choice does not move between runs
-
-    Then the storeys are set against each other and any sheet whose doors are
-    already covered elsewhere is dropped -- that is what removes a multi-floor
-    OVERALL index, whose doors all belong to the per-floor sheets by definition.
-
-    Returns the leading sheets and, separately, every other floor plan. The
-    others are not discarded: doors are still measured on them, because an
-    enlargement is usually where a swing can actually be read.
-    """
-    counted = [s for s in plans if tags_on.get(s.page)]
-    if not counted:
-        return [], list(plans)
-
-    by_level: dict[str, list] = {}
-    for sheet in counted:
-        by_level.setdefault(sheet.level, []).append(sheet)
-
-    leads = []
-    for _level, sheets in by_level.items():
-        sheets.sort(key=lambda s: (s.is_enlargement, -len(tags_on[s.page]),
-                                   s.page))
-        leads.append(sheets[0])
-        # A storey is not always drawn on one sheet, and where a set names no
-        # storey at all every sheet lands in one group. One project draws its
-        # offices on one sheet and its warehouse across two more, all titled
-        # without a level -- taking only the first would have hidden the
-        # warehouse. So a second sheet in the same group leads too when its
-        # doors are mostly its own: that is a different part of the building,
-        # not another drawing of this one.
-        held = set(tags_on[sheets[0].page])
-        for sheet in sheets[1:]:
-            tags = tags_on[sheet.page]
-            if len(tags - held) < len(tags) * _NEW_BUILDING_SHARE:
-                continue
-            leads.append(sheet)
-            held |= tags
-
-    # A sheet whose doors are all somebody else's is an index of the others, not
-    # a floor in its own right. Biggest first, so the real plans are chosen
-    # before the reduced-scale copy gets a chance to represent them.
-    leads.sort(key=lambda s: (-len(tags_on[s.page]), s.page))
-    chosen, covered = [], set()
-    for sheet in leads:
-        tags = tags_on[sheet.page]
-        if len(tags - covered) < len(tags) * _NEW_BUILDING_SHARE:
-            continue
-        chosen.append(sheet)
-        covered |= tags
-
-    chosen.sort(key=lambda s: s.page)
-    lead_pages = {s.page for s in chosen}
-    log.info("plan_audit leads with %s, one per level of %s",
-             [f"{s.number} ({s.level or 'the building'})" for s in chosen],
-             sorted({s.level for s in counted}))
-    return chosen, [s for s in plans if s.page not in lead_pages]
-
-
+# `_plan_per_level` used to elect one "lead" sheet per storey by greedy set
+# cover, and it was removed. It measured each sheet against its own size, so
+# two sheets contributing the same eight doors got opposite answers -- BMK's
+# A3.11 was taken and A3.12 rejected on nothing but A3.12 being the larger
+# drawing. It also denied CR1.01, carrying 51 doors, by a margin of 1.5.
+#
+# A reader opening a set wants to know which tabs have doors on them. That is
+# `scanned`, it needs no election, and it cannot be wrong.
 def _sheets_worth_scanning(plans, tags_on: dict[int, set[str]]):
     """The sheets that are each a different part of the building.
 
@@ -1052,8 +989,6 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         for sighting in sightings:
             for c in sighting.candidates:
                 tags_on.setdefault(c.page, set()).add(sighting.tag)
-        leads, _rest = _plan_per_level(plans, tags_on)
-        lead_pages = {s.page for s in leads}
 
     duration = int((time.perf_counter() - started) * 1000)
     log.info("plan_audit pages=%s doors=%s located=%s detected=%s ms=%s",
@@ -1073,7 +1008,7 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             SheetRef(page=s.page, number=s.number, title=s.title,
                      width=sizes.get(s.page, (0.0, 0.0))[0],
                      height=sizes.get(s.page, (0.0, 0.0))[1],
-                     level=s.level, leads=s.page in lead_pages,
+                     level=s.level, leads=bool(tags_on.get(s.page)),
                      scanned=bool(tags_on.get(s.page)),
                      is_enlargement=s.is_enlargement)
             for s in plans
