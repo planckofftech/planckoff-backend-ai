@@ -425,6 +425,27 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
                                if door.other_leaf else None),
             })
         _insert("detections", rows)
+
+        # The wall type belongs to the door, not to one sheet's sighting of it,
+        # so it is written onto `doors` from whichever sighting is primary.
+        # That is also what puts it within reach of `corrections`: keyed on the
+        # door number, applied by `doors_current`, surviving every re-read.
+        walls = {
+            door.tag: {
+                "wall_type": door.wall_type or None,
+                "wall_type_options": door.wall_type_options or None,
+                "wall_type_source": door.wall_type_source or None,
+            }
+            for door in audit.detected
+            if door.tag and door.primary
+            and (door.wall_type or door.wall_type_options)
+        }
+        for tag, values in walls.items():
+            db.table("doors").update(values).eq(
+                "document_id", document_id).eq("door_tag", tag).execute()
+        if walls:
+            log.info("db: wall type recorded for %d door(s)", len(walls))
+
         if suppressed:
             log.info("db: %d detection(s) left out -- removed by hand earlier",
                      suppressed)
