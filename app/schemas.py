@@ -248,6 +248,24 @@ class DetectedDoorOut(BaseModel):
         description="What the schedule says about this door, so a detail panel "
         "needs no second request. Empty when no schedule door matched.",
     )
+    wall_type: str = Field(
+        "",
+        description="The wall this door sits in, as the drawing's own tag "
+        "names it -- '2C', 'A3', '1'. Empty when the drawing did not settle "
+        "it; see `wall_type_options`.",
+    )
+    wall_type_options: list[str] = Field(
+        default_factory=list,
+        description="The shortlist when two tags sit at much the same distance "
+        "and the drawing does not say which governs this door. A person picks. "
+        "Never more than three.",
+    )
+    wall_type_source: str = Field(
+        "",
+        description="'tag' when read off the plan's own tags, 'ai' when the "
+        "legend's layout defeated the deterministic reader and the vision tier "
+        "read it instead.",
+    )
     source: str = Field(
         "model",
         description="'geometry' when the box is the measured extent of the "

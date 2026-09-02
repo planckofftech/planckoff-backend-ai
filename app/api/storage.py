@@ -74,6 +74,9 @@ CorrectableField = Literal[
     "door_width", "door_height", "door_type", "door_material", "door_finish",
     "frame_material", "frame_finish",
     "threshold", "fire_rating", "hw_set", "comments",
+    # Read off the plan's wall tags rather than the schedule, and wrong often
+    # enough that correcting it is part of the workflow, not an exception.
+    "wall_type",
 ]
 
 

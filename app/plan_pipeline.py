@@ -877,6 +877,55 @@ def _overlaps(a: DoorLocation, b: DoorLocation) -> bool:
             and a.y0 < b.y1 and b.y0 < a.y1)
 
 
+
+def _name_walls(doc, plans, detected) -> None:
+    """Tag each detected door with the wall type it sits in, in place.
+
+    Best effort throughout. A set with no readable legend keeps its doors and
+    loses only this, which is how it behaved before wall types existed.
+    """
+    from app.core import plan_index, wall_tags
+
+    try:
+        sheets = plan_index.index_sheets(doc)
+        arch = [(s.page, s.title) for s in sheets if s.is_architectural]
+        types = wall_tags.legend_symbols(doc, arch)
+        vocabulary = {t.symbol for t in types}
+        if not vocabulary:
+            log.info("plan_audit: no wall legend read; wall types skipped")
+            return
+
+        pages = {d.location.page for d in detected}
+        tags = {page: wall_tags.tags_on(doc, page, vocabulary) for page in pages}
+        named = 0
+        for door in detected:
+            found = tags.get(door.location.page) or []
+            if not found:
+                continue
+            arc = door.arc
+            if arc is not None and arc.radius:
+                x, y, door_pt = arc.hinge_x, arc.hinge_y, arc.radius
+            else:
+                width, height = doc.page_size(door.location.page - 1)
+                box = door.location
+                x = (box.x0 + box.x1) / 2 * width
+                y = (box.y0 + box.y1) / 2 * height
+                door_pt = max(abs(box.x1 - box.x0) * width,
+                              abs(box.y1 - box.y0) * height) or _BASE_DOOR_PT
+            choice = wall_tags.choose(found, x, y, door_pt)
+            if choice.decided:
+                door.wall_type = choice.symbol
+                door.wall_type_source = "tag"
+                named += 1
+            elif choice.candidates:
+                door.wall_type_options = choice.candidates
+                door.wall_type_source = "tag"
+        log.info("plan_audit: wall type decided for %d of %d door(s) from %d "
+                 "type(s) in the legend", named, len(detected), len(vocabulary))
+    except Exception as exc:  # noqa: BLE001 - a takeoff must not fail for this
+        log.warning("plan_audit: wall types skipped (%s)", exc)
+
+
 async def audit(source: bytes | str | Path, *, detect: bool = False,
                 dry_run: bool = False,
                 budget_usd: float | None = None,
@@ -989,6 +1038,12 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         for sighting in sightings:
             for c in sighting.candidates:
                 tags_on.setdefault(c.page, set()).add(sighting.tag)
+
+        # Which wall each door sits in, read off the drawing's own tags. The
+        # wall itself is never identified: the legend says which symbols this
+        # set uses, those symbols are found on the plans inside whatever shape
+        # the set draws them in, and the nearest one governs the door.
+        _name_walls(doc, plans, detected)
 
     duration = int((time.perf_counter() - started) * 1000)
     log.info("plan_audit pages=%s doors=%s located=%s detected=%s ms=%s",
