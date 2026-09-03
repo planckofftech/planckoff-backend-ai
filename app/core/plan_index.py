@@ -63,6 +63,11 @@ _ARCHITECTURAL = frozenset({
     "AI",    # architectural interiors
     "ID",    # interior design
     "IN",    # interiors
+    "I",     # interiors again, single letter. A tenant improvement is often
+             # drawn entirely by an interiors team: St. Louis PPG numbers all
+             # 66 of its sheets I0-.. to I7-.., including "FLOOR PLAN - LEVEL 1"
+             # and "- LEVEL 2", and without this every one of them was rejected
+             # before its title was read.
     "CR",    # clean room -- its own package, with its own doors
 })
 # A sheet that draws doors in plan view says so in its own title.
