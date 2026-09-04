@@ -78,9 +78,21 @@ _OFF_GLYPH = 0.45
 # drawing is not telling us which -- so the caller is given both.
 _DECISIVE = 1.6
 # How far a tag may be from a door and still be a candidate, in door-widths.
-# Generous: on sparsely tagged sheets the governing tag sits at the start of
-# the wall run, and BMK's A3.10 averages seven door-widths.
-_REACH = 10.0
+#
+# Generous, because a tag governs a run of wall rather than one opening: it is
+# printed once where the wall starts, and every door along that wall is further
+# from it than the last.
+#
+# Ten was too tight. Measured on St. Louis PPG -- 55 tags found on one sheet,
+# none rejected, and the median door's nearest tag sitting at 10.4 -- so more
+# than half the doors lost a tag that was plainly beside them, by a tenth of a
+# door. That set draws its doors 9 points long, so ten door-widths reached only
+# 90 points of a 3024-point sheet.
+#
+# Raising this cannot invent a wrong answer on its own: where two tags are
+# comparably close the pair is offered for a person to choose between, so the
+# extra reach turns "nothing found" into either an answer or a question.
+_REACH = 20.0
 # Most candidates ever returned for one door. Past three, a picker stops being
 # a decision and becomes a research task.
 _MAX_CANDIDATES = 3
