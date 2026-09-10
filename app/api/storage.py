@@ -567,11 +567,22 @@ class NewDetection(BaseModel):
 
 
 class MoveDetection(BaseModel):
-    x0: float = Field(ge=0, le=1)
-    y0: float = Field(ge=0, le=1)
-    x1: float = Field(ge=0, le=1)
-    y1: float = Field(ge=0, le=1)
-    kind: str | None = None
+    """A change to one box. Every field optional, and at least one required.
+
+    The position and the classification are corrected for different reasons and
+    usually not together: a box on a door's printed number is in the wrong
+    place but rightly called a swing, while a slider the reader read as
+    "unknown" is in exactly the right place and wrongly named. Requiring the
+    coordinates in order to fix the type made the second correction impossible
+    without restating the first."""
+
+    x0: float | None = Field(None, ge=0, le=1)
+    y0: float | None = Field(None, ge=0, le=1)
+    x1: float | None = Field(None, ge=0, le=1)
+    y1: float | None = Field(None, ge=0, le=1)
+    kind: str | None = Field(
+        None, description="single_swing, double_swing, sliding, pocket, "
+                          "opening_no_door")
     swing: str | None = None
     note: str | None = None
 
@@ -643,23 +654,66 @@ async def place_detection(document_id: str, body: NewDetection,
 
 @router.patch("/detections/{detection_id}")
 async def move_detection(detection_id: str, body: MoveDetection,
-                         _key: str = Depends(require_api_key)):
-    """Move or resize a box a person placed.
+                         caller: Caller = Depends(require_caller)):
+    """Move or resize a box, whoever put it there.
 
-    Only manual boxes. A measured one is the extent of an arc on the drawing,
-    so dragging it would make it a claim about the plan that the plan does not
-    support -- delete it and place your own instead.
+    A box the reader placed from a door's number is a guess: the number is
+    printed beside an opening, not on it, so the box lands near the door rather
+    than over it. Correcting that is ordinary work, and it used to take two
+    calls -- delete the wrong one, place a right one -- with the user expected
+    to know that a derived box cannot be moved.
+
+    So patching a derived box converts it: a hand-placed box is recorded at the
+    new position, the original is remembered as removed so the next audit does
+    not put it back, and the derived row goes. One call, and the correction
+    survives every re-read.
+
+    A measured box can be moved too. The arc it came from stays on the drawing
+    and is not edited -- what moves is our claim about where the door is, which
+    is the thing a person is entitled to overrule.
     """
     db = _db()
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not patch:
+        raise HTTPException(status_code=422, detail="Nothing to change.")
+
     done = (db.table("manual_detections").update(patch)
             .eq("id", detection_id).execute())
-    if not done.data:
-        raise HTTPException(
-            status_code=404,
-            detail="No hand-placed box with that id. Measured detections "
-                   "cannot be moved -- remove it and place your own.")
-    return {**done.data[0], "source": "manual"}
+    if done.data:
+        return {**done.data[0], "source": "manual", "converted": False}
+
+    # Not a hand-placed box, so it is one we derived. Replace it.
+    found = (db.table("detections").select("*")
+             .eq("id", detection_id).execute())
+    if not found.data:
+        raise HTTPException(status_code=404, detail="No such detection.")
+    det = found.data[0]
+
+    sheet = (db.table("sheets").select("page")
+             .eq("id", det["sheet_id"]).execute())
+    page = sheet.data[0]["page"] if sheet.data else 0
+
+    db.table("detection_tombstones").insert({
+        "org_id": det["org_id"], "document_id": det["document_id"],
+        "page": page, "door_tag": det.get("door_tag"),
+        "x0": det["x0"], "y0": det["y0"], "x1": det["x1"], "y1": det["y1"],
+        "reason": "moved by hand", "created_by": caller.user_id,
+    }).execute()
+
+    made = db.table("manual_detections").insert({
+        "org_id": det["org_id"], "document_id": det["document_id"],
+        "page": page, "door_tag": det.get("door_tag"),
+        "x0": patch.get("x0", det["x0"]), "y0": patch.get("y0", det["y0"]),
+        "x1": patch.get("x1", det["x1"]), "y1": patch.get("y1", det["y1"]),
+        "kind": patch.get("kind", det.get("kind")),
+        "swing": patch.get("swing", det.get("swing")),
+        "note": patch.get("note"), "created_by": caller.user_id,
+    }).execute()
+    db.table("detections").delete().eq("id", detection_id).execute()
+
+    log.info("db: detection %s moved by hand and recorded as replaced",
+             detection_id)
+    return {**made.data[0], "source": "manual", "converted": True}
 
 
 @router.delete("/detections/{detection_id}")
