@@ -566,6 +566,16 @@ class NewDetection(BaseModel):
     note: str | None = None
 
 
+# What a person may call a door, as a closed list.
+#
+# `opening_no_door` is deliberately absent. A cased opening with nothing hung
+# in it is not a door somebody reclassifies -- it is a box they delete, and
+# deleting already records the removal so the next audit does not restore it.
+# Our own detector still reports it; this governs only what a person may set.
+DoorKind = Literal["single_swing", "double_swing", "sliding", "pocket"]
+DoorSwing = Literal["left", "right"]
+
+
 class MoveDetection(BaseModel):
     """A change to one box. Every field optional, and at least one required.
 
@@ -580,10 +590,8 @@ class MoveDetection(BaseModel):
     y0: float | None = Field(None, ge=0, le=1)
     x1: float | None = Field(None, ge=0, le=1)
     y1: float | None = Field(None, ge=0, le=1)
-    kind: str | None = Field(
-        None, description="single_swing, double_swing, sliding, pocket, "
-                          "opening_no_door")
-    swing: str | None = None
+    kind: DoorKind | None = None
+    swing: DoorSwing | None = None
     note: str | None = None
 
 
@@ -700,20 +708,42 @@ async def move_detection(detection_id: str, body: MoveDetection,
         "reason": "moved by hand", "created_by": caller.user_id,
     }).execute()
 
-    made = db.table("manual_detections").insert({
-        "org_id": det["org_id"], "document_id": det["document_id"],
-        "page": page, "door_tag": det.get("door_tag"),
+    box = {
         "x0": patch.get("x0", det["x0"]), "y0": patch.get("y0", det["y0"]),
         "x1": patch.get("x1", det["x1"]), "y1": patch.get("y1", det["y1"]),
+    }
+    row = {
+        "org_id": det["org_id"], "document_id": det["document_id"],
+        "page": page, "door_tag": det.get("door_tag"), **box,
         "kind": patch.get("kind", det.get("kind")),
         "swing": patch.get("swing", det.get("swing")),
         "note": patch.get("note"), "created_by": caller.user_id,
-    }).execute()
+    }
+    if det.get("radius"):
+        # The swing moves with its box. Dragging says the position is wrong,
+        # not the measurement -- so the radius and the angles are untouched and
+        # only the hinge shifts, by exactly as far as the box did.
+        #
+        # The shift is computed in page points, because the box is stored as
+        # fractions of the page and the hinge is not.
+        sizes = (db.table("sheets").select("width_pt,height_pt")
+                 .eq("document_id", det["document_id"]).eq("page", page)
+                 .execute())
+        width = (sizes.data[0].get("width_pt") if sizes.data else None) or 0.0
+        height = (sizes.data[0].get("height_pt") if sizes.data else None) or 0.0
+        row.update({
+            "hinge_x": det["hinge_x"] + (box["x0"] - det["x0"]) * width,
+            "hinge_y": det["hinge_y"] + (box["y0"] - det["y0"]) * height,
+            "radius": det["radius"], "start_deg": det.get("start_deg"),
+            "end_deg": det.get("end_deg"), "from_measured": True,
+        })
+    made = db.table("manual_detections").insert(row).execute()
     db.table("detections").delete().eq("id", detection_id).execute()
 
     log.info("db: detection %s moved by hand and recorded as replaced",
              detection_id)
-    return {**made.data[0], "source": "manual", "converted": True}
+    return {**made.data[0], "source": "manual", "converted": True,
+            "arc_kept": bool(det.get("radius"))}
 
 
 @router.delete("/detections/{detection_id}")
