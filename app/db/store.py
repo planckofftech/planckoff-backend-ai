@@ -243,6 +243,16 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
 
         db = client()
         # Replace, never add. See the note at the top of this file.
+        # Doors somebody found on the drawing outlive the schedule being read
+        # again. They are not in it -- that is the whole point of them -- so a
+        # plain wipe deletes them and nothing brings them back, leaving a
+        # hand-placed box pointing at a door number with no door behind it.
+        #
+        # Same rule as corrections and manual detections: derived data is
+        # rebuilt, what a person put there is not.
+        kept = (db.table("doors").select("*")
+                .eq("document_id", document_id).eq("source", "plan")
+                .execute().data or [])
         db.table("doors").delete().eq("document_id", document_id).execute()
         db.table("schedules").delete().eq("document_id", document_id).execute()
 
@@ -275,6 +285,22 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
                 "row_index": index, **values, "extra": door.extra,
             })
         _insert("doors", rows)
+
+        # Put back the ones a person found, unless the schedule now carries
+        # that number itself -- a door that has since been scheduled belongs to
+        # the schedule, and keeping both would price it twice.
+        scheduled = {r.get("door_tag") for r in rows if r.get("door_tag")}
+        restored = [
+            {k: v for k, v in door.items() if k not in ("id", "schedule_id")}
+            for door in kept if door.get("door_tag") not in scheduled
+        ]
+        if restored:
+            for door, index in zip(restored, range(len(rows),
+                                                   len(rows) + len(restored))):
+                door["row_index"] = index
+            _insert("doors", restored)
+            log.info("db: kept %d door(s) found on the drawing rather than in "
+                     "the schedule", len(restored))
 
         if repeated:
             log.warning("db: %d door number(s) appear twice and were stored "
