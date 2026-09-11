@@ -32,6 +32,7 @@ from app.config import get_settings
 from app.api.offload import in_worker
 from app.core.pdf_doc import NotAPdfError
 from app.db import files, store
+from app.db.store import _insert as _insert_rows
 from app.db.client import NoDatabase, client
 from app.pipeline import NoRowsError, NoScheduleFoundError, extract
 from app.plan_pipeline import audit
@@ -590,6 +591,13 @@ class MoveDetection(BaseModel):
     y0: float | None = Field(None, ge=0, le=1)
     x1: float | None = Field(None, ge=0, le=1)
     y1: float | None = Field(None, ge=0, le=1)
+    door_tag: str | None = Field(
+        None,
+        description="Name a box after drawing it. The natural order for "
+        "marking up a plan is to draw the opening and then read its number "
+        "off the drawing, so this has to be settable afterwards and not only "
+        "at creation. A number the schedule does not carry creates its door "
+        "row, exactly as placing a tagged box does.")
     kind: DoorKind | None = None
     swing: DoorSwing | None = None
     note: str | None = None
@@ -608,6 +616,32 @@ def _page_of(db, document_id: str, sheet_id: str) -> int:
         raise HTTPException(status_code=404,
                             detail="That sheet is not in this document.")
     return found.data[0]["page"]
+
+
+def _ensure_door(db, org_id: str, document_id: str, tag: str | None) -> bool:
+    """A door row for this number, if the schedule has none. True if created.
+
+    An opening drawn but never scheduled is the most useful thing a takeoff
+    surfaces, so naming a box after the fact has to create its door just as
+    placing a named one does -- otherwise the same action gives a different
+    result depending on the order the user did it in.
+    """
+    if not tag:
+        return False
+    known = (db.table("doors").select("id")
+             .eq("document_id", document_id).eq("door_tag", tag).execute())
+    if known.data:
+        return False
+    last = (db.table("doors").select("row_index")
+            .eq("document_id", document_id)
+            .order("row_index", desc=True).limit(1).execute())
+    db.table("doors").insert({
+        "org_id": org_id, "document_id": document_id, "door_tag": tag,
+        "source": "plan", "extra": {},
+        "row_index": (last.data[0]["row_index"] + 1) if last.data else 0,
+    }).execute()
+    log.info("db: door %s created from a box named by hand", tag)
+    return True
 
 
 @router.post("/documents/{document_id}/detections",
@@ -685,10 +719,16 @@ async def move_detection(detection_id: str, body: MoveDetection,
     if not patch:
         raise HTTPException(status_code=422, detail="Nothing to change.")
 
-    done = (db.table("manual_detections").update(patch)
+    mine = (db.table("manual_detections").select("*")
             .eq("id", detection_id).execute())
-    if done.data:
-        return {**done.data[0], "source": "manual", "converted": False}
+    if mine.data:
+        if patch.get("door_tag"):
+            _ensure_door(db, mine.data[0]["org_id"],
+                         mine.data[0]["document_id"], patch["door_tag"])
+        done = (db.table("manual_detections").update(patch)
+                .eq("id", detection_id).execute())
+        return {**done.data[0], "source": "manual", "converted": False,
+                "arc_kept": bool(done.data[0].get("radius"))}
 
     # Not a hand-placed box, so it is one we derived. Replace it.
     found = (db.table("detections").select("*")
@@ -714,7 +754,8 @@ async def move_detection(detection_id: str, body: MoveDetection,
     }
     row = {
         "org_id": det["org_id"], "document_id": det["document_id"],
-        "page": page, "door_tag": det.get("door_tag"), **box,
+        "page": page,
+        "door_tag": patch.get("door_tag", det.get("door_tag")), **box,
         "kind": patch.get("kind", det.get("kind")),
         "swing": patch.get("swing", det.get("swing")),
         "note": patch.get("note"), "created_by": caller.user_id,
@@ -737,6 +778,7 @@ async def move_detection(detection_id: str, body: MoveDetection,
             "radius": det["radius"], "start_deg": det.get("start_deg"),
             "end_deg": det.get("end_deg"), "from_measured": True,
         })
+    _ensure_door(db, det["org_id"], det["document_id"], row.get("door_tag"))
     made = db.table("manual_detections").insert(row).execute()
     db.table("detections").delete().eq("id", detection_id).execute()
 
@@ -860,6 +902,63 @@ async def correct(document_id: str, body: Correction,
     log.info("db: %s on door %s changed to %r",
              body.field, body.door_tag, body.value)
     return made.data[0]
+
+
+class BulkCorrection(BaseModel):
+    """One value, applied to many doors at once.
+
+    A building has one standard partition and a handful of variants, so the
+    common edit is "these fifty doors are all wall type 2C". Sent one at a time
+    that is fifty requests, fifty round trips, and a half-applied change if the
+    connection drops in the middle.
+    """
+
+    field: CorrectableField
+    value: str
+    door_tags: list[str] = Field(
+        min_length=1, max_length=500,
+        description="Which doors. Numbers not in this document are reported "
+        "back rather than silently ignored -- a typo in a pasted list should "
+        "be visible, not absorbed.")
+    note: str | None = None
+
+
+@router.post("/documents/{document_id}/corrections/bulk",
+             status_code=status.HTTP_201_CREATED)
+async def correct_many(document_id: str, body: BulkCorrection,
+                       caller: Caller = Depends(require_caller)):
+    """Apply one correction to many doors in a single call.
+
+    Same record as correcting them one by one: the extracted value is kept
+    beside the new one, the edit is keyed on the door number, and it survives
+    every re-read. This only spares the caller the round trips.
+    """
+    db = _db()
+    found = db.table("documents").select("org_id").eq(
+        "id", document_id).execute()
+    if not found.data:
+        raise HTTPException(status_code=404, detail="No such document.")
+    org_id = found.data[0]["org_id"]
+
+    wanted = list(dict.fromkeys(t for t in body.door_tags if t.strip()))
+    known = (db.table("doors").select(f"door_tag,{body.field}")
+             .eq("document_id", document_id).execute())
+    was = {r["door_tag"]: r.get(body.field) for r in known.data
+           if r.get("door_tag")}
+
+    rows = [{
+        "org_id": org_id, "document_id": document_id, "door_tag": tag,
+        "field": body.field, "was": was.get(tag), "now": body.value,
+        "note": body.note, "created_by": caller.user_id,
+    } for tag in wanted if tag in was]
+    missing = [tag for tag in wanted if tag not in was]
+
+    if rows:
+        _insert_rows("corrections", rows)
+    log.info("db: %s set to %r on %d door(s)%s", body.field, body.value,
+             len(rows), f", {len(missing)} unknown" if missing else "")
+    return {"applied": len(rows), "field": body.field, "value": body.value,
+            "not_in_document": missing}
 
 
 @router.get("/documents/{document_id}/history")
