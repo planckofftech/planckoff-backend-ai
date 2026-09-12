@@ -480,6 +480,76 @@ def _stored_rows(db, document_id: str) -> list[DoorRow]:
     return rows
 
 
+@router.post("/documents/{document_id}/reread",
+             status_code=status.HTTP_201_CREATED)
+async def reread_document(
+    document_id: str,
+    plans: bool = Query(True, description="Also locate the doors on the plans"),
+    allow_ai: bool = Query(True, description="Permit the vision fallback tier"),
+    _key: str = Depends(require_api_key),
+):
+    """Read a stored set again, from the file we already hold.
+
+    `from-storage` needs the key the browser uploaded under, which a caller has
+    to keep or reconstruct; a document knows its own key, so asking by document
+    is the shorter road and the only one available once the upload is weeks in
+    the past.
+
+    Everything a person put there survives: corrections keyed on the door
+    number, hand-placed boxes, removals, and doors found on the drawing rather
+    than in the schedule. What is rebuilt is what was read off the drawing.
+    """
+    found = store.stored_pdf(document_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="No such document.")
+    key = found.get("source_uri")
+    if not key:
+        raise HTTPException(
+            status_code=409,
+            detail="That set's file was not kept, so it cannot be read again. "
+                   "Only sets uploaded through /uploads can be.")
+    if not files.available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="No file store configured.")
+    return await _read_and_store(
+        project_id=found["project_id"], key=key,
+        filename=found.get("filename") or "set.pdf", revision=None,
+        source_uri=key, plans=plans, allow_ai=allow_ai)
+
+
+@router.get("/projects/{project_id}/export")
+async def export_project(project_id: str,
+                         _key: str = Depends(require_api_key)):
+    """Every door and detection in a job, in one call.
+
+    A nightly sweep otherwise pages projects, then documents, then each
+    document -- about a hundred requests for forty-odd projects, against a
+    service that serves one request per instance at a time.
+    """
+    db = _db()
+    docs = (db.table("documents").select("*")
+            .eq("project_id", project_id).eq("status", "active")
+            .order("created_at", desc=True).execute().data)
+    out = []
+    for doc in docs:
+        doors = (db.table("doors_current").select("*")
+                 .eq("document_id", doc["id"]).order("row_index")
+                 .execute().data)
+        sheets = (db.table("sheets").select("*")
+                  .eq("document_id", doc["id"]).order("page").execute().data)
+        dets = (db.table("detections").select("*")
+                .eq("document_id", doc["id"]).execute().data)
+        page_id = {s["page"]: s["id"] for s in sheets}
+        placed = [
+            {**row, "source": "manual", "is_primary": True,
+             "sheet_id": page_id.get(row["page"]), "also_on": []}
+            for row in store.manual_detections(doc["id"])
+        ]
+        out.append({"document": doc, "doors": doors, "sheets": sheets,
+                    "detections": dets + placed})
+    return {"project_id": project_id, "documents": out}
+
+
 @router.post("/documents/{document_id}/audit")
 async def audit_document(
     document_id: str,
@@ -618,6 +688,58 @@ def _page_of(db, document_id: str, sheet_id: str) -> int:
     return found.data[0]["page"]
 
 
+def _as_detection(db, row: dict, *, converted: bool) -> dict:
+    """A hand-placed box in the shape a read returns.
+
+    `manual_detections` keys on the page, because sheet ids are rebuilt by
+    every audit. A caller holds sheet ids, so the page is resolved back here --
+    and the full record is returned rather than the stored row, so a client
+    that replaces its copy rather than merging cannot lose the detection off
+    its sheet.
+    """
+    sheet = (db.table("sheets").select("id")
+             .eq("document_id", row["document_id"])
+             .eq("page", row["page"]).execute())
+    return {
+        **row,
+        "sheet_id": sheet.data[0]["id"] if sheet.data else None,
+        "source": "manual",
+        "is_primary": True,
+        "also_on": [],
+        "converted": converted,
+        "arc_kept": bool(row.get("radius")),
+    }
+
+
+def _drop_orphan_plan_door(db, document_id: str, tag: str | None) -> bool:
+    """Remove a door that exists only because somebody drew a box, once the
+    last box for it is gone. True if it was removed.
+
+    A door read from a schedule stays whatever happens on the plan -- the
+    schedule is the record and it still says the door exists. A door with
+    `source: 'plan'` has no such backing: it exists because a person marked an
+    opening, so when every mark for it is gone the door is too.
+
+    Without this a deleted box left a door in the schedule that appears on no
+    drawing, and nothing could clear it -- worse since plan doors began
+    surviving re-reads, which made the stranded row permanent.
+    """
+    if not tag:
+        return False
+    door = (db.table("doors").select("id,source")
+            .eq("document_id", document_id).eq("door_tag", tag).execute())
+    if not door.data or door.data[0].get("source") != "plan":
+        return False
+    for table in ("detections", "manual_detections"):
+        left = (db.table(table).select("id")
+                .eq("document_id", document_id).eq("door_tag", tag).execute())
+        if left.data:
+            return False
+    db.table("doors").delete().eq("id", door.data[0]["id"]).execute()
+    log.info("db: door %s removed -- its last box on the plan is gone", tag)
+    return True
+
+
 def _ensure_door(db, org_id: str, document_id: str, tag: str | None) -> bool:
     """A door row for this number, if the schedule has none. True if created.
 
@@ -727,8 +849,7 @@ async def move_detection(detection_id: str, body: MoveDetection,
                          mine.data[0]["document_id"], patch["door_tag"])
         done = (db.table("manual_detections").update(patch)
                 .eq("id", detection_id).execute())
-        return {**done.data[0], "source": "manual", "converted": False,
-                "arc_kept": bool(done.data[0].get("radius"))}
+        return _as_detection(db, done.data[0], converted=False)
 
     # Not a hand-placed box, so it is one we derived. Replace it.
     found = (db.table("detections").select("*")
@@ -784,8 +905,7 @@ async def move_detection(detection_id: str, body: MoveDetection,
 
     log.info("db: detection %s moved by hand and recorded as replaced",
              detection_id)
-    return {**made.data[0], "source": "manual", "converted": True,
-            "arc_kept": bool(det.get("radius"))}
+    return _as_detection(db, made.data[0], converted=True)
 
 
 @router.delete("/detections/{detection_id}")
@@ -804,8 +924,10 @@ async def remove_detection(detection_id: str,
             .eq("id", detection_id).execute())
     if mine.data:
         db.table("manual_detections").delete().eq("id", detection_id).execute()
+        gone = _drop_orphan_plan_door(db, mine.data[0]["document_id"],
+                                      mine.data[0].get("door_tag"))
         return {"detection_id": detection_id, "deleted": True,
-                "tombstoned": False}
+                "tombstoned": False, "door_deleted": gone}
 
     found = (db.table("detections").select("*")
              .eq("id", detection_id).execute())
@@ -824,9 +946,10 @@ async def remove_detection(detection_id: str,
         "created_by": caller.user_id,
     }).execute()
     db.table("detections").delete().eq("id", detection_id).execute()
+    gone = _drop_orphan_plan_door(db, det["document_id"], det.get("door_tag"))
     log.info("db: detection %s removed and recorded", detection_id)
     return {"detection_id": detection_id, "deleted": True,
-            "tombstoned": True}
+            "tombstoned": True, "door_deleted": gone}
 
 
 @router.delete("/documents/{document_id}/suppressions")
