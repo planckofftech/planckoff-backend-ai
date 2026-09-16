@@ -110,7 +110,7 @@ def stored_pdf(document_id: str) -> dict[str, Any] | None:
     """
     db = client()
     found = (db.table("documents")
-             .select("id,filename,project_id,source_uri")
+             .select("id,filename,project_id,source_uri,sha256,size_bytes")
              .eq("id", document_id).execute())
     return found.data[0] if found.data else None
 

@@ -1,6 +1,22 @@
 from functools import lru_cache
+from typing import Annotated
 
+from pydantic import AfterValidator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# A credential, with surrounding whitespace removed.
+#
+# A secret almost never arrives clean. Written with `echo`, pasted into a file,
+# or edited in nano, it carries a trailing newline -- and a newline cannot go
+# into an HTTP header, so the request is never built. There is then no status
+# code to report and the failure reads as "could not reach the provider at
+# all": the account is fine, the network is fine, and the message sends you
+# looking at both. One such newline in OPENROUTER_API_KEY cost an afternoon.
+#
+# Stripping is safe for all four of these: none of them has meaningful leading
+# or trailing whitespace, and a key that genuinely needed it could not be
+# transported through an environment variable anyway.
+Credential = Annotated[str, AfterValidator(str.strip)]
 
 
 class Settings(BaseSettings):
@@ -10,7 +26,7 @@ class Settings(BaseSettings):
     # than trusted -- see `main`. A default that happens to work is how an API
     # ships open: nothing fails, nothing warns, and the key protecting it is in
     # a public repository.
-    api_key: str = "dev-key"
+    api_key: Credential = "dev-key"
     # Set this in any deployment. It turns the placeholder from a convenience
     # into a refusal to start.
     require_real_api_key: bool = False
@@ -18,7 +34,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # AI fallback (Phase 4). Absent key => the AI tier is skipped, not an error.
-    openrouter_api_key: str = ""
+    openrouter_api_key: Credential = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     ai_model: str = "google/gemini-2.5-flash"
     # Detecting doors on a plan is a different job from transcribing a table,
@@ -49,7 +65,7 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     # The service key, not the anon key. This process is trusted and bypasses
     # row-level security; the anon key belongs in a browser, never here.
-    supabase_service_key: str = ""
+    supabase_service_key: Credential = ""
     # Stamped on every run_log row. Without it a comparison between two runs
     # says nothing, because you cannot tell what was different about them.
     app_version: str = "dev"
@@ -62,8 +78,8 @@ class Settings(BaseSettings):
     # upload finishes leaves the viewer with nothing to draw.
     r2_endpoint: str = ""
     r2_bucket: str = ""
-    r2_access_key: str = ""
-    r2_secret_key: str = ""
+    r2_access_key: Credential = ""
+    r2_secret_key: Credential = ""
     # How long a browser has to use an upload link before it expires.
     upload_url_ttl: int = 900
 
