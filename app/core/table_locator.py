@@ -319,8 +319,6 @@ def _ruled_grid(headers: list[TextItem], items: list[TextItem],
 
     left = max((x for x in crossing if x <= hdr_x0 + 2), default=None)
     right = min((x for x in crossing if x >= hdr_x1 - 2), default=None)
-    if left is None or right is None or right - left < 100:
-        return None
 
     # Prefer the edges the row rules agree on. They both *widen* the grid --
     # picking up columns whose heading spans the stacked header rows, which the
@@ -332,9 +330,33 @@ def _ruled_grid(headers: list[TextItem], items: list[TextItem],
     # the header crosses it, so it is not in `crossing` at all, and snapping
     # fell back to the next rule inward and dropped the REMARKS column.
     span = _row_rule_span(rulings.horizontal, tag_x, hdr_y1)
-    if (span is not None and span[0] <= tag_x < span[1]
-            and span[1] - span[0] >= 100 and span[0] <= hdr_x0 + _MAX_COL_GAP):
+    usable = (span is not None and span[0] <= tag_x < span[1]
+              and span[1] - span[0] >= 100)
+
+    # ...and where the header run has left the table altogether, the row rules
+    # are not merely preferred, they are all we have.
+    #
+    # A schedule is rarely alone on its sheet. Print a legend hard against its
+    # left edge -- DOOR & FRAME LEGENDS beside a door schedule, sharing the
+    # header's baseline -- and the run walks out of the table and into the
+    # legend, because the gap between the two blocks is no wider than a gap
+    # between two of the table's own columns. `hdr_x0` is then a legend cell,
+    # no column rule stands at or left of it, and a fully ruled twelve-column
+    # table was refused outright and guessed at instead: the legend arrived as
+    # two extra columns on the left, which shifted every heading one place off
+    # its data, so a door's width was reported as its height and its height as
+    # its material.
+    #
+    # The row rules cannot make that mistake. They stop at the table's border,
+    # a legend has none, so the span through the door-number column is the
+    # table and nothing but the table. Only ever consulted where the header run
+    # failed to produce an edge at all, so no sheet this already understood can
+    # be changed by it.
+    if usable and (left is None or right is None
+                   or span[0] <= hdr_x0 + _MAX_COL_GAP):
         left, right = span
+    if left is None or right is None or right - left < 100:
+        return None
 
     col_bounds = _dedupe(
         [left] + [x for x in crossing if left < x < right] + [right], _MERGE_TOL)
