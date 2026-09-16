@@ -278,6 +278,23 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
             if tag:
                 seen.add(tag)
             values = door.model_dump(exclude={"extra"})
+            # Null, not "". A row with no number printed on it is a row whose
+            # number we do not know -- and the difference decides whether a
+            # schedule can be stored at all. `doors` is unique on
+            # (document_id, door_tag); Postgres holds two empty strings equal
+            # and two nulls distinct, so a second untagged row was rejected and
+            # the whole save failed:
+            #
+            #   duplicate key value violates unique constraint
+            #   "doors_document_id_door_tag_key"
+            #   Key (document_id, door_tag)=(..., ) already exists.
+            #
+            # The caller then saw "Read the schedule but could not store it"
+            # after half a minute of work, and a schedule with two blank
+            # numbers in it -- a continuation row, a sub-heading -- could never
+            # be saved. `tag` above already worked this out; `model_dump` put
+            # the empty string back.
+            values["door_tag"] = tag
             rows.append({
                 "org_id": org_id, "document_id": document_id,
                 "schedule_id": schedule_id.get(
