@@ -42,7 +42,42 @@ _OTHER_SCHEDULES = ("WINDOW", "GLAZING", "GLASS", "ROOM FINISH", "FINISH SCHEDUL
                     # AIR DEVICE SCHEDULEs, 39 diffusers priced as doors.
                     "AIR DEVICE", "AIR TERMINAL", "DIFFUSER", "GRILLE",
                     "REGISTER", "MECHANICAL", "ELECTRICAL", "PANELBOARD",
-                    "LUMINAIRE", "FIXTURE", "VAV", "RTU", "FAN ", "PUMP")
+                    "LUMINAIRE", "FIXTURE", "VAV", "RTU", "FAN ", "PUMP",
+                    # The same schedules spelled out. "RTU" and "MECHANICAL"
+                    # matched nothing on a sheet captioned "DX ROOFTOP UNIT
+                    # SCHEDULE / DUCTLESS DX SPLIT SYSTEM", and 43 rooftop
+                    # units were returned as doors.
+                    "ROOFTOP", "SPLIT SYSTEM", "DUCTLESS", "CONDENSING",
+                    "AIR HANDL", "HEAT PUMP", "BOILER", "CHILLER",
+                    "WATER HEATER")
+
+# Column names no door schedule carries.
+#
+# A block that gets in on the low bar -- a tag column and two other fields --
+# is not allowed to clear it while naming a column from another trade. A pier
+# schedule heads its columns MARK / WIDTH / LENGTH / THICKNESS, which is
+# indistinguishable from a door's, and has no caption to convict it. FOOTING
+# REBAR convicts it.
+#
+# Whole words only: REBAR must not fire on a door schedule that happens to
+# print "REBAR" inside a note, and short entries like MCA would otherwise
+# match inside ordinary words.
+_FOREIGN_COLUMNS = frozenset({
+    "REBAR", "FOOTING", "FOOTINGS", "PIER", "PILE", "CAISSON", "STIRRUP",
+    "STIRRUPS", "CFM", "MBH", "TONNAGE", "TONS", "VOLTAGE", "VOLTS",
+    "MCA", "MOCP", "GPM", "BTU", "BTUH", "LUMENS", "BALLAST", "LAMP", "DUCT",
+    "NECK", "STATIC", "RPM", "KW", "AMPS",
+    # Not PHASE: a phased fit-out numbers its doors by construction phase, and
+    # a PHASE column on a door schedule is ordinary.
+})
+
+
+def _names_another_trade(headers: list[str]) -> bool:
+    """True when a column heading belongs to a schedule that is not doors."""
+    for text in headers:
+        if _FOREIGN_COLUMNS & set(header_mapper.normalize(text).split()):
+            return True
+    return False
 
 
 def _names_doors(rows: list[DoorRow]) -> bool:
@@ -84,9 +119,12 @@ def looks_like_a_schedule(mapped: list[str | None], headers: list[str],
     if len(fields) >= _MIN_MAPPED_FIELDS:
         return True
     # A genuine door tag is worth a lot: with one, fewer other fields will do.
-    # It has to be a genuine one, though -- see _names_doors.
+    # It has to be a genuine one, though -- see _names_doors. And the block
+    # must not be naming another trade's columns: this branch is the weak
+    # evidence, so foreign evidence outweighs it. Strong blocks -- four door
+    # fields or more -- have already returned above and are not second-guessed.
     return ("door_tag" in fields and len(fields) >= _MIN_FIELDS_WITH_TAG
-            and _names_doors(rows))
+            and _names_doors(rows) and not _names_another_trade(headers))
 
 
 def is_other_schedule(title: str) -> bool:

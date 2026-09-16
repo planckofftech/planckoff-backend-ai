@@ -93,6 +93,22 @@ _TEXT_CACHE_PAGES = 4
 #     BMK         0     2     2     2
 _BEZIER_STEPS = 4
 
+# Side of one cell in the per-page path index, in display points.
+#
+# Smaller cells reject more paths per query and cost more to hold, since a path
+# is listed in every cell it crosses. Measured on a 65,415-path floor plan, over
+# thirty 216 pt windows spread across the sheet:
+#
+#     cell        32     64    128    256    512
+#     build      0.39   0.44   0.38   0.43   0.48   seconds, once per page
+#     candidates  953   1096   1573   2204   4039   paths examined per query
+#     query       7.0    7.9   10.3   13.1   23.1   ms
+#
+# 64 rather than 32: they are within a millisecond of each other at this window
+# size, and 64 keeps the cell count down for the much wider windows the wall
+# tagger asks for. Before the index the same query took 298 ms.
+_GRID = 64.0
+
 
 def _is_horizontal(direction: tuple[float, float], matrix: "fitz.Matrix") -> bool:
     """Is this text line horizontal *as displayed*?
@@ -147,6 +163,7 @@ class PdfDoc:
         self._text_cache: dict[int, list[TextItem]] = {}
         self._drawing_page: int = -1
         self._drawing_cache: list | None = None
+        self._drawing_index: dict | None = None
 
     def __enter__(self) -> PdfDoc:
         return self
@@ -225,7 +242,75 @@ class PdfDoc:
         except Exception:  # noqa: BLE001 - malformed content streams happen
             paths = None
         self._drawing_page, self._drawing_cache = page_index, paths
+        self._drawing_index = None
         return paths
+
+    def _path_index(self, page_index: int, paths: list) -> dict:
+        """Which paths lie in which part of the sheet, built once per page.
+
+        Caching the parsed paths stopped the page being re-parsed forty times.
+        It did not stop each of those forty questions *walking* all of them: a
+        door swing is looked for in a window about 0.7% of the sheet, and
+        answering it meant building a rotated rectangle for every one of 65,415
+        paths to reject 65,198 of them. One such query costs 0.29 s and returns
+        217 segments, so 99.3% of the work was thrown away -- and the arc pass
+        asks roughly 1,500 of them across a set's floor plans.
+
+        So: bucket the paths into a coarse grid of display-space cells, once.
+        A window then visits the handful of cells it covers instead of the
+        whole sheet. Nothing about the answer changes -- the same paths are
+        tested by the same rectangle test, in the same order -- only the ones
+        that could never have matched are skipped.
+
+        Paths whose rectangle cannot be read go in `loose` and are always
+        visited, because a path we cannot place is not a path we may drop.
+        """
+        if self._drawing_index is not None:
+            return self._drawing_index
+
+        matrix = self.doc[page_index].rotation_matrix
+        cells: dict[tuple[int, int], list[int]] = {}
+        loose: list[int] = []
+        boxes: list[tuple[float, float, float, float] | None] = []
+
+        for i, path in enumerate(paths):
+            try:
+                r = fitz.Rect(path["rect"]) * matrix
+                box = (min(r.x0, r.x1), min(r.y0, r.y1),
+                       max(r.x0, r.x1), max(r.y0, r.y1))
+            except (KeyError, ValueError, TypeError):
+                boxes.append(None)
+                loose.append(i)
+                continue
+            boxes.append(box)
+            # A path spanning many cells is listed in each of them. Sheet
+            # borders and long walls do that; they are few, and the
+            # alternative -- a quadtree -- is more code for the same answer.
+            for cx in range(int(box[0] // _GRID), int(box[2] // _GRID) + 1):
+                for cy in range(int(box[1] // _GRID), int(box[3] // _GRID) + 1):
+                    cells.setdefault((cx, cy), []).append(i)
+
+        self._drawing_index = {"cells": cells, "loose": loose, "boxes": boxes}
+        return self._drawing_index
+
+    def _paths_near(self, page_index: int, paths: list,
+                    within: tuple[float, float, float, float]) -> list[int]:
+        """Indices of the paths that could touch `within`, in path order.
+
+        Order is preserved deliberately: the arc finder builds chains out of
+        segments that touch each other, and a chain built in a different order
+        is a different chain.
+        """
+        index = self._path_index(page_index, paths)
+        lo_x, lo_y, hi_x, hi_y = within
+        found: set[int] = set(index["loose"])
+        cells = index["cells"]
+        for cx in range(int(lo_x // _GRID), int(hi_x // _GRID) + 1):
+            for cy in range(int(lo_y // _GRID), int(hi_y // _GRID) + 1):
+                hit = cells.get((cx, cy))
+                if hit:
+                    found.update(hit)
+        return sorted(found)
 
     def bookmarks(self) -> list[tuple[str, int]]:
         """The PDF's own outline as (title, 1-indexed page).
@@ -280,7 +365,15 @@ class PdfDoc:
             return []
 
         clip = fitz.Rect(*within) if within else None
-        for path in drawings:
+        # Only the paths whose cell the window touches. Everything else could
+        # not have passed the rectangle test below, so skipping it changes
+        # nothing but the time taken -- see _path_index.
+        if within is not None and drawings:
+            candidates = (drawings[i] for i in
+                          self._paths_near(page_index, drawings, within))
+        else:
+            candidates = drawings
+        for path in candidates:
             # Whole paths can be skipped on their bounding box; most of a sheet
             # is nowhere near any given door.
             #
