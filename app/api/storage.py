@@ -34,6 +34,7 @@ from app.core.pdf_doc import NotAPdfError
 from app.db import files, store
 from app.db.store import _insert as _insert_rows
 from app.db.client import NoDatabase, client
+from app.ai.client import AiUpstreamError
 from app.pipeline import NoRowsError, NoScheduleFoundError, extract
 from app.plan_pipeline import audit
 from app.schemas import DoorRow
@@ -156,7 +157,25 @@ async def signed_upload(project_id: str, body: UploadRequest,
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No file store configured; upload the PDF directly instead.")
-    _db()
+    db = _db()
+    # The job has to exist before we hand out a link into it. Without this a
+    # stale or mistyped id was signed for happily -- the browser then pushed a
+    # 120 MB set into a prefix no row will ever point at, `from-storage`
+    # refused it, and the bytes stayed in the bucket costing money with nothing
+    # in the product able to name them, let alone delete them.
+    # An id the database cannot even read as an id is not a project either.
+    # Postgres refuses to compare a malformed uuid rather than returning no
+    # rows, and that refusal arrives here as an exception -- which, unhandled,
+    # is a plain-text 500 telling the caller nothing about what it sent.
+    try:
+        found = (db.table("projects").select("id")
+                 .eq("id", project_id).execute())
+    except Exception as exc:  # noqa: BLE001 - any read failure means "no"
+        log.info("uploads: rejected project id %r (%s)", project_id, exc)
+        raise HTTPException(status_code=404, detail="No such project.") from exc
+    if not found.data:
+        raise HTTPException(status_code=404, detail="No such project.")
+
     key = files.key_for(project_id, body.sha256)
     if files.exists(key):
         # Already here. Say so rather than issuing a link to overwrite it with
@@ -230,6 +249,15 @@ async def _read_and_store(project_id: str, path, *, filename: str,
         result = await in_worker(extract(path, allow_ai=allow_ai))
     except (NotAPdfError, NoScheduleFoundError, NoRowsError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AiUpstreamError as exc:
+        # The same answer the multipart route has always given. This one did
+        # not, and a revoked OpenRouter key therefore reached the browser as a
+        # bare "Internal Server Error" with no body worth reading: the set
+        # looked broken when the account was. Every large set arrives through
+        # here, so this was the path where it mattered most.
+        log.error("ai upstream failed: %s", exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=f"AI provider error: {exc}") from exc
 
     document_id = store.save_extraction(
         project_id=project_id, filename=filename, result=result,
@@ -511,10 +539,22 @@ async def reread_document(
     if not files.available():
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="No file store configured.")
-    return await _read_and_store(
-        project_id=found["project_id"], key=key,
-        filename=found.get("filename") or "set.pdf", revision=None,
-        source_uri=key, plans=plans, allow_ai=allow_ai)
+    if not files.exists(key):
+        raise HTTPException(
+            status_code=410,
+            detail="That set's file is no longer in storage, so it cannot be "
+                   "read again. Upload it once more.")
+
+    path = await asyncio.to_thread(files.fetch, key)
+    try:
+        return await _read_and_store(
+            found["project_id"], path,
+            filename=found.get("filename") or "set.pdf",
+            sha256=found.get("sha256") or Path(key).stem,
+            size_bytes=found.get("size_bytes") or files.size_of(key),
+            revision=None, source_uri=key, plans=plans, allow_ai=allow_ai)
+    finally:
+        files.discard(path)
 
 
 @router.get("/projects/{project_id}/export")
