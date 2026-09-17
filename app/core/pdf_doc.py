@@ -110,6 +110,40 @@ _BEZIER_STEPS = 4
 _GRID = 64.0
 
 
+def upright(items: list[TextItem]) -> list[TextItem]:
+    """Every item as part of a printed row, sideways ones included.
+
+    A schedule with narrow columns turns its headings on their side: WIDTH,
+    HEIGHT, THICKNESS and MATERIAL run bottom-to-top so they fit a column an
+    inch wide, while DOOR NAME, LOCATION and COMMENT stay upright. One real set
+    prints eight of its fourteen headings that way.
+
+    Everything that finds a table starts by discarding text that is not
+    horizontal, so on that set the header row was eight cells short: it scored
+    four header words against a threshold of five and the page was refused,
+    twice, on a sheet with 3,095 spans and seven "DOOR SCHEDULE" captions.
+
+    Rotated text reports a bounding box whose *width* is the glyph height and
+    whose *height* is the length of the words. So a sideways heading standing
+    in the header row is an upright heading on the same baseline, one line tall,
+    in the column it occupies -- and this is that, exactly:
+
+        LOCATION    upright   x  260.0.. 321.8   y 182.2..196.4
+        WIDTH       sideways  x  411.8.. 426.1   y 156.2..197.9
+                              -> y 183.6..197.9, within a point of the row
+
+    Nothing is dropped and nothing moves sideways, so a caller that only wanted
+    the horizontal text gets what it had plus the headings it was missing.
+    """
+    out = [i for i in items if i.horizontal]
+    for item in items:
+        if item.horizontal:
+            continue
+        out.append(TextItem(item.x0, item.y1 - (item.x1 - item.x0),
+                            item.x1, item.y1, item.text, item.size, True))
+    return out
+
+
 def _is_horizontal(direction: tuple[float, float], matrix: "fitz.Matrix") -> bool:
     """Is this text line horizontal *as displayed*?
 

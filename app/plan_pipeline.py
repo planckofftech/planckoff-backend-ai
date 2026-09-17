@@ -502,6 +502,11 @@ def _group_by_door(doors: list[DetectedDoorOut]) -> None:
         for door in drawings:
             door.primary = door is best
             door.also_on = chain
+            # Which of `also_on` won, said once rather than worked out by every
+            # caller that wants to send a person to the sheet a door is counted
+            # on. On a repeat it names the primary's sheet; on the primary, its
+            # own.
+            door.counted_on = best.location.sheet
 
 
 async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,

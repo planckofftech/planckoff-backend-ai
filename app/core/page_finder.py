@@ -19,7 +19,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 
-from app.core.pdf_doc import PdfDoc, TextItem
+from app.core.pdf_doc import PdfDoc, TextItem, upright
 
 TAG_RE = re.compile(r"^(?=.*\d)[A-Z0-9]{1,6}(?:[-.][A-Z0-9]{1,4})?$", re.I)
 
@@ -30,6 +30,10 @@ HEADER_WORDS = (
     # Seen across the test corpus and previously unmatched entirely.
     "THICKNESS", "HGT", "PANEL", "LOCATION", "ROOM", "HEAD", "JAMB", "SILL",
     "LABEL", "DETAIL", "NOTES", "QTY", "GLAZING", "CORE", "GROUP", "SIGN",
+    # Hardware named a column at a time rather than as a set number. A tower
+    # set heads its columns SELF CLOSER, DOOR OPENER and CARD READER, ticking
+    # each with an X, and carried no other word this list knew.
+    "CLOSER", "OPENER", "CARD READER",
 )
 
 # Word characters for splitting a heading. Apostrophes are separators so that
@@ -142,6 +146,14 @@ def _starts_a_table(text: str) -> bool:
 _DOOR_MARKERS = frozenset({
     "DOOR NO", "THRESHOLD", "HARDWARE", "HW", "LOUVER", "GLAZ", "GLAZING",
     "JAMB", "SILL", "HEAD", "LABEL", "F.R", "F_R", "MARK",
+    # A closer and an opener belong to a door and to nothing else on a drawing
+    # set -- no window, finish or equipment schedule has a column for either.
+    # One 137-page tower headed its schedule WIDTH / HEIGHT / THICKNESS / TYPE
+    # / MATERIAL / FINISH / RATING / LOCATION, every word of which a window
+    # schedule shares, and SELF CLOSER was the only thing on the row that said
+    # "door". Without it the sheet scored eight header words and was still
+    # refused, and the set returned nothing at all.
+    "CLOSER", "OPENER",
 })
 
 
@@ -348,7 +360,8 @@ def _longest_x_run(tags: list[TextItem]) -> tuple[int, float]:
 
 def score_page(items: list[TextItem], page_number: int, *,
                min_header_hits: int = 5, min_tag_run: int = 8) -> PageCandidate:
-    horizontal = [i for i in items if i.horizontal]
+    # Sideways headings are part of the header row -- see upright().
+    horizontal = upright(items)
     if len(horizontal) < _MIN_ITEMS:
         return PageCandidate(page_number, 0, 0.0, 0, 0.0, 0, False, len(horizontal))
 
@@ -404,7 +417,8 @@ def header_bands(items: list[TextItem], page_number: int, *,
     main door schedule, then one for residential units, then one for guestrooms.
     Scoring only the best band reads one of them and silently drops the rest.
     """
-    horizontal = [i for i in items if i.horizontal]
+    # Sideways headings are part of the header row -- see upright().
+    horizontal = upright(items)
     if len(horizontal) < _MIN_ITEMS:
         return []
 
