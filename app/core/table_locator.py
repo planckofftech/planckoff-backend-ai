@@ -330,8 +330,18 @@ def _ruled_grid(headers: list[TextItem], items: list[TextItem],
     # rule: on one sheet the table's own right border is broken exactly where
     # the header crosses it, so it is not in `crossing` at all, and snapping
     # fell back to the next rule inward and dropped the REMARKS column.
+    # Within `_MERGE_TOL` of the edge is on it. `_row_rule_span` quantises its
+    # edges to even points to survive drawing jitter, which can round a
+    # table's left border *past* the door numbers standing just inside it: one
+    # sheet put the border at 1608 and the numbers at 1606.4, so the span it
+    # had just measured was refused by 1.6 points. `left` then stayed wide
+    # enough to take in the hardware schedule printed beside the table, and the
+    # headings of the two fused -- "DOOR DOOR NUMBER LOCATION" -- which cost 43
+    # doors their location. Its first-floor twin, drawn a shade differently,
+    # was read perfectly.
     span = _row_rule_span(rulings.horizontal, tag_x, hdr_y1)
-    usable = (span is not None and span[0] <= tag_x < span[1]
+    usable = (span is not None
+              and span[0] - _MERGE_TOL <= tag_x < span[1] + _MERGE_TOL
               and span[1] - span[0] >= 100)
 
     # ...and where the header run has left the table altogether, the row rules
