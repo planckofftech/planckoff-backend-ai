@@ -259,14 +259,15 @@ async def _read_and_store(project_id: str, path, *, filename: str,
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
                             detail=f"AI provider error: {exc}") from exc
 
-    document_id = store.save_extraction(
+    stored = store.save_extraction(
         project_id=project_id, filename=filename, result=result,
         sha256=sha256, size_bytes=size_bytes, revision=revision,
         source_uri=source_uri)
-    if not document_id:
+    if not stored:
         raise HTTPException(status_code=503,
                             detail="Read the schedule but could not store it. "
                                    "The result was not saved.")
+    document_id, door_count = stored
 
     # Locating the doors on the drawings is a second, slower pass, and it can
     # fail on its own without costing the schedule that was just read.
@@ -282,8 +283,15 @@ async def _read_and_store(project_id: str, path, *, filename: str,
         except Exception as exc:  # noqa: BLE001 - the schedule still stands
             log.warning("db: schedule stored, plan audit failed: %s", exc)
 
+    # `doors` is what was stored, not what was read. They differ whenever a
+    # number repeats within a level -- one set prints a partial schedule on an
+    # earlier sheet and the full one later, 61 rows for 43 doors -- and
+    # reporting the rows read put a number on screen a third higher than the
+    # takeoff behind it, with nothing to account for the gap. Both are given,
+    # so the difference can be shown rather than guessed at.
     return {"document_id": document_id, "reused": False,
-            "doors": result.row_count, "method": result.method.value,
+            "doors": door_count, "rows_read": result.row_count,
+            "method": result.method.value,
             "located_on_plans": located}
 
 
@@ -402,9 +410,32 @@ async def stored_document(
              "start_deg": None, "end_deg": None, "also_on": []}
             for row in store.manual_detections(document_id)
         ]
-        out["detections"] = measured + placed
+        out["detections"] = _name_the_counted_sheet(measured + placed, sheets)
         out["suppressed"] = len(store.tombstones(document_id))
     return out
+
+
+def _name_the_counted_sheet(detections: list[dict],
+                            sheets: list[dict]) -> list[dict]:
+    """Say which sheet each door was counted on, by name, on every box.
+
+    A door drawn on three sheets comes back three times, one of them
+    `is_primary`. `also_on` lists the sheets but does not say which of them
+    won, so naming the sheet a repeat is counted on meant holding every
+    detection of that door and searching them -- work every caller would
+    otherwise repeat, to answer a question we already know the answer to.
+
+    Left empty where nothing about that door is primary, which happens when the
+    only sheet it was found on was not one the audit listed as a floor plan.
+    """
+    number = {s["id"]: (s.get("number") or "") for s in sheets}
+    counted: dict[str, str] = {}
+    for row in detections:
+        if row.get("is_primary"):
+            counted[row.get("door_tag") or ""] = number.get(row.get("sheet_id"), "")
+    for row in detections:
+        row["counted_on"] = counted.get(row.get("door_tag") or "", "")
+    return detections
 
 
 @router.delete("/documents/{document_id}")
@@ -585,9 +616,97 @@ async def export_project(project_id: str,
              "sheet_id": page_id.get(row["page"]), "also_on": []}
             for row in store.manual_detections(doc["id"])
         ]
-        out.append({"document": doc, "doors": doors, "sheets": sheets,
-                    "detections": dets + placed})
+        out.append({
+            "document": doc, "doors": doors, "sheets": sheets,
+            "detections": _name_the_counted_sheet(dets + placed, sheets)})
     return {"project_id": project_id, "documents": out}
+
+
+class PlansFile(BaseModel):
+    """The drawings, when they came as a file of their own."""
+
+    key: str = Field(description="The key returned by /uploads, now uploaded")
+
+
+@router.post("/documents/{document_id}/plans", status_code=status.HTTP_201_CREATED)
+async def attach_plans(
+    document_id: str,
+    body: PlansFile,
+    detect: bool = Query(False, description="Also find doors as shapes with "
+                                            "the vision model. This is the "
+                                            "only part that costs money."),
+    budget_usd: float | None = Query(None, gt=0,
+                                     description="Ceiling for this request"),
+    _key: str = Depends(require_api_key),
+):
+    """Give a document its drawings, when they arrived as a second file.
+
+    Plenty of jobs do not ship one PDF: the schedule comes as `Door
+    Schedule.pdf` and the drawings as `Architectural.pdf`, or the schedule is
+    one sheet pulled out of a set too big to send. Read the schedule first with
+    `from-storage?plans=false`, upload the drawings through `/uploads`, then
+    call this with that key.
+
+    The doors located are the ones already stored against this document, so
+    this cannot disagree with the table on screen -- and a correction made in
+    between is the number it goes looking for.
+
+    One document, two files, rather than two documents. `save_audit` hangs
+    sheets and detections on a single document, so storing the drawings as
+    their own document would leave the schedule on one row and the door
+    locations on another, and every screen would have to join them. A takeoff
+    is one thing; it may simply have arrived in two envelopes.
+
+    Repeatable: sending a new key replaces the drawings and re-locates every
+    door on them, which is what an addendum to the plans needs.
+    """
+    if not files.available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="No file store configured.")
+    db = _db()
+    found = store.stored_pdf(document_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="No such document.")
+    if not body.key.startswith(f"{found['project_id']}/"):
+        raise HTTPException(
+            status_code=400,
+            detail="That key does not belong to this document's project.")
+    if not files.exists(body.key):
+        raise HTTPException(status_code=404,
+                            detail="Nothing has been uploaded under that key.")
+
+    rows = _stored_rows(db, document_id)
+    if not rows:
+        raise HTTPException(
+            status_code=422,
+            detail="That document has no doors stored, so there is nothing to "
+                   "locate. Read the schedule first.")
+
+    path = await asyncio.to_thread(files.fetch, body.key)
+    try:
+        result = await in_worker(audit(path, rows=rows, detect=detect,
+                                       budget_usd=budget_usd))
+    except NotAPdfError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AiUpstreamError as exc:
+        log.error("ai upstream failed: %s", exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=f"AI provider error: {exc}") from exc
+    finally:
+        files.discard(path)
+
+    # Remembered only once the drawings have been read, so a file that turns
+    # out not to be a PDF does not leave the document pointing at it.
+    store.set_plans_uri(document_id, body.key)
+    saved = store.save_audit(document_id, result)
+    return {"document_id": document_id, "plans_key": body.key,
+            "doors": len(rows),
+            "located_on_plans": len(result.located),
+            "not_on_plans": len(result.not_on_plans),
+            "sheets_scanned": len(result.floor_plans),
+            "duration_ms": result.duration_ms,
+            "stored": saved, "warnings": result.warnings,
+            "coverage_note": result.coverage_note}
 
 
 @router.post("/documents/{document_id}/audit")
@@ -616,7 +735,9 @@ async def audit_document(
     found = store.stored_pdf(document_id)
     if not found:
         raise HTTPException(status_code=404, detail="No such document.")
-    key = found.get("source_uri")
+    # The drawings, which are a second file on a set whose schedule arrived
+    # separately -- see POST /documents/{id}/plans.
+    key = store.drawings_uri(found)
     if not key:
         raise HTTPException(
             status_code=409,

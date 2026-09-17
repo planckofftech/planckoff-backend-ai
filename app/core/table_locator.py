@@ -18,10 +18,11 @@ Two strategies, tried in order:
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 
-from app.core.pdf_doc import Rulings, Segment, TextItem
+from app.core.pdf_doc import Rulings, Segment, TextItem, upright
 
 # Two rulings this close are the same line drawn twice.
 _MERGE_TOL = 4.0
@@ -224,8 +225,8 @@ def header_items(items: list[TextItem], header_y: float, tag_x: float) -> list[T
     band elsewhere on the sheet cannot widen the table.
     """
     band = sorted(
-        (i for i in items
-         if i.horizontal and abs(i.y0 - header_y) <= _HEADER_BAND),
+        (i for i in upright(items)
+         if abs(i.y0 - header_y) <= _HEADER_BAND),
         key=lambda i: i.x0,
     )
     if not band:
@@ -468,6 +469,46 @@ def _banded_grid(headers: list[TextItem], items: list[TextItem],
 # entry point
 # --------------------------------------------------------------------------- #
 
+# What a group row is headed by, above the column names it spans. Not column
+# names themselves, so the header-word list does not know them -- and a strip
+# made of nothing but these and column names is that row, not a caption.
+_GROUP_LABELS = frozenset({
+    "DOOR", "DOORS", "FRAME", "FRAMES", "OPENING", "OPENINGS",
+    "LEAF", "LEAVES", "PANEL", "PANELS", "DETAILS", "DIMENSION",
+    "DIMENSIONS", "AND", "OF", "TOTAL",
+})
+
+
+def _reads_as_headers(text: str) -> bool:
+    """Is this strip a row of column names rather than the table's name?
+
+    A schedule that groups its columns rules the group row off from the ones
+    beneath it -- DOOR over SIZE and TYPE, FRAME over MATERIAL and FINISH --
+    and that strip sits exactly where a caption sits. One hospital set has no
+    caption at all, so both of its schedules came back titled "DOOR FRAME SIZE
+    DETAIL": not merely ugly, but the thing tables are told apart by, so the
+    level each one covers could not be read from it either.
+
+    A caption names the table -- "DOOR AND WINDOW FRAME SCHEDULE",
+    "ARCHITECTURE- DOOR SCHEDULE_LEVEL 1" -- and column names are the words it
+    is made of, not the words it says. So: several distinct column names, and
+    little else in the strip.
+    """
+    from app.core import page_finder
+
+    words = [w for w in re.split(r"[^A-Z0-9.#_]+", text.upper()) if w]
+    if len(words) < 2:
+        return False
+    # Every word accounted for, rather than a majority. "DOOR FRAME" is a group
+    # row -- DOOR over its columns, FRAME over its own -- and only FRAME is a
+    # column name, so counting column names alone left it looking like a
+    # caption. What makes it one is that there is nothing else in it: a caption
+    # says something a column name cannot, and "DOOR SCHEDULE", "DOOR AND
+    # WINDOW FRAME SCHEDULE" and "ARCHITECTURE- DOOR SCHEDULE_LEVEL 1" all do.
+    return all(w in _GROUP_LABELS or page_finder._header_words_found([w])
+               for w in words)
+
+
 def _is_note(text: str) -> str:
     """A note ruled into the caption strip is not the table's name."""
     return text.upper().lstrip().startswith("NOTE")
@@ -502,6 +543,8 @@ def table_title(grid: TableGrid, items: list[TextItem],
         band.sort(key=lambda i: (round(i.cy / 3), i.x0))
         text = " ".join(i.text for i in band).strip()
         # A band full of column-ish text is another header row, not a caption.
+        if _reads_as_headers(text):
+            return None, ""
         return (top, text) if 0 < len(text) <= 80 else (None, "")
 
     # Work up through the ruled strips above the headings. The nearest one is

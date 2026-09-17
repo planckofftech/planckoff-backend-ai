@@ -46,6 +46,14 @@ class DoorRow(BaseModel):
     fire_rating: str = ""
     hw_set: str = ""
     comments: str = ""
+    level: str = Field(
+        "",
+        description="Which part of the building this door belongs to, in the "
+        "drawing's own words -- 'LEVEL 08', 'P1 LEVEL', 'GARAGE'. Empty where "
+        "the schedule does not divide its doors, which is most single-floor "
+        "jobs and is not a failure. Two doors sharing a number in different "
+        "levels are two doors.",
+    )
     extra: dict[str, str] = Field(
         default_factory=dict,
         description="Columns whose header did not map to a canonical field. "
@@ -302,6 +310,14 @@ class DetectedDoorOut(BaseModel):
         description="Every sheet this same door is drawn on, smallest scale "
         "first -- overall plan, then the partial, then the enlargement. This "
         "is the order a person reads the set in.",
+    )
+    counted_on: str = Field(
+        "",
+        description="The sheet this door is counted on, by name. `also_on` "
+        "lists the sheets it is drawn on but does not say which of them won, "
+        "so a caller had to hold every drawing of the door and search them to "
+        "answer a question already settled here. On a repeat this names the "
+        "sheet to send someone to; on the primary it names its own sheet.",
     )
     sheet_scale: float = Field(
         0.0,

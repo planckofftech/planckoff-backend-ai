@@ -124,7 +124,10 @@ async def _stored_pdf(document_id: str) -> AsyncIterator[Path]:
     if not found:
         raise HTTPException(status_code=404, detail="No such document.")
 
-    key = found.get("source_uri")
+    # The drawings, not the schedule. On a set that arrived as two files these
+    # differ, and every page this renders is a plan sheet -- rendering the
+    # schedule's file would draw doors onto the wrong document.
+    key = store.drawings_uri(found)
     if not key:
         raise HTTPException(
             status_code=409,

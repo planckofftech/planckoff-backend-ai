@@ -101,6 +101,29 @@ _ANGLE_BIN = 15
 # How many tags must share a shape before it is this sheet's
 # convention rather than a coincidence.
 _MIN_SHAPE_EXAMPLES = 3
+# How many types a sheet must define before its rows count as a legend.
+#
+# The vocabulary used to be the union of every architectural sheet, and a floor
+# plan's keynote list joins that union whenever a note happens to state a
+# material and a size. Oncor's entire vocabulary was two such notes -- "01
+# PROVIDE AND INSTALL LANDSCAPE FABRIC" and "12 PROVIDE HOSE BIB AND 8" CMU
+# WALL" -- and 69 doors were told their wall was one of them. Worse than
+# saying nothing, because it reads as though it came off a legend.
+#
+# Per sheet rather than per set, because CCS spreads its eight types over four
+# unit-plan sheets and taking only the best sheet would lose one. Measured,
+# types defined by each sheet on its own:
+#
+#     OBGYN  A2.1 FLOOR PLAN                15      | Oncor  best sheet   2
+#     VA     AS410 PARTITION TYPES          12      | CHI    best sheet   2
+#     CCS    A-103/4/5/6 unit plans      7,7,6,6    |
+#     PPG    I0-51 PARTITION TYPES           6      |
+#     BMK    CR1.01 enlarged floor plan      6      |
+#
+# Six and up on every set that works, two on both that were wrong. Three sits
+# in that gap, and nothing real is near it. Note BMK's own "SHEET: WALL TYPES"
+# contributes one and is rightly ignored -- its vocabulary is on a floor plan.
+_MIN_LEGEND_TYPES = 3
 
 
 @dataclass(slots=True)
@@ -156,6 +179,9 @@ def legend_symbols(doc: PdfDoc,
     """
     found: dict[str, WallType] = {}
     for page, title in pages:
+        # Read this sheet on its own, and only merge it if it defines enough
+        # to be a legend. See _MIN_LEGEND_TYPES.
+        mine: dict[str, WallType] = {}
         items = doc.text_items(page - 1)
         # The sheet's own title counts as a caption. King's City prints
         # "PARTITION TYPES" in its title block and nowhere in the body, and
@@ -172,9 +198,9 @@ def legend_symbols(doc: PdfDoc,
             symbol, described = row.group(1), row.group(2).strip()
             if not (_BUILD_UP.search(described) and _SIZED.search(described)):
                 continue
-            if symbol not in found or len(described) > len(found[symbol].description):
-                found[symbol] = WallType(symbol=symbol,
-                                         description=described[:200])
+            if symbol not in mine or len(described) > len(mine[symbol].description):
+                mine[symbol] = WallType(symbol=symbol,
+                                        description=described[:200])
 
         for item in items:
             text = item.text.strip()
@@ -192,8 +218,24 @@ def legend_symbols(doc: PdfDoc,
             # a grid letter out of the vocabulary.
             if not (_BUILD_UP.search(described) and _SIZED.search(described)):
                 continue
-            if text not in found or len(described) > len(found[text].description):
-                found[text] = WallType(symbol=text, description=described[:200])
+            if text not in mine or len(described) > len(mine[text].description):
+                mine[text] = WallType(symbol=text, description=described[:200])
+
+        # A legend states a vocabulary. One or two symbols is a coincidence --
+        # a keynote that happens to name a material and a size -- and merging
+        # those is how a door came to be told its wall was "01 PROVIDE AND
+        # INSTALL LANDSCAPE FABRIC". See _MIN_LEGEND_TYPES.
+        if len(mine) < _MIN_LEGEND_TYPES:
+            if mine:
+                log.info("wall_tags: ignoring p%s (%s): only %d type(s) -- "
+                         "%s", page, title or "untitled", len(mine),
+                         ", ".join(sorted(mine)))
+            continue
+        for symbol, wall in mine.items():
+            if (symbol not in found
+                    or len(wall.description) > len(found[symbol].description)):
+                found[symbol] = wall
+
     types = sorted(found.values(), key=lambda w: w.symbol)
     log.info("wall_tags: %d wall type(s) defined: %s",
              len(types), ", ".join(t.symbol for t in types) or "none")

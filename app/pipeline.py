@@ -229,6 +229,82 @@ class NoRowsError(RuntimeError):
         )
 
 
+def _levels_from_titles(tables: list[ScheduleTable]) -> None:
+    """Name each table's doors by what its caption says and the others do not.
+
+    A set that splits its doors by storey does it one of two ways. It prints a
+    band across the table -- "LEVEL 08" -- which the extractor reads directly;
+    or it prints one table per storey and says so in the caption:
+
+        ARCHITECTURE- DOOR SCHEDULE_LEVEL 1
+        ARCHITECTURE- DOOR SCHEDULE_LEVEL 5
+        ARCHITECTURE- DOOR SCHEDULE_GARAGE
+        ARCHITECTURE- DOOR SCHEDULE_UNITS
+
+    What every caption shares is the name of the schedule; what one caption has
+    and the rest do not is the part of the building it covers. So the shared
+    opening is dropped and the remainder is the level, without a list of storey
+    words to maintain -- which matters, because GARAGE and UNITS are neither
+    storeys nor spellable in advance, and they divide the doors just the same.
+
+    Only where a table has no level already: a band states it per row and is
+    the better evidence. And only where the captions genuinely differ -- one
+    set heads both of its schedules "DOOR FRAME", which distinguishes nothing.
+    """
+    titled = [t for t in tables if t.title.strip()]
+    if len(titled) < 2:
+        return
+    titles = [t.title.strip() for t in titled]
+    if len(set(titles)) < 2:
+        return
+    shared = 0
+    for position, letters in enumerate(zip(*titles)):
+        if len(set(letters)) > 1:
+            break
+        shared = position + 1
+    # A caption that runs out exactly where they diverge is the same schedule
+    # carried on, not a part of the building: one set heads its pages "DOOR
+    # SCHEDULE" and "DOOR SCHEDULE CONTINUE.". Checked before the back-off
+    # below, which hands a whole shared word back and so leaves both remainders
+    # looking non-empty -- "SCHEDULE" and "SCHEDULE CONTINUE.", neither a place.
+    if shared == min(len(t) for t in titles):
+        return
+
+    # Back off to a separator, or a caption is cut mid-word and the level comes
+    # back as "EVEL 1". An underscore counts: one set writes its captions
+    # "ARCHITECTURE- DOOR SCHEDULE_LEVEL 1", so the part that differs begins
+    # after one, and backing off to the last space alone left "SCHEDULE_" on
+    # the front of every storey.
+    opening = titles[0][:shared]
+    cut = max(opening.rfind(c) for c in " _-:")
+    shared = cut + 1 if cut >= 0 else 0
+
+    # Keep backing off while what is left says nothing. Two captions reading
+    # "..._LEVEL 1" and "..._LEVEL 5" share everything up to the number, so the
+    # difference between them is "1" and "5" -- true, and no use to anyone
+    # reading a door's level. Give back the word that makes it "LEVEL 1".
+    while shared > 0 and not any(
+            any(ch.isalpha() for ch in t[shared:]) for t in titles):
+        cut = max(opening[:shared - 1].rfind(c) for c in " _-:")
+        shared = cut + 1 if cut >= 0 else 0
+
+    names = [t.title.strip()[shared:].strip(" _-:") for t in titled]
+    # A caption with nothing left once the shared opening is removed is the
+    # same schedule carried on, not a part of the building: one set heads its
+    # pages "DOOR SCHEDULE" and "DOOR SCHEDULE CONTINUE.", which would divide
+    # its doors into no level at all and "CONTINUE.". Neither is a place, so
+    # the whole derivation is abandoned rather than applied to one page.
+    if not all(names):
+        return
+
+    for table, name in zip(titled, names):
+        if name == table.title.strip():
+            continue
+        for row in table.rows:
+            if not row.level:
+                row.level = name
+
+
 async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                   debug: bool = False) -> ExtractionResult:
     """PDF in, JSON out. Stateless.
@@ -380,6 +456,7 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                               field_map=e.mapped, row_count=len(e.rows), rows=e.rows)
                 for e in sorted(found, key=lambda e: (e.page, -len(e.rows)))
             ]
+            _levels_from_titles(tables)
             # Every door on the sheet, not the biggest table's doors.
             #
             # `rows` used to be the winning table alone. A sheet with two

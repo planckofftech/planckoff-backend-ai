@@ -170,6 +170,31 @@ def _is_noise(cells: list[str], tag_col: int) -> bool:
     return all(len(c) <= 1 and not c.isalnum() for c in populated)
 
 
+def _is_band(cells: list[str]) -> bool:
+    """A storey written across the table, on a row of its own.
+
+    A schedule that groups its doors by level prints the level as a band --
+    "P1 LEVEL", "LEVEL 00 -BELOW GRADE", "LEVEL 08" -- with the whole rest of
+    the row empty. It is a label, not a door.
+
+    Structural rather than textual, because `_is_heading_row` tests for a mark
+    made only of letters and these carry digits: "LEVEL 08" reads as a door
+    number that happens to be spelled oddly. One populated cell, and that cell
+    not a door number, says it without reading the words.
+
+    This matters twice over. The row is not a door, and -- because working out
+    which column holds the door number is done on the columns as read -- a band
+    label sitting in that column makes it look like no column of door numbers
+    at all: every value has to be short and distinct, and "LEVEL 00 -BELOW
+    GRADE" is neither. On a 137-page tower that one row cost all 149 doors
+    their numbers.
+    """
+    filled = [c.strip() for c in cells if c.strip()]
+    if len(filled) != 1:
+        return False
+    return not page_finder.TAG_RE.match(_join_split_mark(filled[0]))
+
+
 def extract_page(doc: PdfDoc, candidate: PageCandidate,
                  header_overrides: dict[str, str] | None = None) -> PageExtraction:
     page_index = candidate.page - 1
@@ -195,7 +220,10 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
     if raw_rows and _looks_like_header(raw_rows[0], header_strings):
         raw_rows = raw_rows[1:]
 
-    columns = [[r[i] if i < len(r) else "" for r in raw_rows]
+    # Band rows are excluded here, not merely skipped later: the door-number
+    # column is inferred from these columns. See _is_band.
+    body = [r for r in raw_rows if not _is_band(r)]
+    columns = [[r[i] if i < len(r) else "" for r in body]
                for i in range(len(header_strings))]
     before = list(mapped)
     mapped = header_mapper.infer_tag_column(mapped, columns, header_strings)
@@ -213,7 +241,14 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         )
 
     rows: list[DoorRow] = []
+    # The storey a band announced, carried down until the next one announces
+    # another. That is what the band is for: every door under "LEVEL 08" is on
+    # level 8, and the rows themselves never say so.
+    band = ""
     for cells in raw_rows:
+        if _is_band(cells):
+            band = next(c.strip() for c in cells if c.strip())
+            continue
         if _is_noise(cells, tag_col):
             continue
         values: dict[str, str] = {}
@@ -236,7 +271,7 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         if _is_heading_row(values.get("door_tag", "")):
             continue
         _split_run_on_tag(values)
-        rows.append(DoorRow(**values, extra=extra))
+        rows.append(DoorRow(**values, level=band, extra=extra))
 
     # A mark carrying a character no font could have meant. One sheet's embedded
     # font has a damaged ToUnicode map -- every glyph it gets wrong comes back

@@ -110,9 +110,28 @@ def stored_pdf(document_id: str) -> dict[str, Any] | None:
     """
     db = client()
     found = (db.table("documents")
-             .select("id,filename,project_id,source_uri,sha256,size_bytes")
+             .select("id,filename,project_id,source_uri,plans_uri,"
+                     "sha256,size_bytes")
              .eq("id", document_id).execute())
     return found.data[0] if found.data else None
+
+
+def drawings_uri(document: dict[str, Any]) -> str | None:
+    """Which file to read this document's *drawings* from.
+
+    Usually the one it arrived as. A set whose schedule and drawings came as
+    two files keeps the drawings in `plans_uri`, and every caller that wants a
+    floor plan -- the audit, the sheet preview -- wants that one instead.
+    """
+    return document.get("plans_uri") or document.get("source_uri")
+
+
+def set_plans_uri(document_id: str, key: str) -> bool:
+    """Remember where this document's drawings live."""
+    db = client()
+    done = (db.table("documents").update({"plans_uri": key})
+            .eq("id", document_id).execute())
+    return bool(done.data)
 
 
 def set_document_status(document_id: str, status: str) -> bool:
@@ -215,8 +234,15 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
                     result: ExtractionResult, sha256: str, size_bytes: int,
                     project_id: str | None = None, org_id: str | None = None,
                     revision: str | None = None,
-                    source_uri: str | None = None) -> str | None:
-    """Store a schedule reading. Returns the document id, or None if not stored.
+                    source_uri: str | None = None
+                    ) -> tuple[str, int] | None:
+    """Store a schedule reading. Returns (document id, doors stored), or None.
+
+    The count is what reached the database, not what was read off the sheet.
+    Those differ whenever a number repeats within a level -- one set prints a
+    partial schedule on an earlier sheet and the full one later, 61 rows for 43
+    doors -- and reporting the rows read meant the number on screen was a third
+    higher than the takeoff behind it, with nothing to explain the gap.
 
     Never raises for a database reason. A takeoff that cannot be written down is
     still a takeoff, and the caller has already been given it.
@@ -268,15 +294,23 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
         rows, seen, repeated = [], set(), []
         for index, door in enumerate(result.rows):
             tag = door.door_tag or None
-            # `doors` allows one row per number, and that constraint is doing
-            # real work: one set's damaged font read doors 106 and 108 both as
-            # "10". Refusing the whole save over it would lose eighty good rows,
-            # so the repeat is dropped and named in the log instead.
-            if tag and tag in seen:
+            # `doors` allows one row per number *per level*, and that
+            # constraint is doing real work: one set's damaged font read doors
+            # 106 and 108 both as "10". Refusing the whole save over it would
+            # lose eighty good rows, so the repeat is dropped and named in the
+            # log instead.
+            #
+            # Keyed on the level too, because a building that numbers per
+            # storey repeats itself legitimately: one residential set has 001
+            # on level 1 and 001 outside, and S1-0 in the garage and on level
+            # 1. Those are five different doors, and on the number alone three
+            # of them were thrown away as duplicates.
+            key = (tag, door.level)
+            if tag and key in seen:
                 repeated.append(tag)
                 continue
             if tag:
-                seen.add(tag)
+                seen.add(key)
             values = door.model_dump(exclude={"extra"})
             # Null, not "". A row with no number printed on it is a row whose
             # number we do not know -- and the difference decides whether a
@@ -325,7 +359,7 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
         log.info("db: stored %d door(s) for %s", len(rows), filename)
         _log_run(org_id, project_id, document_id, "extract", result=result,
                  doors=len(rows))
-        return document_id
+        return document_id, len(rows) + len(restored)
     except NoDatabase:
         return None
     except Exception as exc:  # noqa: BLE001 - storing must not break a takeoff
