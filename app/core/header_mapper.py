@@ -22,7 +22,23 @@ HEADER_ALIASES: list[tuple[str, list[str]]] = [
     # with no door number at all.
     ("door_tag", ["#", "NO", "NO.", "NUMBER", "DOOR NUMBER", "MARK", "DOOR NO",
                   "DOOR NO.", "DOOR #", "TAG", "DOOR MARK", "DR NO"]),
-    ("from_space", ["FROM", "FROM ROOM", "FROM SPACE"]),
+    # A schedule names the room a door serves one of two ways. Some give both
+    # sides -- FROM and TO -- and some give one, headed LOCATION or ROOM. The
+    # single-column kind was unmapped entirely: six of twelve real sets print
+    # it and only the one saying "FROM ROOM" was understood, so CORRIDOR,
+    # KITCHEN, WAITING, RECEPTION, WAREHOUSE and SUITE - BATHROOM all sat in
+    # `extra` where no column could show them. It is the field an estimator
+    # reads after the door number.
+    #
+    # It maps to `from_space`, the side the door is approached from, because
+    # that is what a one-sided column means: where this door is. `to_space`
+    # stays empty on those sets rather than being invented.
+    # Names only, not numbers: ROOM NO and ROOM NUMBER are a different column,
+    # and on a sheet whose door column is poorly headed they would be taken for
+    # the door's own number.
+    ("from_space", ["FROM", "FROM ROOM", "FROM SPACE",
+                    "DOOR LOCATION", "LOCATION", "ROOM NAME", "ROOM",
+                    "SPACE"]),
     ("to_space", ["TO", "TO ROOM", "TO SPACE"]),
     # "PANEL WIDTH" first: sheets that group columns under DOOR and FRAME print
     # a bare "WIDTH" under FRAME, and matching that would report the frame's
@@ -62,7 +78,15 @@ _MAX_LEAF_ALIAS = 2
 # TYPE and FRAME TYPE, FIRE RATING and ACOUSTIC RATING. Matching those loose
 # puts the frame's value in the door's column, and an acoustic rating in the
 # fire rating.
-_SAFE_MID_HEADING = frozenset({"WIDTH", "HEIGHT", "THICKNESS", "THK", "UNDERCUT"})
+_SAFE_MID_HEADING = frozenset({
+    "WIDTH", "HEIGHT", "THICKNESS", "THK", "UNDERCUT",
+    # A door schedule names the room a door serves once. FROM ROOM and TO ROOM
+    # are claimed by the exact and prefix passes above and a field is claimed
+    # only once, so matching these loose cannot take the far side's column.
+    # It is what reads a heading the sheet mangled -- one set's column arrives
+    # as "l ROOM", another's as "DOOR LOCATION FIRST FLOOR".
+    "LOCATION", "ROOM",
+})
 # Which door field a repeated heading hands over to the frame.
 _DOOR_TO_FRAME = {"door_material": "frame_material", "door_finish": "frame_finish"}
 _MAX_TAG_LEN = 10
