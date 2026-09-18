@@ -98,6 +98,17 @@ _NOT_A_FLOOR_PLAN = (
     # read off the page, and "CONSTRUCTION PLAN KEYNOTES" is set larger than
     # the drawing's own caption "CONSTRUCTION PLAN" right below the plan.
     "KEYNOTE", "LEGEND", "SYMBOLS", "GENERAL NOTES",
+    # The floor drawn again for a trade that hangs nothing in a wall. A
+    # graphics or signage plan repeats every room number and every door
+    # number, so it matches the schedule as well as the real plan does and
+    # contributes nothing but duplicates: one school set's two GRAPHICS PLAN
+    # sheets produced 92 detections and not one door that another sheet did
+    # not already have.
+    "GRAPHICS", "FF&E",
+    # Site work. These carry no doors at all -- one set's FIRE LANE STRIPING
+    # PLAN and FENCING PLAN were read as floor plans because neither title
+    # says "SITE", which is the word this list knew.
+    "FIRE LANE", "STRIPING", "FENCING", "PAVEMENT MARKING",
 )
 # The floor drawn again for somebody else's benefit. Every door is on these,
 # drawn identically, so scanning one is not more coverage -- it is the same

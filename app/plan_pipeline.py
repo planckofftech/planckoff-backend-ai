@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -470,12 +471,76 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
             entry.sheet_scale = round(scale_of[page], 2)
             out.append(entry)
 
+    out = _drop_wrong_shape(out)
     _group_by_door(out)
     counted = [d for d in out if d.primary]
     log.info("plan_audit measured %d drawing(s) of %d door(s), %d with a "
              "fitted swing", len(out), len(counted),
              sum(1 for d in counted if d.arc))
     return out
+
+
+# How many numbers must share an enclosure before it is this set's door-tag
+# convention rather than a coincidence. Measured across thirteen sets: where a
+# set marks its doors, the shape appears 22 to 153 times; where it does not,
+# the stray enclosures number one to thirteen. Five sits in that gap, and the
+# rule below is safe either way -- a door with no correctly-shaped sighting
+# keeps the ones it has.
+_MIN_SHAPED_TAGS = 5
+
+
+def _drop_wrong_shape(doors: list[DetectedDoorOut]) -> list[DetectedDoorOut]:
+    """Drop numbers that are not drawn the way this set draws a door number.
+
+    A plan is covered in short numbers and a door mark is only one of them. A
+    room is numbered too, and with the same numbers: one school set schedules
+    109 doors and this pass found 354, because every room number on the overall
+    plan matched a door in the schedule. An estimator reading that sheet is
+    never confused, because the drawing says which is which -- the door numbers
+    are in bubbles and the room numbers are bare.
+
+    So: learn the enclosure this set puts its door numbers in, and prefer it.
+    Measured, the convention is never in doubt where one exists:
+
+        A-103 … A-106, A-112 … A-114   100% circles     the door tags
+        A-101, A-102  OVERALL PLAN      79 bare         the room numbers
+        A-703, A-704  GRAPHICS PLAN     92              a signage sheet
+
+    Nothing about circles is written down anywhere: `enclosure_shape` bins the
+    angles of the edges around a glyph, so a hexagon is {0, 60, 120} and the
+    next set's convention is whatever that set uses.
+
+    Decided per door, not per document, and this is the part that matters. A
+    door is routinely bubbled on one sheet and printed bare on another, so
+    dropping every bare number outright takes away doors whose only sighting is
+    bare -- one set lost 62 of its 63 doors that way, another 57 of 127. A door
+    that has a properly drawn tag somewhere keeps those and loses its bare
+    duplicates; a door that is only ever printed bare keeps what it has.
+
+    It also settles which sheets count, without a rule about sheet titles. A
+    graphics plan and a fire-lane plan carry no door-shaped numbers and fall
+    away on their own, while a set whose only plans are titled "ENLARGED FLOOR
+    PLAN" keeps every one of them.
+    """
+    shapes = Counter(d.tag_shape for d in doors if d.tag_shape)
+    if not shapes:
+        return doors
+    convention, seen = shapes.most_common(1)[0]
+    if seen < _MIN_SHAPED_TAGS:
+        # A handful of enclosures on a set that marks its doors bare: one had a
+        # single boxed number against 62 plain ones. Reading that as the
+        # convention would throw the set away.
+        return doors
+
+    properly_drawn = {d.tag for d in doors
+                      if d.tag and d.tag_shape == convention}
+    kept = [d for d in doors
+            if d.tag_shape == convention or d.tag not in properly_drawn]
+    if len(kept) != len(doors):
+        log.info("plan_audit: this set draws its door numbers in a %s; "
+                 "dropped %d number(s) drawn otherwise where the same door is "
+                 "marked properly elsewhere", convention, len(doors) - len(kept))
+    return kept
 
 
 def _group_by_door(doors: list[DetectedDoorOut]) -> None:
