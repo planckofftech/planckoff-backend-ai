@@ -269,6 +269,47 @@ def _signature(doc: PdfDoc, page: int, x: float, y: float,
     return frozenset(angle for angle, count in bins.items() if count >= 2)
 
 
+# What a set of edge angles means, as a name a viewer can draw.
+_NAMED_SHAPES = {
+    frozenset({0, 90}): "square",
+    frozenset({0}): "",          # one edge is a leader line, not an enclosure
+    frozenset({90}): "",
+    frozenset({45, 135}): "diamond",
+    frozenset({0, 60, 120}): "hexagon",
+    frozenset({30, 90, 150}): "hexagon",
+}
+# Angles a circle shows. Broken into short segments it hits every bin there is,
+# which is what tells it apart from a polygon: measured on one set, all 38 door
+# bubbles on a sheet reported ten to thirteen distinct angles, while a sheet
+# that prints its numbers as bare text reported one.
+_ROUND_ENOUGH = 6
+
+
+def enclosure_shape(doc: PdfDoc, page: int, x: float, y: float,
+                    size: float) -> str:
+    """The shape a number is drawn inside, named -- or "" if it is drawn bare.
+
+    A viewer wants to highlight the tag rather than box the door: the tag is
+    what a person looks for on a crowded plan and a far better thing to click
+    than a nine-point rectangle. Tracing the shape the drawing actually used
+    beats drawing a rectangle over a circle.
+
+    Reuses `_signature`, which is what makes wall tags findable at all -- it
+    reads the angles of the edges around a glyph, so a hexagon is {0, 60, 120}
+    and nobody has to name the shapes in advance.
+
+    Empty is a real answer and a common one: plenty of sets print door numbers
+    as bare text against the wall, and saying so lets a viewer fall back to a
+    plain highlight instead of tracing a shape that is not there.
+    """
+    if size <= 0:
+        return ""
+    angles = _signature(doc, page, x, y, size)
+    if len(angles) >= _ROUND_ENOUGH:
+        return "circle"
+    return _NAMED_SHAPES.get(frozenset(angles), "")
+
+
 def tag_shape(doc: PdfDoc, page: int, vocabulary: set[str]) -> frozenset[int]:
     """What shape this sheet draws its wall tags in, learned from the sheet.
 

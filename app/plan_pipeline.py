@@ -22,6 +22,7 @@ from app.config import get_settings
 from app.core import (
     table_locator,
     dimensions,
+    wall_tags,
     door_match,
     door_reconcile,
     page_finder,
@@ -369,13 +370,18 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
         for r in rows if r.door_tag
     }
 
-    seeds: dict[int, list[tuple[str, float, float]]] = {}
+    # The number's own rectangle travels with its centre. The centre is what
+    # finds the arc; the rectangle is what a viewer highlights, and it used to
+    # be discarded here -- so a door whose swing was measured kept only the
+    # arc's box and nothing that said where its number was printed.
+    seeds: dict[int, list[tuple[str, float, float, tuple]]] = {}
     for sighting in sightings:
         for c in sighting.candidates:
             width, height = sizes.get(c.page, (0.0, 0.0))
             if width and height:
                 seeds.setdefault(c.page, []).append(
-                    (sighting.tag, (c.x0 + c.x1) / 2, (c.y0 + c.y1) / 2))
+                    (sighting.tag, (c.x0 + c.x1) / 2, (c.y0 + c.y1) / 2,
+                     (c.x0, c.y0, c.x1, c.y1)))
 
     # Every sheet, not a chosen few. Reading only the sheet with the most doors
     # on it costs the arcs: that sheet is the overall plan, where a door is a
@@ -394,7 +400,7 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
         if page not in sheet_of:
             continue
         width, height = sizes[page]
-        points = [(x, y) for _tag, x, y in found]
+        points = [(x, y) for _tag, x, y, _box in found]
         radius = swing_finder.calibrate(doc, page, points)
         door_pt = radius if radius else _BASE_DOOR_PT
         # The calibrated leaf length *is* the scale, measured off the drawing.
@@ -408,7 +414,7 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
         arcs = swing_finder.arcs_for_tags(doc, page, points, expected_r=radius,
                                           door_pt=door_pt)
 
-        for (tag, x, y), arc in zip(found, arcs):
+        for (tag, x, y, box), arc in zip(found, arcs):
             half = door_pt / 2
             entry = DetectedDoorOut(
                 location=DoorLocation(
@@ -417,6 +423,12 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
                     x1=(x + half) / width, y1=(y + half) / height),
                 type="unknown", tag=tag, schedule=by_tag.get(tag, {}),
                 confidence="unique",
+                tag_box=DoorLocation(
+                    page=page, sheet=sheet_of[page],
+                    x0=box[0] / width, y0=box[1] / height,
+                    x1=box[2] / width, y1=box[3] / height),
+                tag_shape=wall_tags.enclosure_shape(
+                    doc, page, x, y, box[3] - box[1]),
             )
             # No fixed cap here any more. arcs_for_tags refuses an arc whose
             # own nearest number is somebody else, which is the real test --
