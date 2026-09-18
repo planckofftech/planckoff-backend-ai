@@ -407,7 +407,11 @@ async def stored_document(
             {**row, "source": "manual", "is_primary": True,
              "sheet_id": page_id.get(row["page"]),
              "radius": None, "hinge_x": None, "hinge_y": None,
-             "start_deg": None, "end_deg": None, "also_on": []}
+             "start_deg": None, "end_deg": None, "also_on": [],
+             # A box drawn by hand has no printed number to highlight. Named
+             # anyway, so every row of this array has the same keys.
+             "tag_x0": None, "tag_y0": None, "tag_x1": None, "tag_y1": None,
+             "tag_shape": None}
             for row in store.manual_detections(document_id)
         ]
         out["detections"] = _name_the_counted_sheet(measured + placed, sheets)
@@ -613,7 +617,9 @@ async def export_project(project_id: str,
         page_id = {s["page"]: s["id"] for s in sheets}
         placed = [
             {**row, "source": "manual", "is_primary": True,
-             "sheet_id": page_id.get(row["page"]), "also_on": []}
+             "sheet_id": page_id.get(row["page"]), "also_on": [],
+             "tag_x0": None, "tag_y0": None, "tag_x1": None, "tag_y1": None,
+             "tag_shape": None}
             for row in store.manual_detections(doc["id"])
         ]
         out.append({

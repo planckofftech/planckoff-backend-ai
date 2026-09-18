@@ -6,7 +6,8 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from app.core import cell_mapper, header_mapper, page_finder, row_builder
+from app.core import (cell_mapper, dimensions, header_mapper, page_finder,
+                      row_builder)
 from app.core.page_finder import PageCandidate
 from app.core.pdf_doc import PdfDoc
 from app.core.table_locator import TableNotFoundError, locate_table, table_title
@@ -156,6 +157,33 @@ class PageExtraction:
     mapped: list[str | None] = field(default_factory=list)
 
 
+def _to_feet(values: dict[str, str]) -> int:
+    """Rewrite this row's metric sizes as feet and inches, in place.
+
+    Sets outside the US state their doors in millimetres -- 914 mm, 2032 mm,
+    44 mm. An estimator pricing in feet cannot read that, and neither can the
+    parts of this codebase that compare a door's stated width against the
+    drawing: `parse_feet` returns None for every one of them, so a metric set
+    got no measured width and no double-door box.
+
+    Applied to every cell that is a metric size and nothing else, rather than
+    to named columns. A schedule in millimetres is in millimetres throughout --
+    width, height, thickness, undercut -- and half of those columns have no
+    canonical field, so naming them would convert some and leave the rest.
+    A cell reading "SEE DETAIL" or "1 3/4\"" is untouched.
+
+    Returns how many cells were converted, so the caller can say the schedule
+    was metric instead of quietly handing over feet the drawing never printed.
+    """
+    converted = 0
+    for key, text in values.items():
+        as_feet = dimensions.to_feet_inches(text)
+        if as_feet is not None:
+            values[key] = as_feet
+            converted += 1
+    return converted
+
+
 def _is_noise(cells: list[str], tag_col: int) -> bool:
     """Drop grid artefacts that survived the row walk.
 
@@ -241,6 +269,10 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         )
 
     rows: list[DoorRow] = []
+    # How many cells were written in millimetres. Counted so the caller is told
+    # the schedule was metric, rather than silently handed feet the drawing
+    # never printed.
+    metric = 0
     # The storey a band announced, carried down until the next one announces
     # another. That is what the band is for: every door under "LEVEL 08" is on
     # level 8, and the rows themselves never say so.
@@ -271,7 +303,17 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         if _is_heading_row(values.get("door_tag", "")):
             continue
         _split_run_on_tag(values)
+        metric += _to_feet(values) + _to_feet(extra)
         rows.append(DoorRow(**values, level=band, extra=extra))
+
+    if metric:
+        # No total: only the largest table's warnings reach the caller, so a
+        # count here would be one table's and read as the document's.
+        warnings.append(
+            "This schedule states its sizes in millimetres. They have been "
+            "converted to feet and inches, rounded to the nearest eighth of "
+            "an inch."
+        )
 
     # A mark carrying a character no font could have meant. One sheet's embedded
     # font has a damaged ToUnicode map -- every glyph it gets wrong comes back

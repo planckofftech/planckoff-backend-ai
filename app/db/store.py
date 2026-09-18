@@ -492,6 +492,14 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
                 "measured_width": door.measured_width or None,
                 "is_primary": door.primary, "sheet_scale": door.sheet_scale,
                 "also_on": door.also_on,
+                # Flat, like the box and the arc beside them: a detection is
+                # read back with `select *`, and the nested `tag_box` of the
+                # audit response is a shape no stored reader has ever seen.
+                "tag_x0": door.tag_box.x0 if door.tag_box else None,
+                "tag_y0": door.tag_box.y0 if door.tag_box else None,
+                "tag_x1": door.tag_box.x1 if door.tag_box else None,
+                "tag_y1": door.tag_box.y1 if door.tag_box else None,
+                "tag_shape": door.tag_shape or None,
                 "hinge_x": arc.hinge_x if arc else None,
                 "hinge_y": arc.hinge_y if arc else None,
                 "radius": arc.radius if arc else None,

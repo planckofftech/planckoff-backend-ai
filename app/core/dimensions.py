@@ -88,6 +88,68 @@ def door_span_pt(width_text: str, median_ft: float | None,
     return base_pt * (feet / median_ft)
 
 
+# A size written in millimetres, centimetres or metres, and nothing else in
+# the cell. Anchored both ends on purpose: "914 mm" is a size, while "SEE
+# DETAIL 3 mm" or a note that happens to mention millimetres is not.
+_METRIC = re.compile(
+    # The brackets are part of the pair marker, not optional around a digit:
+    # written loose, "914 mm" reads as two leaves of 14 mm.
+    r"^(?:\((?P<leaves>\d)\)\s*)?"
+    r"(?P<value>\d+(?:[.,]\d+)?)\s*"
+    r"(?P<unit>MM|CM|M)\.?$",
+    re.IGNORECASE,
+)
+_TO_MM = {"MM": 1.0, "CM": 10.0, "M": 1000.0}
+# Rounded to this, in inches. An eighth is what a drawing writes and what a
+# door is made to: 914 mm is 35.98 inches, which is 3'-0" and not 2'-11.98".
+# Measured against one Canadian tower's whole schedule, every size lands on an
+# eighth or better -- 2032 mm is exactly 80", 44 mm is 1 3/4", 35 mm is 1 3/8".
+_EIGHTH = 8
+
+
+def is_metric(text: str) -> bool:
+    """Is this cell a size written in metric units?"""
+    return bool(_METRIC.match((text or "").strip()))
+
+
+def to_feet_inches(text: str) -> str | None:
+    """A metric size as a drawing in feet and inches would write it.
+
+    Returns None when the cell is not a metric size, so a caller can leave it
+    alone. Sets outside the US state their doors in millimetres -- 914 mm,
+    2032 mm, 44 mm -- and an estimator pricing in feet cannot read a schedule
+    in millimetres, nor can anything here that compares a door's width against
+    the drawing.
+
+    Written as inches alone below a foot, because that is how a drawing states
+    a door's thickness: 1 3/4", never 0' - 1 3/4".
+    """
+    found = _METRIC.match((text or "").strip())
+    if not found:
+        return None
+    mm = float(found.group("value").replace(",", ".")) * _TO_MM[
+        found.group("unit").upper()]
+    inches = mm / 25.4
+    if inches <= 0:
+        return None
+    eighths = round(inches * _EIGHTH)
+    whole, part = divmod(eighths, _EIGHTH)
+    fraction = ""
+    if part:
+        top, bottom = part, _EIGHTH
+        while top % 2 == 0 and bottom % 2 == 0:
+            top, bottom = top // 2, bottom // 2
+        fraction = f" {top}/{bottom}"
+
+    if whole < 12:
+        size = f'{whole}{fraction}"'
+    else:
+        feet, rest = divmod(whole, 12)
+        size = f"{feet}' - {rest}{fraction}\""
+    leaves = found.group("leaves")
+    return f"({leaves}){size}" if leaves else size
+
+
 def feet_inches(feet: float) -> str:
     """Format a measured size the way a drawing writes it.
 

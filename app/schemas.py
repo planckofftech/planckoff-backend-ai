@@ -311,6 +311,23 @@ class DetectedDoorOut(BaseModel):
         "first -- overall plan, then the partial, then the enlargement. This "
         "is the order a person reads the set in.",
     )
+    tag_box: DoorLocation | None = Field(
+        None,
+        description="Where the door's number is printed, as page fractions. "
+        "`location` is the door -- the arc where one was measured -- and this "
+        "is the label pointing at it. A viewer highlighting the tag rather "
+        "than boxing the door wants this one: on a crowded plan the number is "
+        "what a person looks for, and a far better click target than a "
+        "nine-point rectangle. Null on a door found without a number.",
+    )
+    tag_shape: str = Field(
+        "",
+        description="The shape the number is drawn inside -- 'circle', "
+        "'square', 'hexagon', 'diamond' -- read off the drawing. Empty where "
+        "the number is printed bare, which is common and not a failure: trace "
+        "the shape when there is one, and fall back to a plain highlight when "
+        "there is not.",
+    )
     counted_on: str = Field(
         "",
         description="The sheet this door is counted on, by name. `also_on` "
