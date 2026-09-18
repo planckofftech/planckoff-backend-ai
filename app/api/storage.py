@@ -369,6 +369,14 @@ async def list_documents(
 async def stored_document(
     document_id: str,
     detections: bool = Query(True, description="Include the measured doors"),
+    primary_only: bool = Query(
+        False,
+        description="Return one box per door -- the sheet it is counted on -- "
+        "instead of every sheet it is drawn on. A door appears on the overall "
+        "plan, its area plan and an enlargement, so the full set is two to "
+        "four times the doors and a viewer showing only the counted sheets "
+        "throws most of it away. Hand-placed boxes are always included: a "
+        "person put them there."),
     _key: str = Depends(require_api_key),
 ):
     """A takeoff as stored -- no PDF, no re-processing.
@@ -414,6 +422,8 @@ async def stored_document(
              "tag_shape": None}
             for row in store.manual_detections(document_id)
         ]
+        if primary_only:
+            measured = [d for d in measured if d.get("is_primary")]
         out["detections"] = _name_the_counted_sheet(measured + placed, sheets)
         out["suppressed"] = len(store.tombstones(document_id))
     return out
