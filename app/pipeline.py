@@ -22,9 +22,32 @@ from app.schemas import (
     ExtractionResult,
     PageScore,
     ScheduleTable,
+    TableBox,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _table_box(extraction) -> TableBox | None:
+    """Where this table sits, as fractions of its page.
+
+    Fractions rather than points, to match `TableBox` and `DoorLocation`
+    everywhere else: the viewer draws onto an image rendered at whatever dpi it
+    chooses, and a fraction is the one form that survives that.
+
+    `source` is "text" because the box was measured off the page's own rulings
+    and text, not estimated from a picture of it -- the same distinction the AI
+    tier's box carries, and worth keeping where a caller may be looking at
+    either.
+    """
+    bounds, size = extraction.bounds, extraction.page_size
+    if not bounds or not size or not size[0] or not size[1]:
+        return None
+    x0, y0, x1, y1 = bounds
+    width, height = size
+    return TableBox(page=extraction.page, source="text",
+                    x0=x0 / width, y0=y0 / height,
+                    x1=x1 / width, y1=y1 / height)
 
 # Below this page count it is cheap enough to let the AI look at the best-
 # scoring page even though no page passed the structural gates.
@@ -453,7 +476,8 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
 
             tables = [
                 ScheduleTable(title=e.title, page=e.page, headers=e.headers,
-                              field_map=e.mapped, row_count=len(e.rows), rows=e.rows)
+                              field_map=e.mapped, row_count=len(e.rows),
+                              rows=e.rows, box=_table_box(e))
                 for e in sorted(found, key=lambda e: (e.page, -len(e.rows)))
             ]
             _levels_from_titles(tables)

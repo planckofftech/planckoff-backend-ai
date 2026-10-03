@@ -112,6 +112,16 @@ class ScheduleTable(BaseModel):
     )
     row_count: int = 0
     rows: list[DoorRow] = Field(default_factory=list)
+    box: TableBox | None = Field(
+        None,
+        description="Where this schedule sits on its page, as fractions of the "
+        "page, so a viewer can outline the table these rows were read from. "
+        "Per table rather than per document because one sheet routinely "
+        "carries several schedules stacked down it, and a single box could "
+        "only ever point at one of them. Null where the geometry could not be "
+        "measured, which is a real answer: an AI-read page has no grid to "
+        "measure and says so rather than guessing a rectangle.",
+    )
 
 
 class ExtractionResult(BaseModel):
@@ -313,12 +323,16 @@ class DetectedDoorOut(BaseModel):
     )
     tag_box: DoorLocation | None = Field(
         None,
-        description="Where the door's number is printed, as page fractions. "
-        "`location` is the door -- the arc where one was measured -- and this "
-        "is the label pointing at it. A viewer highlighting the tag rather "
-        "than boxing the door wants this one: on a crowded plan the number is "
-        "what a person looks for, and a far better click target than a "
-        "nine-point rectangle. Null on a door found without a number.",
+        description="The door's mark, as page fractions -- the bubble the "
+        "number is drawn in, measured off the drawing, falling back to the "
+        "number's own rectangle where it is printed bare. `location` is the "
+        "door -- the arc where one was measured -- and this is the label "
+        "pointing at it. A viewer highlighting the tag rather than boxing the "
+        "door wants this one: on a crowded plan the mark is what a person "
+        "looks for, and a far better click target than a nine-point rectangle. "
+        "Draw `tag_shape` inside it: the glyph's own box is smaller than the "
+        "bubble and sits off-centre in it, so a circle inscribed in that one "
+        "never lands on the ink. Null on a door found without a number.",
     )
     tag_shape: str = Field(
         "",

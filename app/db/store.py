@@ -286,7 +286,15 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
         made = _insert("schedules", [
             {"document_id": document_id, "page": t.page, "title": t.title,
              "headers": t.headers, "field_map": t.field_map,
-             "row_count": t.row_count}
+             "row_count": t.row_count,
+             # Flat columns rather than a nested object, because a stored
+             # schedule is read back with `select *` and nothing reading a
+             # document has ever seen the response's nested shape. See 017.
+             "box_x0": t.box.x0 if t.box else None,
+             "box_y0": t.box.y0 if t.box else None,
+             "box_x1": t.box.x1 if t.box else None,
+             "box_y1": t.box.y1 if t.box else None,
+             "box_source": t.box.source if t.box else None}
             for t in tables
         ])
         schedule_id = {t.page: m["id"] for t, m in zip(tables, made)}

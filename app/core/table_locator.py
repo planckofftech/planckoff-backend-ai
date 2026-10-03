@@ -760,3 +760,45 @@ def locate_table(items: list[TextItem], rulings: Rulings, header_y: float,
         "no table rulings found; columns inferred from text alignment"
     )
     return grid, headers
+
+
+def table_bottom(grid: TableGrid, items: list[TextItem]) -> float:
+    """Where the table ends -- the last ruled line that still has rows above it.
+
+    Taking the last ruled line outright drew the box past the schedule and
+    around whatever was ruled beneath it: on one sheet it swallowed the GLAZING
+    TYPES and DEMOUNTABLE REQUIREMENTS tables below. Those bands are empty as
+    far as *this* grid's columns are concerned, so the last band holding text is
+    the real edge.
+    """
+    inside = [
+        item for item in items
+        if item.horizontal and item.cy > grid.header_bottom
+        and grid.column_of(item.x0) is not None
+    ]
+    lowest = max((i.y1 for i in inside), default=None)
+
+    if grid.row_bounds:
+        if lowest is None:
+            return grid.row_bounds[-1]
+        # The first boundary at or below the lowest row of text.
+        return next((b for b in grid.row_bounds if b >= lowest - 1),
+                    grid.row_bounds[-1])
+    return lowest if lowest is not None else grid.header_bottom + 40.0
+
+
+def table_bounds(grid: TableGrid, items: list[TextItem],
+                 rulings: Rulings) -> tuple[float, float, float, float]:
+    """The whole table in PDF points: caption, headings and rows.
+
+    Lives here rather than in `preview`, where it grew up, because it is the
+    answer to "where is this table" and nothing about it is to do with drawing
+    a picture. The preview still asks the question; so now does extraction, for
+    callers that draw their own outline over the page and would otherwise have
+    to re-measure the grid to find out what was read.
+    """
+    top = min(grid.header_top, grid.header_bottom, table_top(grid, items, rulings))
+    title_top, _title = table_title(grid, items, rulings)
+    if title_top is not None:
+        top = min(top, title_top)
+    return (grid.left, top, grid.right, table_bottom(grid, items))

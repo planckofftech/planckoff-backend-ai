@@ -10,7 +10,8 @@ from app.core import (cell_mapper, dimensions, header_mapper, page_finder,
                       row_builder)
 from app.core.page_finder import PageCandidate
 from app.core.pdf_doc import PdfDoc
-from app.core.table_locator import TableNotFoundError, locate_table, table_title
+from app.core.table_locator import (TableNotFoundError, locate_table,
+                                    table_bounds, table_title)
 from app.schemas import DoorRow, ExtractionMethod
 
 log = logging.getLogger(__name__)
@@ -155,6 +156,12 @@ class PageExtraction:
     title: str = ""
     # Canonical field per column, aligned to `headers`; None where unmapped.
     mapped: list[str | None] = field(default_factory=list)
+    # Where this table sits on its page, in PDF points, and how big the page
+    # is -- enough for a caller to express the box however it draws. Measured
+    # off the grid that was actually read, so it outlines the table these rows
+    # came from rather than the page's strongest-looking table.
+    bounds: tuple[float, float, float, float] | None = None
+    page_size: tuple[float, float] | None = None
 
 
 def _to_feet(values: dict[str, str]) -> int:
@@ -231,6 +238,13 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
 
     grid, headers = locate_table(items, rulings, candidate.header_y, candidate.tag_x)
     warnings = list(grid.warnings)
+    # Measured here, from the grid these rows are about to be read out of, so
+    # the outline a caller draws and the rows it draws beside it can never
+    # describe two different tables.
+    try:
+        bounds = table_bounds(grid, items, rulings)
+    except Exception:  # noqa: BLE001 - an outline is not worth losing rows over
+        bounds = None
 
     _title_top, title = table_title(grid, items, rulings)
     header_strings = cell_mapper.header_texts(grid, headers, items, rulings)
@@ -331,7 +345,8 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         )
 
     return PageExtraction(candidate.page, method, header_strings, rows, warnings,
-                          unmapped, candidate, title, mapped)
+                          unmapped, candidate, title, mapped, bounds,
+                          doc.page_size(page_index))
 
 
 # A door mark printed as a number and a letter with air between them. Real
