@@ -79,6 +79,16 @@ _MAX_BANDS_SCORED = 6
 # Kept deliberately tight: a wider window starts swallowing data rows, which
 # on the Ellis set turned four extra pages into false positives.
 _HEADER_STACK_SPAN = 40.0
+# How long the door column under a band must be before the band may make up its
+# word count from the rest of its table's header. Well above `min_tag_run`,
+# because this is the one guard standing between pooling and a page of prose:
+# measured, a real schedule's column runs to 31 and 35 marks where the spec
+# page that fooled an earlier attempt ran to 15.
+_POOL_TAG_RUN = 20
+# Fewest heading words a band must hold on its own before pooling is considered
+# at all. Three is most of a header already; below that a band is a stray label
+# or two and pooling would be inventing a heading rather than completing one.
+_POOL_MIN_WORDS = 3
 _HEADER_STACK_ROWS = 3
 # Two header rows this close describe one table, not two.
 _SAME_TABLE_Y = 60.0
@@ -370,19 +380,74 @@ def score_page(items: list[TextItem], page_number: int, *,
     # neighbouring schedule's header scored higher but had no tag column: on one
     # sheet a window schedule's header outscored the door schedule below it, so
     # the page was rejected on the window table's missing tag run.
+    bands = _scored_bands(horizontal)
     best: PageCandidate | None = None
-    for words, header_y, band, leaf in _scored_bands(horizontal)[:_MAX_BANDS_SCORED]:
+    for index, (words, header_y, band, leaf) in enumerate(bands[:_MAX_BANDS_SCORED]):
         candidate = _judge(horizontal, band, words, header_y, page_number,
-                           min_header_hits, min_tag_run, leaf)
+                           min_header_hits, min_tag_run, leaf,
+                           _pooled(bands, index))
         if best is None or (candidate.passed, candidate.score) > (best.passed, best.score):
             best = candidate
     return best or PageCandidate(page_number, 0, 0.0, 0, 0.0, 0, False,
                                  len(horizontal))
 
 
+def _pooled(bands: list[tuple[set[str], float, list[TextItem], list[TextItem]]],
+            index: int) -> set[str]:
+    """This band's header words, plus those of every band over the same table.
+
+    A band has to prove the whole case on its own -- five known words, one of
+    them distinctly a door's -- and where a header is printed over several
+    lines *and* split into narrow column groups, no single band ever holds
+    enough of it.
+
+    Measured on AT&T's Blackline reissue, whose door schedule is rejected:
+
+        band  words                                    HARDWARE  tag column
+        [0]   COMMENTS HEIGHT LOCATION TYPE WIDTH         no        35 doors
+        [8]   FRAME HARDWARE LOCATION TYPE                yes       35 doors
+
+    Both describe the same table -- the same 35-door column stands under each
+    -- and each fails a different clause: [0] has the five words and no door
+    word, [8] has the door word and only four. Pooled they read HARDWARE,
+    LOCATION, FRAME, TYPE, WIDTH, HEIGHT, COMMENTS and pass comfortably. The
+    same sheet issued a year earlier fits every heading on one line, scores
+    seven words in a single band, and has always passed; nothing about the
+    doors changed, only the column widths.
+
+    "The same table" is meant strictly: bands within the stack span of each
+    other whose cells overlap horizontally. That is what keeps the two
+    schedules printed side by side on this very sheet apart -- the right-hand
+    table's own HARDWARE sits a thousand points away and pools with its own
+    header, not this one.
+
+    Pooled words settle one question only -- whether a door word is present.
+    The five-word count stays the band's own, because pooling that too is not
+    safe: tried on the Ellis set it gathered JAMB and SILL out of the prose on
+    a metal-building spec page, reached five, and passed page 51 as a schedule
+    beside the real one on page 21.
+    """
+    words, header_y, band, _leaf = bands[index]
+    if not band:
+        return words
+    low, high = min(i.x0 for i in band), max(i.x1 for i in band)
+
+    pooled = set(words)
+    for other, other_y, other_band, _ in bands:
+        if other <= pooled or abs(other_y - header_y) > _HEADER_STACK_SPAN:
+            continue
+        if not other_band:
+            continue
+        if max(i.x1 for i in other_band) < low or min(i.x0 for i in other_band) > high:
+            continue
+        pooled |= other
+    return pooled
+
+
 def _judge(horizontal: list[TextItem], band: list[TextItem], words: set[str],
            header_y: float, page_number: int, min_header_hits: int,
-           min_tag_run: int, leaf: list[TextItem] | None = None) -> PageCandidate:
+           min_tag_run: int, leaf: list[TextItem] | None = None,
+           pooled: set[str] | None = None) -> PageCandidate:
     """Score one header band together with the tag column beneath it.
 
     The tag column is searched under the *leaf* row, not the merged band. A
@@ -399,9 +464,23 @@ def _judge(horizontal: list[TextItem], band: list[TextItem], words: set[str],
             if i.y0 > header_y + 1 and x0 <= i.x0 <= x1 and TAG_RE.match(i.text)]
     tag_run, tag_x = _longest_x_run(tags)
 
-    hits = len(words)
+    # What a band may borrow from the rest of its table's header -- see
+    # `_pooled` -- depends on what stands under it.
+    #
+    # The door word it may always borrow: a heading printed two lines above the
+    # one carrying the column names is still this table's heading.
+    #
+    # The word *count* only when a real door column stands beneath it, and that
+    # is the line between the two sets this has to serve. AT&T's second table
+    # holds four heading words of its own above 31 door marks; Ellis's
+    # metal-building spec page holds a couple of words above a run of 15 detail
+    # marks, and letting it pool the count passed it as a schedule beside the
+    # real one. Prose does not have a door column under it, so the column is
+    # what tells them apart -- not the words, which read alike.
+    counting = (pooled if pooled and tag_run >= _POOL_TAG_RUN else words)
+    hits = len(counting)
     passed = (hits >= min_header_hits and tag_run >= min_tag_run
-              and bool(words & _DOOR_MARKERS))
+              and bool((pooled or words) & _DOOR_MARKERS))
     return PageCandidate(
         page_number, hits, header_y, tag_run, tag_x,
         hits * 2 + min(tag_run, 30), passed, len(horizontal),
@@ -423,8 +502,13 @@ def header_bands(items: list[TextItem], page_number: int, *,
         return []
 
     found: list[PageCandidate] = []
-    for words, header_y, band, leaf in _scored_bands(horizontal):
-        if len(words) < min_header_hits:
+    bands = _scored_bands(horizontal)
+    for index, (words, header_y, band, leaf) in enumerate(bands):
+        # A band short of the threshold is still worth judging when it holds
+        # most of a header, because `_judge` may complete it from the rest of
+        # this table's heading. Below `_POOL_MIN_WORDS` it cannot, so the walk
+        # over every band on the page stays as cheap as it was.
+        if len(words) < min(min_header_hits, _POOL_MIN_WORDS):
             continue
         # One table yields several bands -- itself, and itself merged with the
         # group rows above it -- each with a different leaf row. They describe
@@ -439,7 +523,30 @@ def header_bands(items: list[TextItem], page_number: int, *,
         # both headed "Door Schedule" at the same height, and ten of its
         # twenty-five doors were never read.
         candidate = _judge(horizontal, band, words, header_y, page_number,
-                           min_header_hits, min_tag_run, leaf)
+                           min_header_hits, min_tag_run, leaf,
+                           _pooled(bands, index))
+        # A band that had to borrow its word count is weak evidence. It may
+        # reveal a table standing in a column nothing has read yet -- that is
+        # what recovers the second half of a schedule printed in two halves --
+        # but it may not re-read a column already claimed, at any height.
+        #
+        # Borrowed either way: short of words, or carrying no door word of its
+        # own. Both lean on the rest of the table's header, and neither is
+        # enough to announce a table in a column already read.
+        #
+        # Measured, and the two cases separate cleanly on the column alone.
+        # AT&T's two halves stand at x=770 and x=1758, so the second is new and
+        # is kept. UBC's door schedule is read once from a band holding eight
+        # words and its own CLOSER and THRESHOLD, and then offers band after
+        # band at that same x=1437 -- the same table, lower down, with a grid
+        # that fits it badly. One of those yielded a phantom 12-row "table"
+        # whose door numbers were AL, HM and ST: the material abbreviations out
+        # of its own legend column.
+        borrowed = (len(words) < min_header_hits
+                    or not words & _DOOR_MARKERS)
+        if borrowed and any(abs(candidate.tag_x - c.tag_x) <= _SAME_TABLE_X
+                            for c in found):
+            continue
         if any(abs(header_y - c.header_y) <= _SAME_TABLE_Y
                and abs(candidate.tag_x - c.tag_x) <= _SAME_TABLE_X
                for c in found):
