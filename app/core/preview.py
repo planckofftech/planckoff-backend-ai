@@ -21,6 +21,8 @@ from app.core.table_locator import (
     TableGrid,
     TableNotFoundError,
     locate_table,
+    table_bottom,
+    table_bounds,
     table_title,
     table_top,
 )
@@ -45,28 +47,8 @@ _PDF_DPI = 72.0
 
 
 def _table_bottom(grid: TableGrid, doc: PdfDoc, page_index: int) -> float:
-    """Where the table ends -- the last ruled line that still has rows above it.
-
-    Taking the last ruled line outright drew the box past the schedule and
-    around whatever was ruled beneath it: on one sheet it swallowed the GLAZING
-    TYPES and DEMOUNTABLE REQUIREMENTS tables below. Those bands are empty as
-    far as *this* grid's columns are concerned, so the last band holding text is
-    the real edge.
-    """
-    inside = [
-        item for item in doc.text_items(page_index)
-        if item.horizontal and item.cy > grid.header_bottom
-        and grid.column_of(item.x0) is not None
-    ]
-    lowest = max((i.y1 for i in inside), default=None)
-
-    if grid.row_bounds:
-        if lowest is None:
-            return grid.row_bounds[-1]
-        # The first boundary at or below the lowest row of text.
-        return next((b for b in grid.row_bounds if b >= lowest - 1),
-                    grid.row_bounds[-1])
-    return lowest if lowest is not None else grid.header_bottom + 40.0
+    """Where the table ends. See `table_locator.table_bottom`."""
+    return table_bottom(grid, doc.text_items(page_index))
 
 
 def _title_band(grid: TableGrid, doc: PdfDoc, page_index: int,
@@ -170,14 +152,9 @@ _SAME_TABLE = 12.0
 
 
 def _bounds(grid, doc: PdfDoc, page_index: int) -> tuple[float, float, float, float]:
-    """The whole table in PDF points: caption, headings and rows."""
-    items = doc.text_items(page_index)
-    rulings = doc.rulings(page_index)
-    top = min(grid.header_top, grid.header_bottom, table_top(grid, items, rulings))
-    title_top, _title = _title_band(grid, doc, page_index, rulings)
-    if title_top is not None:
-        top = min(top, title_top)
-    return (grid.left, top, grid.right, _table_bottom(grid, doc, page_index))
+    """The whole table in PDF points. See `table_locator.table_bounds`."""
+    return table_bounds(grid, doc.text_items(page_index),
+                        doc.rulings(page_index))
 
 
 def _other_tables(doc: PdfDoc, page_index: int, candidate: PageCandidate,
