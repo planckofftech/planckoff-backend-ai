@@ -346,8 +346,8 @@ def _kind(leaves: int, width_ft: float | None, per_foot: float | None,
     return "double_swing" if leaves >= 2 else "single_swing"
 
 
-def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
-                       sizes) -> list[DetectedDoorOut]:
+def _measure_from_tags(doc: PdfDoc, plans, sightings, rows, sizes,
+                       want_shape: str = "") -> list[DetectedDoorOut]:
     """Measure each door's swing starting from its printed number. No AI.
 
     The detector exists to find doors nobody numbered. But every door that IS
@@ -361,6 +361,23 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
 
     What it cannot do is see a door with no number on it. That is the one thing
     the model is for, and why this does not replace it.
+
+    `want_shape` is the mark this set draws its door numbers in -- "circle",
+    "hexagon", "diamond", "square" -- named by the person who has the drawing
+    open. Given one, it is the test rather than a tidy-up afterwards: a number
+    not drawn in that mark, or with no door beside it, is not a door and never
+    becomes a sighting. Left empty, the convention is learned from the sheet
+    and applied per door as before -- see `_drop_wrong_shape`.
+
+    Two things on one sheet are what this is for. On Austin OBGYN's A2.1 the
+    same number is printed twice: once in a circle, where it is the door, and
+    once bare a few inches away, where it is the room -- 15 of its 37 doors
+    collide with a room that way, and nothing but the circle separates them.
+    And a circle alone is not enough either, because that sheet draws its
+    wall-type tags in circles too. What settles those is the second half of the
+    rule: measured there, every circled mark that is a real door has its swing
+    0.46 to 0.72 leaf-lengths away, while the circled wall tags have no door
+    beside them at all.
     """
     widths = [r.door_width for r in rows if r.door_width]
     median_ft = dimensions.median_width_ft(widths)
@@ -397,6 +414,10 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
     scale_of: dict[int, float] = {}
 
     out: list[DetectedDoorOut] = []
+    # Whether a door is actually drawn where each number sits, aligned to
+    # `out`. Kept beside it rather than on the model: it is evidence about the
+    # reading, not something a caller should be told.
+    beside: list[bool] = []
     for page, found in seeds.items():
         if page not in sheet_of:
             continue
@@ -416,6 +437,14 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
                                           door_pt=door_pt)
 
         for (tag, x, y, box), arc in zip(found, arcs):
+            at_opening = False
+            # The mark the number is drawn in, measured -- not the glyph's own
+            # rectangle. Where the set was named, a number drawn in anything
+            # else is a room number or a keynote and is dropped here, before
+            # anything is measured, rather than filtered out downstream.
+            mark = wall_tags.enclosure(doc, page, x, y, box[3] - box[1])
+            if want_shape and (mark is None or mark.shape != want_shape):
+                continue
             half = door_pt / 2
             entry = DetectedDoorOut(
                 location=DoorLocation(
@@ -426,10 +455,11 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
                 confidence="unique",
                 tag_box=DoorLocation(
                     page=page, sheet=sheet_of[page],
-                    x0=box[0] / width, y0=box[1] / height,
-                    x1=box[2] / width, y1=box[3] / height),
-                tag_shape=wall_tags.enclosure_shape(
-                    doc, page, x, y, box[3] - box[1]),
+                    x0=(mark.x0 if mark else box[0]) / width,
+                    y0=(mark.y0 if mark else box[1]) / height,
+                    x1=(mark.x1 if mark else box[2]) / width,
+                    y1=(mark.y1 if mark else box[3]) / height),
+                tag_shape=mark.shape if mark else "",
             )
             # No fixed cap here any more. arcs_for_tags refuses an arc whose
             # own nearest number is somebody else, which is the real test --
@@ -468,10 +498,39 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
                 if per_foot:
                     entry.measured_width = dimensions.feet_inches(
                         arc.radius / per_foot)
+            else:
+                # No arc, so ask whether a door panel is drawn beside the
+                # number at all -- a slider, a pocket or a cased opening has
+                # no swing but still has a leaf. Recorded as evidence only:
+                # the *type* stays unknown, because nothing here measured one.
+                #
+                # `find_leaf`, not `leaves_at`. The latter counts arcs, so in
+                # this branch -- reached only because no arc was fitted -- it
+                # can only ever answer zero, and every door drawn without a
+                # swing was condemned for not having one. On Austin OBGYN that
+                # was five properly circled doors, 110, 113, 114, 118 and 122,
+                # each with a 17-25 pt panel plainly drawn at its opening.
+                at_opening = swing_finder.find_leaf(
+                    doc, page, x, y, door_pt=door_pt) is not None
+            near = arc is not None or at_opening
+            # Half the rule, and the half a shape cannot supply: a door mark
+            # sits at an opening. A wall tag is drawn in the same circle and
+            # has nothing beside it.
+            if want_shape and not near:
+                continue
             entry.sheet_scale = round(scale_of[page], 2)
             out.append(entry)
+            beside.append(near)
 
-    out = _drop_wrong_shape(out)
+    if want_shape:
+        # Both tests have already been applied to every sighting, and applied
+        # strictly. Learning a convention now would only second-guess the one
+        # we were given.
+        log.info("plan_audit kept %d number(s) drawn in a %s with a door "
+                 "beside them", len(out), want_shape)
+    else:
+        out = _drop_far_from_doors(out, beside)
+        out = _drop_wrong_shape(out)
     _group_by_door(out)
     counted = [d for d in out if d.primary]
     log.info("plan_audit measured %d drawing(s) of %d door(s), %d with a "
@@ -487,6 +546,38 @@ def _measure_from_tags(doc: PdfDoc, plans, sightings, rows,
 # rule below is safe either way -- a door with no correctly-shaped sighting
 # keeps the ones it has.
 _MIN_SHAPED_TAGS = 5
+
+
+def _drop_far_from_doors(doors: list[DetectedDoorOut],
+                        beside: list[bool]) -> list[DetectedDoorOut]:
+    """Drop numbers with no door beside them.
+
+    A schedule number matches text on a plan, and a plan numbers its rooms with
+    the same numbers it gives their doors: "A115" is both the classroom and the
+    door into it. One school set schedules 109 doors and this pass found 354,
+    because every room number on the overall plan matched.
+
+    What tells them apart is not the character -- it is that a door mark sits at
+    an opening and a room number sits in the middle of the floor. We already
+    measure the openings: an arc fitted to the swing, or a leaf where there is
+    no swing to fit.
+
+    Decided per door, for the same reason as `_drop_wrong_shape`: a door drawn
+    at a scale too small to measure has neither arc nor leaf on that sheet, and
+    would otherwise be thrown away for being drawn badly. A door with an opening
+    beside it *somewhere* keeps those sightings and loses the rest; a door with
+    none anywhere keeps what it has.
+    """
+    at_an_opening = {d.tag for d, near in zip(doors, beside) if d.tag and near}
+    if not at_an_opening:
+        return doors
+    kept = [d for d, near in zip(doors, beside)
+            if near or d.tag not in at_an_opening]
+    if len(kept) != len(doors):
+        log.info("plan_audit: dropped %d number(s) with no door drawn beside "
+                 "them, where the same door is at an opening elsewhere",
+                 len(doors) - len(kept))
+    return kept
 
 
 def _drop_wrong_shape(doors: list[DetectedDoorOut]) -> list[DetectedDoorOut]:
@@ -1012,7 +1103,8 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
                 dry_run: bool = False,
                 budget_usd: float | None = None,
                 rows: list[DoorRow] | None = None,
-                schedule_page: int = 0) -> PlanAudit:
+                schedule_page: int = 0,
+                tag_shape: str = "") -> PlanAudit:
     """PDF in, reconciliation out. Stateless.
 
     `rows` is a schedule that has already been read. Pass it and this does not
@@ -1028,6 +1120,16 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
     `detect` turns on the vision pass that finds doors as shapes. It is off by
     default because it is the only part of this that costs money; `dry_run`
     reports what it would send and sends nothing.
+
+    `tag_shape` is the mark this set draws its door numbers in -- "circle",
+    "hexagon", "diamond", "square" -- as named by whoever has the drawing open.
+    It is optional, and naming it is worth more than any amount of guessing: a
+    plan prints its room numbers with the same characters as its door numbers,
+    and the mark around them is the only thing that tells the two apart. Given
+    one, it is applied strictly, and the font-size filter -- which is a hard
+    reject built on the assumption that a sheet uses one size, and on some
+    sheets it does not -- stands down in its favour. Left empty, the convention
+    is learned from the drawing and applied leniently, as it was before.
     """
     started = time.perf_counter()
     _DRY_RUN.set(dry_run)
@@ -1053,7 +1155,7 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         # with itself and reports that everything agrees.
         avoid = _schedule_table(doc, best_page)
 
-        sightings = locate(doc, tags, plans, avoid)
+        sightings = locate(doc, tags, plans, avoid, shape=tag_shape)
 
         # Second pass, for the doors the plainly-titled plans did not account
         # for. Sheet titles are not dependable enough to be the only filter --
@@ -1065,7 +1167,8 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             if spare:
                 log.info("plan_audit widening to %d more architectural sheets "
                          "for %d unplaced doors", len(spare), len(missing))
-                extra = {s.tag: s for s in locate(doc, missing, spare, avoid)}
+                extra = {s.tag: s for s in locate(doc, missing, spare, avoid,
+                                                  shape=tag_shape)}
                 sightings = [extra.get(s.tag, s) if not s.found else s
                              for s in sightings]
                 searched += spare
@@ -1111,7 +1214,8 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             # Measuring there drew boxes on calculation tables. A door printed
             # nowhere but a code sheet is reported as not found on any floor
             # plan, which is what it is.
-            detected = _measure_from_tags(doc, plans, sightings, rows, sizes)
+            detected = _measure_from_tags(doc, plans, sightings, rows, sizes,
+                                          tag_shape)
 
         # Which sheet leads for each storey. Worked out from where the door
         # numbers actually landed, so it reflects the drawings rather than the
