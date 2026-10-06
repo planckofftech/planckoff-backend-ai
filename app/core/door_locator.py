@@ -10,10 +10,11 @@ room number, because door numbering usually follows room numbering. Three
 observations separate them, and all three are measured from the drawing itself
 rather than assumed:
 
-  size    Door tags are set in one size. We learn it from the tags that cannot
-          be anything else (`127A`, `46C` -- lettered, and appearing once on
-          the sheet), instead of hard-coding a number that would be wrong on
-          the next drawing set.
+  size    Where a sheet sets its door tags in one size we learn it from the
+          tags themselves, instead of hard-coding a number that would be wrong
+          on the next drawing set. It is the weakest of the three and not
+          always true -- Austin OBGYN sets its tags at three sizes on one plan
+          -- so the caller can turn it off; see `size_filter`.
 
   stack   A room number sits directly beneath its room name. `59` under `CREW`
           is a room; `59` beside `58` and `15' - 0"` is a door.
@@ -33,6 +34,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
+from app.core import wall_tags
 from app.core.pdf_doc import PdfDoc, TextItem
 from app.core.plan_index import SHEET_NUMBER, PlanSheet
 
@@ -173,8 +175,8 @@ def _company(item: TextItem, items: list[TextItem], tags: set[str]) -> tuple[int
 
 
 def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
-           avoid: dict[int, list[tuple[float, float, float, float]]] | None = None
-           ) -> list[DoorSighting]:
+           avoid: dict[int, list[tuple[float, float, float, float]]] | None = None,
+           size_filter: bool = True, shape: str = "") -> list[DoorSighting]:
     """Place every tag on the given sheets. Text only -- no rendering, no AI.
 
     `avoid` lists rectangles per page that must not be searched, in page points.
@@ -185,6 +187,32 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
     inch from the left edge, stepping evenly down the table -- and the audit
     reported that the schedule and the drawings agreed. It had only ever
     compared the schedule with itself.
+
+    `size_filter` is the calibrated font-size test, and the caller may turn it
+    off. It is a hard reject rather than a score, and one drawing shows why
+    that is a liability: on Austin OBGYN's A2.1 the door numbers are set at
+    three sizes in one plan -- glyphs 8.8, 13.4 and 18.9 points tall -- so any
+    single learned size is wrong for two thirds of them, and `_tag_size`
+    survives there only because the schedule's own numbers outvote the rest.
+
+    Where the caller has a stronger test than size -- the shape this set draws
+    its door marks in -- this one is redundant, and should not get a second,
+    quieter veto over the marks that test would have kept.
+
+    `shape` is that stronger test: the mark this set draws its door numbers in.
+    Given one, a number drawn in anything else is not a door and is not a
+    candidate, and the size test stands down in its favour.
+
+    It belongs here rather than downstream, and the reason is the one case the
+    whole test exists for. This function returns the best candidate *per page*,
+    so where a sheet prints the same number twice -- once in a circle at the
+    door, once bare in the middle of the room -- only one of the two ever
+    reaches the caller, chosen on a score that knows nothing about marks.
+    Filtering afterwards then cannot help: on Austin OBGYN's A2.1, door 113's
+    bare room number outscored its own circled door mark, so the sighting that
+    survived to be tested was already the wrong one, and testing it merely
+    threw the door away. Judged here, the circle is never in competition with
+    the room number in the first place.
     """
     per_tag: dict[str, list[Candidate]] = defaultdict(list)
 
@@ -201,7 +229,12 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
             log.info("door_locator: page %d, ignoring %d text items inside the "
                      "schedule's own %d table(s)", sheet.page,
                      before - len(items), len(blanked))
-        size = _tag_size(items, tags)
+        # A named mark stands the size test down on its own. Leaving the two
+        # to be turned off separately is a trap: the size filter runs first, so
+        # a caller who names the mark and forgets the other flag gets tags
+        # rejected on a size that was never reliable, before the test they
+        # actually asked for is ever reached.
+        size = _tag_size(items, tags) if (size_filter and not shape) else None
         counts = Counter(i.text.strip() for i in items)
 
         for item in items:
@@ -209,6 +242,10 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
             if text not in tags:
                 continue
             if size is not None and abs(item.size - size) > size * _SIZE_TOLERANCE:
+                continue
+            if shape and wall_tags.enclosure_shape(
+                    doc, sheet.page, item.cx, item.cy,
+                    item.y1 - item.y0) != shape:
                 continue
 
             candidate = Candidate(sheet.page, sheet.number,

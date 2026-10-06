@@ -309,6 +309,17 @@ async def plan_audit(
         "is reached and says how much of the drawing it did not read. "
         "Defaults to DETECT_BUDGET_USD.",
     ),
+    tag_shape: str = Query(
+        "",
+        pattern="^(circle|square|hexagon|diamond)?$",
+        description="The mark this set draws its door numbers in, as you see "
+        "it on the sheet. Optional, and worth more than any amount of "
+        "guessing: a plan numbers its rooms with the same numbers it gives "
+        "their doors, and the mark around them is the only thing that tells "
+        "the two apart. Name it and a number drawn in anything else is not "
+        "read as a door. Leave it empty and the convention is learned from the "
+        "drawing, which is right on most sets and lenient by design.",
+    ),
     _key: str = Depends(require_api_key),
 ) -> PlanAudit:
     """Set the schedule against the drawings.
@@ -323,7 +334,8 @@ async def plan_audit(
         try:
             result = await in_worker(
                 audit(path, detect=detect, dry_run=dry_run,
-                      budget_usd=budget_usd, **_supplied(schedule)))
+                      budget_usd=budget_usd, tag_shape=tag_shape,
+                      **_supplied(schedule)))
         except NotAPdfError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail="File is not a readable PDF.") from exc

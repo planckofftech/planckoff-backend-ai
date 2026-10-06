@@ -41,10 +41,18 @@ log = logging.getLogger(__name__)
 # (CCS A-006), "PARTITION KEY", "WALL PARTITION KEY".
 _LEGEND_CAPTION = re.compile(
     r"(WALL|PARTITION)\s*(TYPE|KEY|LEGEND|SCHEDULE|ASSEMBL)", re.I)
-# A symbol is a very short token: 1, 5, A, B, P1, 2A, A3.1. The trailing
+# A symbol is a very short token: 1, 5, A, B, P1, 2A, A3.1, PS1. The trailing
 # decimal matters -- AT&T names half its partitions A3.1, B2.1 and so on, and a
 # pattern without it read only part of that set's vocabulary.
-_SYMBOL = re.compile(r"^[0-9]{1,2}[A-Z]?(\.[0-9])?$|^[A-Z][0-9]{0,2}(\.[0-9])?$")
+#
+# Two letters, not one. Firms prefix the trade: Tsawout names its partitions
+# PS1, PS2 for partition-steel, and with one letter allowed its legend row
+# "92mm STEEL STUD - PARTITION WALL" sat beside a symbol nothing would match,
+# so the row was orphaned and the set read as having no wall types at all.
+# A bare two-letter token is admitted too, and that is safe here for the same
+# reason a bare one always was: a symbol earns its place only when the text
+# beside it states a build-up AND a size, which no ordinary word does.
+_SYMBOL = re.compile(r"^[0-9]{1,2}[A-Z]?(\.[0-9])?$|^[A-Z]{1,2}[0-9]{0,2}(\.[0-9])?$")
 # A legend row written as one line: "A1 _ 1" STUD WALL WITH 5/8" GYP EACH SIDE".
 #
 # Reading the row this way rather than pairing a symbol with whatever sits to
@@ -66,7 +74,15 @@ _BUILD_UP = re.compile(
 # are: 3-5/8" studs, 5/8" board, 8" CMU. Prose that merely mentions gypsum does
 # not, which is what let single letters like A, G and X into BMK's vocabulary
 # when materials alone were the test.
-_SIZED = re.compile(r"\d\s*[-/]?\s*\d*\s*/?\s*\d*\s*\"|\d+\s*(GA|GAUGE|MIL)\b",
+#
+# Metric counts as a size. Measured: Vancouver College writes its legend as
+# "150mm INS-2 rigid XPS insulation" and "concrete slab on 25mm sand", and
+# with inches as the only unit not one of that sheet's 81 build-up rows
+# carried a size -- so the set produced no vocabulary at all, and every one of
+# its located doors went unwalled. Tsawout reads the same way. A good part of
+# the corpus is Canadian, and an imperial-only rule discards it in silence.
+_SIZED = re.compile(r"\d\s*[-/]?\s*\d*\s*/?\s*\d*\s*\"|\d+\s*(GA|GAUGE|MIL)\b"
+                    r"|\d+\s*(MM|CM)\b",
                     re.I)
 # How far around a tag to look for the shape enclosing it, in glyph heights.
 _ENCLOSURE = 1.6
@@ -242,31 +258,45 @@ def legend_symbols(doc: PdfDoc,
     return types
 
 
-def _signature(doc: PdfDoc, page: int, x: float, y: float,
-               size: float) -> frozenset[int]:
-    """The shape drawn around a glyph, as the set of angles its edges run at.
+def _ring(doc: PdfDoc, page: int, x: float, y: float,
+          size: float) -> list[tuple[float, float, float, float]]:
+    """The segments of the mark drawn around a glyph, without the glyph itself.
+
+    Segments close to the glyph's centre are dropped: those are the strokes of
+    the character, not the ring around it.
+    """
+    reach = size * _ENCLOSURE
+    out: list[tuple[float, float, float, float]] = []
+    for x0, y0, x1, y1 in doc.segments(page - 1, within=(x - reach, y - reach,
+                                                         x + reach, y + reach)):
+        if math.hypot(x1 - x0, y1 - y0) < 0.5:
+            continue
+        near = max(math.hypot(x0 - x, y0 - y), math.hypot(x1 - x, y1 - y))
+        if near <= size * _OFF_GLYPH:
+            continue
+        out.append((x0, y0, x1, y1))
+    return out
+
+
+def _angles(ring: list[tuple[float, float, float, float]]) -> frozenset[int]:
+    """The set of angles a mark's edges run at.
 
     A diamond is four edges at 45 degrees and four at 135. A square is 0 and
     90. A hexagon is 0, 60 and 120. A circle, broken into short segments, is
     every angle there is. So the angles alone say which shape it is, without
     anyone having to name the shapes in advance.
-
-    Segments close to the glyph's centre are ignored: those are the strokes of
-    the character itself, not the ring around it.
     """
-    reach = size * _ENCLOSURE
     bins: Counter[int] = Counter()
-    for x0, y0, x1, y1 in doc.segments(page - 1, within=(x - reach, y - reach,
-                                                         x + reach, y + reach)):
-        dx, dy = x1 - x0, y1 - y0
-        if math.hypot(dx, dy) < 0.5:
-            continue
-        near = max(math.hypot(x0 - x, y0 - y), math.hypot(x1 - x, y1 - y))
-        if near <= size * _OFF_GLYPH:
-            continue
-        bins[round(math.degrees(math.atan2(dy, dx)) % 180 / _ANGLE_BIN)
-             * _ANGLE_BIN] += 1
+    for x0, y0, x1, y1 in ring:
+        bins[round(math.degrees(math.atan2(y1 - y0, x1 - x0)) % 180
+                   / _ANGLE_BIN) * _ANGLE_BIN] += 1
     return frozenset(angle for angle, count in bins.items() if count >= 2)
+
+
+def _signature(doc: PdfDoc, page: int, x: float, y: float,
+               size: float) -> frozenset[int]:
+    """The shape drawn around a glyph, as the set of angles its edges run at."""
+    return _angles(_ring(doc, page, x, y, size))
 
 
 # What a set of edge angles means, as a name a viewer can draw.
@@ -285,29 +315,70 @@ _NAMED_SHAPES = {
 _ROUND_ENOUGH = 6
 
 
-def enclosure_shape(doc: PdfDoc, page: int, x: float, y: float,
-                    size: float) -> str:
-    """The shape a number is drawn inside, named -- or "" if it is drawn bare.
+@dataclass(slots=True)
+class Enclosure:
+    """The mark drawn around a number, named and measured, in page points."""
 
-    A viewer wants to highlight the tag rather than box the door: the tag is
-    what a person looks for on a crowded plan and a far better thing to click
-    than a nine-point rectangle. Tracing the shape the drawing actually used
-    beats drawing a rectangle over a circle.
+    shape: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
 
-    Reuses `_signature`, which is what makes wall tags findable at all -- it
-    reads the angles of the edges around a glyph, so a hexagon is {0, 60, 120}
-    and nobody has to name the shapes in advance.
+    @property
+    def radius(self) -> float:
+        return (self.x1 - self.x0) / 2
 
-    Empty is a real answer and a common one: plenty of sets print door numbers
+
+def enclosure(doc: PdfDoc, page: int, x: float, y: float,
+              size: float) -> Enclosure | None:
+    """The mark a number is drawn inside, or None if it is drawn bare.
+
+    Both halves matter and only one of them used to be returned. The *name* is
+    what tells a door mark from a room number -- on one set the same number is
+    printed twice on one sheet, in a circle where it is the door and bare where
+    it is the room, and nothing but the circle separates them. The *extent* is
+    what a viewer draws: given the name alone it can only inscribe a circle in
+    the glyph's own box, which is smaller than the bubble and sits off-centre
+    inside it, so the drawn ring never lands on the ink.
+
+    The extent is taken as the median distance from the glyph's centre to the
+    mark's edges, rather than their bounding box. A leader line touching the
+    bubble, or a wall passing behind it, is in the window too and would stretch
+    a bounding box well past the mark; it cannot move a median. For a polygon
+    this is the circumradius, which is what a viewer needs to draw it.
+
+    None is a real answer and a common one: plenty of sets print door numbers
     as bare text against the wall, and saying so lets a viewer fall back to a
     plain highlight instead of tracing a shape that is not there.
     """
     if size <= 0:
-        return ""
-    angles = _signature(doc, page, x, y, size)
+        return None
+    ring = _ring(doc, page, x, y, size)
+    if not ring:
+        return None
+    angles = _angles(ring)
     if len(angles) >= _ROUND_ENOUGH:
-        return "circle"
-    return _NAMED_SHAPES.get(frozenset(angles), "")
+        shape = "circle"
+    else:
+        shape = _NAMED_SHAPES.get(frozenset(angles), "")
+    if not shape:
+        return None
+
+    reaches = sorted(math.hypot(px - x, py - y)
+                     for x0, y0, x1, y1 in ring
+                     for px, py in ((x0, y0), (x1, y1)))
+    radius = reaches[len(reaches) // 2]
+    if radius <= 0:
+        return None
+    return Enclosure(shape, x - radius, y - radius, x + radius, y + radius)
+
+
+def enclosure_shape(doc: PdfDoc, page: int, x: float, y: float,
+                    size: float) -> str:
+    """The shape a number is drawn inside, named -- or "" if it is drawn bare."""
+    found = enclosure(doc, page, x, y, size)
+    return found.shape if found else ""
 
 
 def tag_shape(doc: PdfDoc, page: int, vocabulary: set[str]) -> frozenset[int]:
