@@ -553,6 +553,80 @@ def _stored_rows(db, document_id: str) -> list[DoorRow]:
     return rows
 
 
+@router.get("/documents/{document_id}/download-url")
+async def document_download_url(
+    document_id: str,
+    part: str = Query(
+        "drawings",
+        pattern="^(drawings|source)$",
+        description="Which file. 'drawings' is the one a viewer wants and the "
+        "default: for a set that arrived as one PDF it is that PDF, and for a "
+        "set whose schedule and drawings came separately it is the drawings. "
+        "'source' is always the file the document was first read from.",
+    ),
+    seconds: int = Query(
+        0, ge=0, le=3600,
+        description="How long the link should last. Defaults to the same "
+        "window an upload link gets.",
+    ),
+    _key: str = Depends(require_api_key),
+):
+    """A link to the stored PDF itself, for a caller that needs the file back.
+
+    The bytes never pass through this service in either direction. The browser
+    PUTs a set straight to storage with a write-only link from `/uploads`, and
+    this is the same arrangement pointing the other way -- so a 400 MB set is
+    not pulled through the API to be pushed out again, and no credential
+    leaves here.
+
+    Worth being clear about what this recovers and what it does not. A re-read
+    never costs you the file: the object is named by content hash, so the same
+    bytes land on the same key and a revised set lands on a new one, leaving
+    the old object where it was. What does cost you the file is deleting the
+    document or its project, which removes the object -- and after that there
+    is nothing here to sign, which this reports as a 410 rather than handing
+    back a link to nothing.
+
+    The link grants whoever holds it read access to that one object until it
+    expires, so the window is deliberately short and the caller is expected to
+    fetch with it rather than store it.
+    """
+    if not files.available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="No file store configured.")
+    db = _db()
+    found = db.table("documents").select("*").eq("id", document_id).execute()
+    if not found.data:
+        raise HTTPException(status_code=404, detail="No such document.")
+    document = found.data[0]
+
+    key = (store.drawings_uri(document) if part == "drawings"
+           else document.get("source_uri"))
+    if not key:
+        raise HTTPException(
+            status_code=409,
+            detail="That set's file was not kept, so it cannot be handed back. "
+                   "Only sets uploaded through /uploads can be.")
+    if not files.exists(key):
+        raise HTTPException(
+            status_code=410,
+            detail="That set's file is no longer in storage. It was removed "
+                   "when the document or its project was deleted.")
+
+    ttl = seconds or get_settings().upload_url_ttl
+    url = await asyncio.to_thread(files.read_url, key, ttl)
+    log.info("db: signed a read link for document %s (%s, %ds)",
+             document_id, part, ttl)
+    return {
+        "document_id": document_id,
+        "part": part,
+        "filename": document.get("filename") or "set.pdf",
+        "size_bytes": document.get("size_bytes"),
+        "download_url": url,
+        "expires_in": ttl,
+    }
+
+
 @router.post("/documents/{document_id}/reread",
              status_code=status.HTTP_201_CREATED)
 async def reread_document(
