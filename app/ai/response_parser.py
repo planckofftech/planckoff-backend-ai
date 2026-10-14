@@ -11,6 +11,9 @@ import json
 import re
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
+# What a reader is told when only part of the table came back.
+_PARTIAL = ("Part of this schedule could not be read. Check the door count "
+            "against the drawing.")
 
 
 def _strip_fences(text: str) -> str:
@@ -106,7 +109,7 @@ def parse_table(content: str) -> tuple[list[str], list[list[str]], list[str]]:
     """
     warnings: list[str] = []
     if not content or not content.strip():
-        return [], [], ["model returned an empty response"]
+        return [], [], []
 
     text = _strip_fences(content)
 
@@ -126,21 +129,16 @@ def parse_table(content: str) -> tuple[list[str], list[list[str]], list[str]]:
             if not headers:
                 headers = list(objects[0].keys())
             rows = [[_cell(o, h) for h in headers] for o in objects]
-            warnings.append(
-                f"model response was truncated; salvaged {len(rows)} complete rows"
-            )
+            warnings.append(_PARTIAL)
             return headers, rows, warnings
 
         if len(arrays) >= 2:
-            warnings.append(
-                f"model response was truncated; salvaged {len(arrays) - 1} "
-                "complete rows"
-            )
+            warnings.append(_PARTIAL)
             return arrays[0], arrays[1:], warnings
-        return [], [], ["model response could not be parsed as JSON"]
+        return [], [], []
 
     if not isinstance(parsed, dict):
-        return [], [], ["model response was not a JSON object"]
+        return [], [], []
 
     headers = [str(h) for h in parsed.get("headers") or [] if h is not None]
     raw_rows = parsed.get("rows") or []
@@ -161,12 +159,10 @@ def parse_table(content: str) -> tuple[list[str], list[list[str]], list[str]]:
             padded += [""] * (len(headers) - len(padded))
             rows.append(padded[:len(headers)] if headers else padded)
 
-    if not headers:
-        warnings.append("model returned no column headers")
     if ragged:
         warnings.append(
-            f"{ragged} of {len(rows)} rows did not have one cell per column; "
-            "values in those rows may be shifted"
+            f"{ragged} of {len(rows)} rows may have values in the wrong column. "
+            "Check them against the drawing."
         )
     return headers, rows, warnings
 
@@ -249,9 +245,7 @@ def parse_rows(content: str) -> tuple[list[dict], list[str]]:
     except json.JSONDecodeError:
         rows = _salvage_objects(text)
         if rows:
-            warnings.append(
-                f"model response was not valid JSON; salvaged {len(rows)} complete rows"
-            )
+            warnings.append(_PARTIAL)
             # The envelope object, if it survived, is not a row.
             return [r for r in rows if any(k in r for k in
                                            ("door_tag", "from_space", "to_space"))], warnings
@@ -269,3 +263,40 @@ def parse_rows(content: str) -> tuple[list[dict], list[str]]:
         if any(k in parsed for k in ("door_tag", "from_space", "to_space")):
             return [parsed], warnings
     return [], ["model response had no recognizable rows array"]
+
+
+def parse_tables(content: str) -> list[tuple[str, list[str], list[list[str]],
+                                         tuple[float, float, float, float] | None,
+                                         list[str]]]:
+    """Every table in a reply, as (title, headers, rows, box, warnings).
+
+    The reader is asked for each door schedule on a sheet separately -- one
+    sheet carries three of them side by side, and read as one they came back
+    as a single 121-row table in a single box around all three. A reply in the
+    older one-table shape is still understood, and a reply cut off at the
+    token limit falls back to the one-table salvage: the rows that closed are
+    kept, in one table, rather than losing the call.
+    """
+    text = _strip_fences(content or "")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("tables"), list):
+        out = []
+        for table in parsed["tables"]:
+            if not isinstance(table, dict):
+                continue
+            piece = json.dumps(table)
+            headers, rows, warnings = parse_table(piece)
+            if headers and rows:
+                out.append((str(table.get("title") or "").strip(), headers, rows,
+                            parse_box(piece), warnings))
+        return out
+
+    headers, rows, warnings = parse_table(content or "")
+    if not headers or not rows:
+        return []
+    title = str(parsed.get("title") or "").strip() if isinstance(parsed, dict) else ""
+    return [(title, headers, rows, parse_box(content or ""), warnings)]

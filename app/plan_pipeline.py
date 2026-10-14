@@ -31,7 +31,6 @@ from app.core import (
     swing_finder,
 )
 from app.core.door_locator import DoorSighting, locate
-from app.core.extractor import extract_pages
 from app.core.pdf_doc import PdfDoc
 from app.schemas import (
     DetectedDoorOut,
@@ -68,9 +67,6 @@ _PAIR_OPENING = 1.5
 # So one leaf sits in the gap: past it, the arc belongs to somebody else,
 # and drawing this door on it is worse than leaving it unmeasured.
 _TAG_REACH = 1.0
-# What a caption has to say for a table to be the door schedule rather than
-# one of the other schedules a drawing set carries.
-_DOOR_WORDS = ("DOOR", "OPENING", "LEAF")
 _DRY_RUN: ContextVar[bool] = ContextVar("plan_audit_dry_run", default=False)
 
 _COVERAGE_NOTE = (
@@ -173,29 +169,23 @@ def _sheets_worth_scanning(plans, tags_on: dict[int, set[str]]):
 
 
 def _read_schedule(doc: PdfDoc, sheets, pages_scanned: int):
-    """The door schedule, going straight to its sheet when the set names one.
+    """The door schedule, found the same way the schedule read finds it.
 
-    The sheet list already says `A7.10 - DOOR SCHEDULE`. Scoring all 187 pages
-    to rediscover that costs twelve seconds and can still land on the hardware
-    matrix printed beside it. So try the named sheets first, and only fall back
-    to searching when the set does not name one -- which happens: one project
-    prints its schedule on the floor plan sheet, with no title of its own.
+    This audit used to carry its own rules for picking the schedule, and two
+    sets of rules for one question give two answers. It asks `detect` now --
+    the sheet index first, every table weighed -- so a schedule the read
+    accepts is the schedule the audit sets against the plans, and one it
+    rejects is rejected here too.
+
+    `sheets` is no longer needed for this; it is kept for the caller.
     """
-    named = plan_index.schedule_sheets(sheets)
-    if named:
-        pages = [page_finder.score_page(doc.text_items(s.page - 1), s.page)
-                 for s in named]
-        found = [e for e in extract_pages(doc, pages) if e.rows]
-        if found:
-            return _every_door(found)
-        log.info("plan_audit: the named schedule sheets held no readable "
-                 "table; searching every page instead")
+    from app.pipeline import detect
 
-    candidates = page_finder.passing(page_finder.find_schedule_pages(doc))
-    extractions = [e for e in extract_pages(doc, candidates) if e.rows]
-    if not extractions:
+    located = detect(doc)
+    tables = [e for _, e in (located.found or located.unsure)]
+    if not tables:
         raise NoDoorScheduleError(pages_scanned)
-    return _every_door(extractions)
+    return _every_door(tables)
 
 
 def _schedule_table(doc: PdfDoc, page: int
@@ -252,27 +242,15 @@ def _schedule_table(doc: PdfDoc, page: int
 
 
 def _every_door(found: list) -> tuple[list[DoorRow], int]:
-    """All the doors the sheet schedules, not the biggest table's doors.
+    """All the doors the set schedules, not the biggest table's doors.
 
     One sheet can carry a schedule in two halves printed side by side -- doors
     101-117 on the left, 118-126 on the right. Auditing the winner alone left
     ten of that project's twenty-five doors never looked for on the drawings,
-    and nothing said so.
-
-    Every table whose caption says it is about doors counts, whatever its size.
-    Keeping only those tying the best score is not the same thing and was wrong
-    for exactly the case this exists for: the two halves of one schedule differ
-    in row count, so the smaller half scored lower and was dropped again.
-
-    When nothing says "door" -- a schedule printed with no caption at all --
-    the single most door-like table is read rather than everything on the page,
-    because at that point there is nothing to tell a door schedule apart from
-    the window schedule beside it.
+    and nothing said so. Every table here has already been judged to be a door
+    schedule, so every one counts; a door number met twice is counted once.
     """
-    said_so = [e for e in found
-               if any(w in (e.title or "").upper() for w in _DOOR_WORDS)]
-    doors = said_so or [max(found, key=_door_schedule_score)]
-
+    doors = sorted(found, key=lambda e: e.page)
     rows: list[DoorRow] = []
     seen: set[str] = set()
     for extraction in doors:
@@ -284,26 +262,9 @@ def _every_door(found: list) -> tuple[list[DoorRow], int]:
             rows.append(row)
 
     page = doors[0].page
-    log.info("plan_audit read %d schedule(s) on page %d: %d doors",
+    log.info("plan_audit read %d schedule(s) from page %d: %d doors",
              len(doors), page, len(rows))
     return rows, page
-
-
-def _door_schedule_score(extraction) -> tuple[int, int, int]:
-    """How much this table looks like *the* door schedule.
-
-    Taking the biggest table was the obvious rule and it is wrong. A drawing set
-    carries schedules for everything -- one 164-page set briefly produced a
-    107-row table of heat pumps (`B-HP-1`, `B-HP-2`...) beside its 40-row door
-    schedule, and the heat pumps won on size alone.
-
-    So: a table whose caption says DOOR outranks any number of rows, then how
-    much of it we could actually understand as door columns, and only then size.
-    """
-    title = (extraction.title or "").upper()
-    says_door = any(word in title for word in _DOOR_WORDS)
-    fields = len({f for f in extraction.mapped if f})
-    return (1 if says_door else 0, fields, len(extraction.rows))
 
 
 def _fraction(location, width: float, height: float) -> DoorLocation:

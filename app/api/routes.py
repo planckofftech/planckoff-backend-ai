@@ -24,8 +24,8 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from app import __version__
-from app.ai.client import AiUpstreamError
-from app.api.deps import require_api_key
+from app.ai.client import AiUnavailableError, AiUpstreamError
+from app.api.deps import parse_pages, require_api_key
 from app.api.offload import in_worker
 from app.config import get_settings
 from app.core.pdf_doc import NotAPdfError, PdfDoc
@@ -184,20 +184,28 @@ async def extract_door_schedule(
     file: UploadFile = File(..., description="Construction PDF (multipart)"),
     debug: bool = Query(False, description="Include per-page finder diagnostics"),
     allow_ai: bool = Query(True, description="Permit the vision fallback tier"),
+    ai_read: bool = Query(False, description="Read the door schedule with the "
+                          "image reader, as asked -- not only as a fallback"),
+    pages: str | None = Query(None, description="Pages to read with ai_read, e.g. 29 or 136,137. Leave out to read the door schedule sheets found in the set."),
     _key: str = Depends(require_api_key),
 ) -> ExtractionResult:
     started = time.perf_counter()
+    asked = parse_pages(pages)
     async with _spooled_upload(file) as path:
         size_mb = path.stat().st_size / 1024 / 1024
         try:
             result = await in_worker(
-                extract(path, allow_ai=allow_ai, debug=debug))
+                extract(path, allow_ai=allow_ai, debug=debug,
+                        ai_read=ai_read, pages=asked))
         except NotAPdfError as exc:
             log.warning("rejected upload: %s", exc)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail="File is not a readable PDF.") from exc
         except (NoScheduleFoundError, NoRowsError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AiUnavailableError as exc:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=str(exc)) from exc
         except AiUpstreamError as exc:
             # A billing or auth failure upstream must never read as "no rows
             # found". Log it too: the caller sees the detail, but whoever is

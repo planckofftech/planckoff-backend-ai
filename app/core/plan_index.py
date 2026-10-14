@@ -189,8 +189,6 @@ _NOT_A_TITLE = ("KEYNOTE", "LEGEND", "SYMBOLS", "GENERAL NOTES", "NOTES:",
 # Below this many usable outline entries the outline is a cover-page list, not
 # a per-sheet index, and reading the pages is the honest fallback.
 _MIN_BOOKMARKS = 5
-# What a sheet title says when it carries a door schedule.
-_DOOR_WORDS = ("DOOR", "OPENING", "LEAF")
 
 
 @dataclass(slots=True)
@@ -519,29 +517,6 @@ def other_architectural(sheets: list[PlanSheet],
         if s.is_architectural and s.page not in seen
         and "SCHEDULE" not in s.title.upper()
     ]
-
-
-def schedule_sheets(sheets: list[PlanSheet]) -> list[PlanSheet]:
-    """Architectural sheets whose own title says they carry a door schedule.
-
-    The point is to stop searching. Scoring every page of a 187-page set to
-    find the door schedule takes twelve seconds and can still land on the
-    hardware matrix beside it; the sheet list already says `A7.10 - DOOR
-    SCHEDULE`, so go straight there.
-
-    A door/window schedule counts -- several sets combine the two -- and so
-    does a hardware schedule sharing the sheet, because the extractor tells
-    those apart once it is on the page.
-    """
-    found = [
-        s for s in sheets
-        if s.is_architectural
-        and "SCHEDULE" in s.title.upper()
-        and any(word in s.title.upper() for word in _DOOR_WORDS)
-    ]
-    log.info("plan_index schedule sheets: %s",
-             [f"p{s.page} {s.number}" for s in found] or "none named")
-    return found
 
 
 def floor_plans(sheets: list[PlanSheet]) -> list[PlanSheet]:

@@ -101,6 +101,19 @@ def find_document(project_id: str, sha256: str) -> dict[str, Any] | None:
     return found.data[0] if found.data else None
 
 
+def is_current(document: dict[str, Any]) -> bool:
+    """Was this stored reading made by the reader running now?
+
+    A database that predates db/018 has no such column at all; there nothing
+    can be told, and a stored reading is reused as it always was.
+    """
+    from app.pipeline import READER_VERSION
+
+    if "reader_version" not in document:
+        return True
+    return document.get("reader_version") == READER_VERSION
+
+
 def stored_pdf(document_id: str) -> dict[str, Any] | None:
     """Where a document's original drawing set lives, if it is still on file.
 
@@ -211,6 +224,19 @@ def _upsert_document(org_id: str, project_id: str, *, sha256: str,
         "revision": revision,
         "source_uri": source_uri,
     }
+    from app.pipeline import READER_VERSION
+
+    # Recorded where the column exists (db/018); a database without it yet
+    # stores the reading exactly as before rather than failing to store it.
+    versioned = {**row, "reader_version": READER_VERSION}
+    try:
+        if existing:
+            db.table("documents").update(versioned).eq("id", existing["id"]).execute()
+            return existing["id"]
+        return db.table("documents").insert(versioned).execute().data[0]["id"]
+    except Exception as exc:  # noqa: BLE001 - only the missing column is expected
+        if "reader_version" not in str(exc):
+            raise
     if existing:
         db.table("documents").update(row).eq("id", existing["id"]).execute()
         return existing["id"]

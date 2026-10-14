@@ -162,10 +162,12 @@ class PageExtraction:
     # came from rather than the page's strongest-looking table.
     bounds: tuple[float, float, float, float] | None = None
     page_size: tuple[float, float] | None = None
+    # No column was headed as the door number; one was chosen from the data.
+    tag_guessed: bool = False
 
 
-def _to_feet(values: dict[str, str]) -> int:
-    """Rewrite this row's metric sizes as feet and inches, in place.
+def _metric_columns(columns: list[list[str]], mapped: list[str | None]) -> set[int]:
+    """The columns whose values are metric sizes, to be rewritten in feet.
 
     Sets outside the US state their doors in millimetres -- 914 mm, 2032 mm,
     44 mm. An estimator pricing in feet cannot read that, and neither can the
@@ -173,22 +175,28 @@ def _to_feet(values: dict[str, str]) -> int:
     drawing: `parse_feet` returns None for every one of them, so a metric set
     got no measured width and no double-door box.
 
-    Applied to every cell that is a metric size and nothing else, rather than
-    to named columns. A schedule in millimetres is in millimetres throughout --
-    width, height, thickness, undercut -- and half of those columns have no
-    canonical field, so naming them would convert some and leave the rest.
-    A cell reading "SEE DETAIL" or "1 3/4\"" is untouched.
+    Decided per column, by what the column holds, never per cell. Converting
+    any cell that happened to parse as a size turned door 207M into
+    679' - 1 5/8" -- "207 metres" -- on a schedule printed entirely in feet:
+    one mark among 207A to 207Q, and it no longer matched the plan. A column of
+    sizes is sizes almost throughout; one stray look-alike in a column of
+    marks is a mark.
 
-    Returns how many cells were converted, so the caller can say the schedule
-    was metric instead of quietly handing over feet the drawing never printed.
+    Not decided by named field either. A schedule in millimetres is in
+    millimetres throughout -- width, height, thickness, undercut -- and half of
+    those columns have no canonical field, so naming them would convert some
+    and leave the rest. The door number is the one exception: it identifies
+    the door and is never a size, whatever it looks like.
     """
-    converted = 0
-    for key, text in values.items():
-        as_feet = dimensions.to_feet_inches(text)
-        if as_feet is not None:
-            values[key] = as_feet
-            converted += 1
-    return converted
+    metric: set[int] = set()
+    for index, cells in enumerate(columns):
+        if index < len(mapped) and mapped[index] == "door_tag":
+            continue
+        filled = [c for c in cells if c.strip()]
+        sizes = sum(1 for c in filled if dimensions.is_metric(c))
+        if sizes and sizes * 2 > len(filled):
+            metric.add(index)
+    return metric
 
 
 def _is_noise(cells: list[str], tag_col: int) -> bool:
@@ -269,24 +277,19 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
                for i in range(len(header_strings))]
     before = list(mapped)
     mapped = header_mapper.infer_tag_column(mapped, columns, header_strings)
-    if mapped != before:
+    tag_guessed = mapped != before
+    if tag_guessed:
         claimed = header_strings[mapped.index("door_tag")]
-        warnings.append(
-            f"no column named the door tag; read it from the data in {claimed!r}"
-        )
         unmapped = [h for h in unmapped if h != claimed]
     tag_col = header_mapper.tag_column_index(mapped)
 
-    if unmapped:
-        warnings.append(
-            f"unmapped column headers kept under 'extra': {', '.join(unmapped)}"
-        )
 
     rows: list[DoorRow] = []
     # How many cells were written in millimetres. Counted so the caller is told
     # the schedule was metric, rather than silently handed feet the drawing
     # never printed.
     metric = 0
+    in_metres = _metric_columns(columns, mapped)
     # The storey a band announced, carried down until the next one announces
     # another. That is what the band is for: every door under "LEVEL 08" is on
     # level 8, and the rows themselves never say so.
@@ -308,6 +311,11 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         # every row in it.
         for idx, field in enumerate(mapped):
             text = cells[idx] if idx < len(cells) else ""
+            if idx in in_metres:
+                as_feet = dimensions.to_feet_inches(text)
+                if as_feet is not None:
+                    text = as_feet
+                    metric += 1
             if field:
                 values[field] = _join_split_mark(text) if field == "door_tag" \
                     else text
@@ -317,16 +325,14 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         if _is_heading_row(values.get("door_tag", "")):
             continue
         _split_run_on_tag(values)
-        metric += _to_feet(values) + _to_feet(extra)
         rows.append(DoorRow(**values, level=band, extra=extra))
 
     if metric:
         # No total: only the largest table's warnings reach the caller, so a
         # count here would be one table's and read as the document's.
         warnings.append(
-            "This schedule states its sizes in millimetres. They have been "
-            "converted to feet and inches, rounded to the nearest eighth of "
-            "an inch."
+            "This schedule gives its sizes in millimetres. They are shown in "
+            "feet and inches."
         )
 
     # A mark carrying a character no font could have meant. One sheet's embedded
@@ -346,7 +352,7 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
 
     return PageExtraction(candidate.page, method, header_strings, rows, warnings,
                           unmapped, candidate, title, mapped, bounds,
-                          doc.page_size(page_index))
+                          doc.page_size(page_index), tag_guessed)
 
 
 # A door mark printed as a number and a letter with air between them. Real
@@ -528,17 +534,11 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
                 continue
 
             if is_other_schedule(extraction.title):
-                log.info("skipping %r on page %s (%s rows): another schedule",
-                         extraction.title, extraction.page, len(extraction.rows))
                 skipped.append(extraction)
                 continue
 
             if not looks_like_a_schedule(extraction.mapped, extraction.headers,
                                          extraction.rows):
-                log.info("skipping block on page %s at y=%.0f (%s rows, %s fields "
-                         "understood): does not behave like a schedule",
-                         extraction.page, band.header_y, len(extraction.rows),
-                         len({f for f in extraction.mapped if f}))
                 rejected.append(extraction)
                 continue
             out.append(extraction)
@@ -551,8 +551,7 @@ def extract_pages(doc: PdfDoc, candidates: list[PageCandidate]) -> list[PageExtr
         best = max(rejected, key=lambda e: (len({f for f in e.mapped if f}),
                                             len(e.rows)))
         best.warnings.append(
-            "only a few columns on this table could be identified; check the "
-            "rows against the drawing"
+            "Check these rows against the drawing before pricing."
         )
         out.append(best)
 
