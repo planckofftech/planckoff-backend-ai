@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+from urllib.parse import unquote
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -56,19 +57,16 @@ _TITLE_SPANS = 12
 # CR is why this exists at all. A clean-room package numbers its sheets CR1.00,
 # and reading only the first letter called that Civil and threw away four floor
 # plans -- with them, nineteen doors that were printed nowhere else.
+# Disciplines that draw and schedule doors, by the first letter of the sheet
+# number (US National CAD Standard): A architectural, I interiors.
+_DRAWS_DOORS = frozenset("AI")
+# Outside the standard, kept by name.
 _ARCHITECTURAL = frozenset({
-    "A",     # the architectural set
-    "AD",    # addendum / demolition, depending on the firm
-    "AS",    # architectural site
-    "AI",    # architectural interiors
-    "ID",    # interior design
-    "IN",    # interiors
-    "I",     # interiors again, single letter. A tenant improvement is often
-             # drawn entirely by an interiors team: St. Louis PPG numbers all
-             # 66 of its sheets I0-.. to I7-.., including "FLOOR PLAN - LEVEL 1"
-             # and "- LEVEL 2", and without this every one of them was rejected
-             # before its title was read.
-    "CR",    # clean room -- its own package, with its own doors
+    "CR",    # clean room -- its own package, with its own doors. Its first
+             # letter reads as civil, and BMK lost nineteen doors to that.
+})
+_NOT_ARCHITECTURAL = frozenset({
+    "AV",    # audio-visual: an A that is not the architect's
 })
 # A sheet that draws doors in plan view says so in its own title.
 _PLAN_WORDS = ("FLOOR PLAN", "ROOF PLAN", "SITE PLAN", "LEVEL", "PLAN")
@@ -210,7 +208,24 @@ class PlanSheet:
 
     @property
     def is_architectural(self) -> bool:
-        return self.discipline in _ARCHITECTURAL
+        """Is this sheet the architect's or the interiors team's?
+
+        By the US National CAD Standard: the first letter of a sheet number is
+        the discipline and any second letter only qualifies it -- AD is
+        architectural demolition, AS architectural site, IA interiors
+        architectural. A and I are the disciplines that draw and schedule
+        doors. Still an allowlist, so a sheet whose number could not be read
+        is skipped rather than scanned.
+
+        The prefixes used to be listed one by one, and every new numbering
+        scheme fell outside the list: a church renovation numbered its whole
+        architectural set IA0.00 to IA10.11, and its floor plans were all
+        rejected before their titles were read.
+        """
+        discipline = self.discipline
+        if discipline in _NOT_ARCHITECTURAL:
+            return False
+        return discipline[:1] in _DRAWS_DOORS or discipline in _ARCHITECTURAL
 
     @property
     def level(self) -> str:
@@ -293,15 +308,15 @@ class PlanSheet:
         # Narrow on purpose -- it lets a ceiling through and nothing else. A
         # demolition or roof plan that also says FLOOR PLAN is still rejected,
         # because those are about a different set of doors or none at all.
-        both = any(word in title for word in _IS_THE_FLOOR)
+        both = _is_the_floor(title)
         for word in _NOT_A_FLOOR_PLAN:
-            if word in title and not (both and word in _SHARES_THE_SHEET):
+            if _says(title, word) and not (both and word in _SHARES_THE_SHEET):
                 return False
-        if any(word in title for word in _ONE_PART_OF_IT):
+        if any(_says(title, word) for word in _ONE_PART_OF_IT):
             return False
-        if any(word in title for word in _IS_THE_FLOOR):
+        if both:
             return True
-        return not any(word in title for word in _ANOTHER_SUBJECT)
+        return not any(_says(title, word) for word in _ANOTHER_SUBJECT)
 
 
 # Where a title block lives, as a fraction of the sheet: the right-hand strip
@@ -316,6 +331,27 @@ _TITLE_STRIPS = ((0.74, 0.55, 1.0, 1.0), (0.0, 0.82, 1.0, 1.0))
 # set is normally a dozen architectural sheets; a document that needs more than
 # this is not one we should be reading a title block at a time.
 _MAX_OCR_PAGES = 40
+
+
+def _says(title: str, word: str) -> bool:
+    """`word` in `title` as a whole word or phrase, not inside another word.
+
+    Matched as a fragment, SITE was found in COMPOSITE, and "COMPOSITE FLOOR
+    PLAN - LEVEL 1" was thrown out as a site plan -- one church set lost both
+    of its floor plans to it.
+    """
+    # A plural is the same word: KEYNOTES is a keynote block, PLANS are plans.
+    return re.search(rf"(?<![A-Z]){re.escape(word)}S?(?![A-Z])", title) is not None
+
+
+# The floor plan drawn together with another one: "FLOOR & LIGHTING PLAN",
+# "FLOOR AND CEILING PLAN", "FLOOR/FINISH PLAN", "FLOOR + FURNITURE PLAN".
+_FLOOR_WITH = re.compile(r"(?<![A-Z])FLOOR\s*(?:&|\+|/|AND)")
+
+
+def _is_the_floor(title: str) -> bool:
+    return (any(_says(title, word) for word in _IS_THE_FLOOR)
+            or _FLOOR_WITH.search(title) is not None)
 
 
 def _ocr_title_block(doc: PdfDoc, page: int) -> list[str]:
@@ -456,8 +492,9 @@ def from_bookmarks(doc: PdfDoc) -> list[PlanSheet]:
     for title, page in doc.bookmarks():
         match = _BOOKMARK.match(title)
         if match:
+            # Some outlines arrive URL-encoded: "FLOOR%2FFINISH PLAN".
             entries.append((match.group("number").upper(),
-                            match.group("title").strip(), page))
+                            unquote(match.group("title")).strip(), page))
     if not entries:
         return []
 
