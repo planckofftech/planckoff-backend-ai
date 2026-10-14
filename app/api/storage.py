@@ -27,14 +27,14 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
-from app.api.deps import Caller, require_api_key, require_caller
+from app.api.deps import Caller, parse_pages, require_api_key, require_caller
 from app.config import get_settings
 from app.api.offload import in_worker
 from app.core.pdf_doc import NotAPdfError
 from app.db import files, store
 from app.db.store import _insert as _insert_rows
 from app.db.client import NoDatabase, client
-from app.ai.client import AiUpstreamError
+from app.ai.client import AiUnavailableError, AiUpstreamError
 from app.pipeline import NoRowsError, NoScheduleFoundError, extract
 from app.plan_pipeline import audit
 from app.schemas import DoorRow
@@ -227,7 +227,8 @@ async def add_uploaded_document(
     sha256 = Path(body.key).stem
     if reuse:
         found = store.find_document(project_id, sha256)
-        if found:
+        # Reused only if today's reader made it; an older reading is read again.
+        if found and store.is_current(found):
             return {"document_id": found["id"], "reused": True,
                     "filename": found["filename"]}
 
@@ -243,12 +244,17 @@ async def add_uploaded_document(
 
 async def _read_and_store(project_id: str, path, *, filename: str,
                           sha256: str, size_bytes: int, revision: str | None,
-                          source_uri: str | None, plans: bool, allow_ai: bool):
+                          source_uri: str | None, plans: bool, allow_ai: bool,
+                          ai_read: bool = False, pages: list[int] | None = None):
     """Extract, store, then audit -- shared by both ways a file arrives."""
     try:
-        result = await in_worker(extract(path, allow_ai=allow_ai))
+        result = await in_worker(extract(path, allow_ai=allow_ai,
+                                         ai_read=ai_read, pages=pages))
     except (NotAPdfError, NoScheduleFoundError, NoRowsError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AiUnavailableError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=str(exc)) from exc
     except AiUpstreamError as exc:
         # The same answer the multipart route has always given. This one did
         # not, and a revoked OpenRouter key therefore reached the browser as a
@@ -322,7 +328,9 @@ async def add_document(
 
         if reuse:
             found = store.find_document(project_id, sha256)
-            if found:
+            # Reused only if today's reader made it; an older reading is read
+            # again, keeping everything a person put there.
+            if found and store.is_current(found):
                 log.info("db: %s is already in this project; not re-reading",
                          file.filename)
                 return {"document_id": found["id"], "reused": True,
@@ -633,6 +641,9 @@ async def reread_document(
     document_id: str,
     plans: bool = Query(True, description="Also locate the doors on the plans"),
     allow_ai: bool = Query(True, description="Permit the vision fallback tier"),
+    ai_read: bool = Query(False, description="Read the door schedule with the "
+                          "image reader, as asked -- not only as a fallback"),
+    pages: str | None = Query(None, description="Pages to read with ai_read, e.g. 29 or 136,137. Leave out to read the door schedule sheets found in the set."),
     _key: str = Depends(require_api_key),
 ):
     """Read a stored set again, from the file we already hold.
@@ -671,7 +682,8 @@ async def reread_document(
             filename=found.get("filename") or "set.pdf",
             sha256=found.get("sha256") or Path(key).stem,
             size_bytes=found.get("size_bytes") or files.size_of(key),
-            revision=None, source_uri=key, plans=plans, allow_ai=allow_ai)
+            revision=None, source_uri=key, plans=plans, allow_ai=allow_ai,
+            ai_read=ai_read, pages=parse_pages(pages))
     finally:
         files.discard(path)
 

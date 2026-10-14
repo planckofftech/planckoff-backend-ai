@@ -363,8 +363,20 @@ def _ruled_grid(headers: list[TextItem], items: list[TextItem],
     # table and nothing but the table. Only ever consulted where the header run
     # failed to produce an edge at all, so no sheet this already understood can
     # be changed by it.
+    #
+    # The same holds where the header run did produce edges but they are
+    # someone else's. Two schedules printed side by side share a header
+    # baseline, and the run walks from one into the other: on one sheet the
+    # EXTERIOR schedule's grid began at the left edge of the UNITS schedule
+    # beside it, 900 points away. Its rows were then cut by rules belonging to
+    # neither table and came back as eight rows of run-together door numbers
+    # -- "100 100A 103A 103B 103C" -- out of twenty-five. Where the header run
+    # reaches more than a column beyond the table's own row rules, it has left
+    # the table, and the row rules are the table.
+    overreach = usable and (hdr_x0 < span[0] - _MAX_COL_GAP
+                            or hdr_x1 > span[1] + _MAX_COL_GAP)
     if usable and (left is None or right is None
-                   or span[0] <= hdr_x0 + _MAX_COL_GAP):
+                   or span[0] <= hdr_x0 + _MAX_COL_GAP or overreach):
         left, right = span
     if left is None or right is None or right - left < 100:
         return None
@@ -465,8 +477,6 @@ def _banded_grid(headers: list[TextItem], items: list[TextItem],
         return TableGrid(
             "banded", bounds[0], bounds[-1], min(h.y0 for h in headers), hdr_y1,
             _dedupe(bounds, 1.0),
-            warnings=["column bands inferred from header centres; "
-                      "left-aligned data columns were not detectable"],
         )
 
     left = starts[0] - 3.0
@@ -756,9 +766,6 @@ def locate_table(items: list[TextItem], rulings: Rulings, header_y: float,
         _trim_to_tagged_rows(grid, items, tag_x)
         return grid, headers
     grid = _banded_grid(headers, items, header_y)
-    grid.warnings.append(
-        "no table rulings found; columns inferred from text alignment"
-    )
     return grid, headers
 
 

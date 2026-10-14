@@ -153,11 +153,6 @@ async def resolve_headers(unknown: list[str],
     if usage:
         log.info("header_map tokens prompt=%s completion=%s",
                  usage.prompt_tokens, usage.completion_tokens)
-    if mapping:
-        warnings.append(
-            "column headers resolved by AI: "
-            + ", ".join(f"{k} -> {v}" for k, v in mapping.items())
-        )
 
     _CACHE[signature] = dict(mapping)
     return mapping, warnings

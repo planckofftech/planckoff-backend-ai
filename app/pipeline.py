@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from app.ai.client import AiUpstreamError
+from app.ai.client import AiUnavailableError, AiUpstreamError
 from app.config import get_settings
-from app.core import header_mapper, page_finder
-from app.core.extractor import PageExtraction, extract_page, extract_pages
+from app.core import header_mapper, page_finder, schedule_judge
+from app.core.extractor import (PageExtraction, extract_page, extract_pages,
+                                is_other_schedule)
 from app.core.pdf_doc import PdfDoc
 from app.schemas import (
     DoorRow,
@@ -49,6 +51,13 @@ def _table_box(extraction) -> TableBox | None:
                     x0=x0 / width, y0=y0 / height,
                     x1=x1 / width, y1=y1 / height)
 
+# Which reader produced a stored reading. Raise it whenever a change means a
+# set read before it would come out differently -- a stored reading is reused
+# for a repeat upload only when it was made by this version (db/018).
+#   2: tables found by the weighed judge and the cover-sheet index, a box
+#      per table, every schedule on an image-read page read on its own.
+READER_VERSION = 2
+
 # Below this page count it is cheap enough to let the AI look at the best-
 # scoring page even though no page passed the structural gates.
 _SMALL_DOC_PAGES = 20
@@ -62,6 +71,10 @@ _MIN_REAL_COLUMNS = 5
 _MIN_FILL_RATIO = 0.30
 # Never render more than this many pages to the model, whatever the page count.
 _MAX_AI_PAGES = 2
+# ...and when a person asks for the image read themselves. Higher, because
+# they chose to spend it, but still a ceiling: a schedule spread over more
+# sheets than this is read a few sheets at a time.
+_MAX_ASKED_AI_PAGES = 4
 
 
 # A ruling this long, as a fraction of the page, is a table rule or a wall --
@@ -153,31 +166,6 @@ def select_fallback_pages(doc: PdfDoc, scores: list, pages_scanned: int) -> list
     return [c.page for c in ranked[:_MAX_AI_PAGES]]
 
 
-# What a door schedule has that a lighting, finish or equipment schedule does
-# not. A door number alone is too weak -- every schedule has a first column of
-# marks -- so the test is the number *and* something dimensional beside it.
-_DOOR_COLUMNS = ("door_width", "door_height", "door_type", "door_material",
-                 "frame_material", "frame_finish", "fire_rating", "hw_set",
-                 "threshold")
-
-
-def _is_a_door_schedule(rows: list[DoorRow]) -> bool:
-    """Do these rows describe doors, or some other schedule on the same sheet?
-
-    A drawing set is full of schedules -- lighting, finish, equipment, plumbing
-    fixtures -- and they are laid out identically. Nothing about the shape of a
-    table says which one it is; what says it is whether the columns are about
-    doors. When they are not, every value lands in `extra` and the door fields
-    stay empty, which is a clear answer as long as somebody asks the question.
-    """
-    if not rows:
-        return False
-    filled = {field for row in rows for field in _DOOR_COLUMNS
-              if getattr(row, field, "")}
-    tagged = sum(1 for row in rows if row.door_tag)
-    return bool(filled) and tagged >= max(1, len(rows) // 2)
-
-
 def _is_thin(extraction: PageExtraction) -> str | None:
     """Why this deterministic read looks incomplete, or None if it looks fine.
 
@@ -231,6 +219,267 @@ def _column_samples(extractions: list[PageExtraction], headers: list[str],
             _ = values
 
     return {k: v for k, v in samples.items() if v}
+
+
+def _index_door_pages(doc: PdfDoc) -> tuple[dict[int, str], list[str]]:
+    """Pages the set's own lists point at for the door schedule, how strongly,
+    and the door schedule sheets the cover index lists that are not in the file.
+
+    The index is where an estimator looks first, and it is right far more
+    often than any reading of the page: the sheet titled A6-001 SCHEDULE DOOR
+    held a seven-door schedule that the eight-door gate threw away, and the
+    index had named it all along.
+
+    Two lists, cross-checked. The drawing index on the cover sheet is the
+    architect's own; each sheet it lists is placed only where that page's
+    title block carries the same number. The PDF's bookmarks -- or, with no
+    cover index, every page's title block -- say the same thing a second way.
+    """
+    from app.core import drawing_index, plan_index
+
+    pages: dict[int, str] = {}
+    missing: list[str] = []
+    try:
+        entries = drawing_index.read_entries(doc)
+        wanted = [e for e in entries
+                  if schedule_judge.says_door_schedule(e.title)
+                  or schedule_judge.is_schedules_sheet(e.number, e.title)]
+        drawing_index.locate(doc, entries, wanted)
+        for e in wanted:
+            named = schedule_judge.says_door_schedule(e.title)
+            if e.page:
+                pages[e.page] = (schedule_judge.NAMED if named
+                                 else schedule_judge.SCHEDULES)
+            elif named:
+                missing.append(f"{e.number} {e.title}")
+
+        # Reading every page's title block is slow and is what the cover
+        # index saves; the bookmarks cost nothing and are read either way.
+        sheets = (plan_index.from_bookmarks(doc) if entries
+                  else plan_index.index_sheets(doc))
+        for page, level in schedule_judge.door_sheet_pages(sheets).items():
+            if pages.get(page) != schedule_judge.NAMED:
+                pages[page] = level
+    except Exception as exc:  # noqa: BLE001 - the index helps; it is not a gate
+        log.info("sheet index unreadable: %s", exc)
+    return dict(sorted(pages.items())), missing
+
+
+def _judged(doc: PdfDoc, candidates: list, door_pages: dict[int, str], read: set[int]
+            ) -> tuple[list[tuple[int, PageExtraction]], list[tuple[int, PageExtraction]]]:
+    """Read every table on these pages and sort them into found and unsure.
+
+    Rejected tables go nowhere. The extractor's habit of handing back the
+    strongest rejected table rather than nothing is exactly what this ends: a
+    page whose every table fails is a page with no door schedule on it.
+
+    `read` collects every page that yielded a table at all, judged either way:
+    those pages were understood as text, so the vision tier has nothing to add.
+    """
+    found: list[tuple[int, PageExtraction]] = []
+    unsure: list[tuple[int, PageExtraction]] = []
+    if not candidates:
+        return found, unsure
+    for extraction in extract_pages(doc, candidates):
+        if not extraction.rows:
+            continue
+        read.add(extraction.page)
+        verdict = schedule_judge.judge(
+            extraction, index_says_door=door_pages.get(extraction.page))
+        if verdict.outcome == schedule_judge.FOUND:
+            found.append((verdict.score, extraction))
+        elif verdict.outcome == schedule_judge.UNSURE:
+            unsure.append((verdict.score, extraction))
+    return found, unsure
+
+
+def _unread_door_sheets(door_pages: dict[int, str], accepted: set[int]) -> list[int]:
+    """Sheets the index points at where reading the text gave no door schedule.
+
+    A scanned sheet has no text at all. A CAD sheet can be subtler: one prints
+    150 doors as real text and its column headings as exploded linework, so
+    there is no heading row and no table to find; another sets most of its text
+    as outlines, and what little is left reads as a table of nothing. Either
+    way the index still says what the sheet is -- so when the text yields no
+    door schedule there, the text reading failed, not the index, and the sheet
+    is the one worth sending to the vision tier.
+
+    Sheets titled as a door schedule first, then architectural schedule sheets.
+    Never an unnumbered title: too weak a reason to pay for the model to look.
+    """
+    # A generic schedules sheet is worth a paid read only where nothing names
+    # the door schedule outright -- otherwise it is a finish or toilet
+    # accessory schedule bought at the price of a door schedule.
+    levels = set(door_pages.values())
+    wanted = ({schedule_judge.NAMED} if schedule_judge.NAMED in levels
+              else {schedule_judge.SCHEDULES})
+    return [p for p, level in door_pages.items()
+            if level in wanted and p not in accepted]
+
+
+@dataclass(slots=True)
+class _ReadTable:
+    """A table the image reader returned, in the shape the judge reads."""
+    page: int
+    title: str
+    headers: list[str]
+    rows: list[DoorRow]
+    mapped: list[str]
+    tag_guessed: bool = False
+
+
+async def _read_unread_sheets(doc: PdfDoc, pages: list[int],
+                              warnings: list[str], limit: int = _MAX_AI_PAGES,
+                              door_pages: dict[int, str] | None = None,
+                              asked: bool = False) -> list[ScheduleTable]:
+    """Sheets read as images: every door schedule on each, as its own table.
+
+    One table per printed schedule, each with its own box, so a sheet carrying
+    three schedules previews as three outlined tables.
+
+    Each is weighed by the same judge as a table read from text -- caption,
+    headings, columns, values, the index -- because the model reads whatever
+    table is on the page, captions included, and gets them wrong: one door
+    schedule came back titled with its neighbour's GLAZING SCHEDULE caption.
+    A person who named the page gets the doubtful ones too; the fallback only
+    takes what the judge accepts.
+    """
+    door_pages = door_pages or {}
+    accept = ({schedule_judge.FOUND, schedule_judge.UNSURE} if asked
+              else {schedule_judge.FOUND})
+    from app.ai.vision_extract import read_tables
+
+    tables: list[ScheduleTable] = []
+    for page in pages[:limit]:
+        try:
+            read = await read_tables(doc, page)
+        except AiUpstreamError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a tier failure is a warning
+            log.info("vision read of p%s failed: %s", page, exc)
+            warnings.append(f"Page {page} could not be read.")
+            continue
+        for table in read:
+            # Asked for every door schedule, the reader also hands back the
+            # WINDOW SCHEDULE beside it -- widths and types, rows that look
+            # like doors.
+            fields = sorted({f for r in table.rows
+                             for f, v in r.model_dump().items()
+                             if v and f not in ("extra", "level")})
+            verdict = schedule_judge.judge(
+                _ReadTable(page, table.title, table.headers, table.rows, fields),
+                index_says_door=door_pages.get(page))
+            if verdict.outcome not in accept:
+                continue
+            # Accepted on its own headings while its caption names another
+            # schedule: the caption is the neighbour's. Shown untitled, not
+            # mislabelled -- a door schedule offered as GLAZING SCHEDULE.
+            title = "" if is_other_schedule(table.title) else table.title
+            warnings.extend(table.warnings)
+            tables.append(ScheduleTable(
+                title=title, page=page, headers=table.headers,
+                row_count=len(table.rows), rows=table.rows, box=table.box))
+    return tables
+
+
+def _ai_result(tables: list[ScheduleTable], pages_scanned: int, started: float,
+               warnings: list[str], page_scores: list | None = None,
+               status: str = "ok") -> ExtractionResult:
+    """A result read by the image reader, carrying its tables.
+
+    Always its tables: a result with rows and no tables imports as "no
+    schedule table" -- the door sheet is filled from the tables.
+    """
+    rows = [r for t in tables for r in t.rows]
+    widest = max(tables, key=lambda t: t.row_count)
+    duration = int((time.perf_counter() - started) * 1000)
+    log.info("extracted method=ai_vision pages=%s tables=%s rows=%s ms=%s",
+             sorted({t.page for t in tables}), len(tables), len(rows), duration)
+    return ExtractionResult(
+        method=ExtractionMethod.AI_VISION,
+        pages_scanned=pages_scanned,
+        source_pages=sorted({t.page for t in tables}),
+        row_count=len(rows),
+        duration_ms=duration,
+        warnings=warnings,
+        headers=widest.headers,
+        rows=rows,
+        tables=tables,
+        page_scores=page_scores or [],
+        box=widest.box,
+        status=status,
+    )
+
+
+async def _asked_ai_read(doc: PdfDoc, pages: list[int], started: float,
+                         warnings: list[str]) -> ExtractionResult:
+    """The schedule read as images, because a person asked for it."""
+    if not get_settings().ai_enabled:
+        raise AiUnavailableError(
+            "Image reading is not set up on this server.")
+    pages = sorted({p for p in pages if 1 <= p <= doc.page_count})
+    if not pages:
+        raise NoScheduleFoundError(doc.page_count)
+    if len(pages) > _MAX_ASKED_AI_PAGES:
+        warnings.append(
+            f"Read pages {', '.join(map(str, pages[:_MAX_ASKED_AI_PAGES]))}. "
+            f"Ask again with the remaining pages to read them as well.")
+
+    tables = await _read_unread_sheets(doc, pages, warnings,
+                                       limit=_MAX_ASKED_AI_PAGES, asked=True)
+    if not tables:
+        raise NoScheduleFoundError(doc.page_count)
+    return _ai_result(tables, doc.page_count, started, warnings)
+
+
+@dataclass(slots=True)
+class Detection:
+    """Where the door schedule is, before anything is made of it.
+
+    The one answer to "which tables are the door schedule" -- the schedule
+    read and the plan audit both ask it, and they must not answer it two ways.
+    """
+    door_pages: dict[int, str]
+    missing: list[str]
+    read: set[int]
+    found: list[tuple[int, PageExtraction]]
+    unsure: list[tuple[int, PageExtraction]]
+    scores: list
+    candidates: list
+
+
+def detect(doc: PdfDoc, *, debug: bool = False) -> Detection:
+    """Find the door schedule tables: the sheet index first, then every page.
+
+    Nearly every set names its door schedule sheet. Those pages are read
+    whatever they score -- a seven-door schedule is still a schedule -- and
+    when they hold the door schedule, the other 600 pages are not searched.
+    """
+    settings = get_settings()
+    door_pages, missing = _index_door_pages(doc)
+    named = [page_finder.score_page(doc.text_items(p - 1), p,
+                                    min_header_hits=settings.min_header_hits,
+                                    min_tag_run=settings.min_tag_run)
+             for p in door_pages]
+    read: set[int] = set()
+    found, unsure = _judged(doc, named, door_pages, read)
+
+    scores: list = []
+    candidates: list = []
+    if not found or debug:
+        scores = page_finder.find_schedule_pages(
+            doc,
+            min_header_hits=settings.min_header_hits,
+            min_tag_run=settings.min_tag_run,
+        )
+        candidates = page_finder.passing(scores)
+    if not found:
+        more_found, more_unsure = _judged(
+            doc, [c for c in candidates if c.page not in door_pages],
+            door_pages, read)
+        found += more_found
+        unsure += more_unsure
+    return Detection(door_pages, missing, read, found, unsure, scores, candidates)
 
 
 class NoScheduleFoundError(RuntimeError):
@@ -329,11 +578,22 @@ def _levels_from_titles(tables: list[ScheduleTable]) -> None:
 
 
 async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
-                  debug: bool = False) -> ExtractionResult:
+                  debug: bool = False, ai_read: bool = False,
+                  pages: list[int] | None = None) -> ExtractionResult:
     """PDF in, JSON out. Stateless.
 
     `source` is bytes or a path. A path keeps memory flat on a large set --
     see PdfDoc.
+
+    Two ways to use the image reader, and they are different requests:
+
+    `allow_ai` -- the fallback. It steps in only where the text could not be
+    read, and only on the pages that need it.
+
+    `ai_read` -- asked for. A person looking at a schedule that came back
+    wrong, or not at all, wants it read as an image. `pages` names the sheets
+    when they know them; otherwise the door schedule sheets found here are
+    read.
 
     Kept async so swapping in a job queue later means changing the route, not
     the logic.
@@ -345,16 +605,25 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
     with PdfDoc(source) as doc:
         pages_scanned = doc.page_count
 
-        scores = page_finder.find_schedule_pages(
-            doc,
-            min_header_hits=settings.min_header_hits,
-            min_tag_run=settings.min_tag_run,
-        )
-        candidates = page_finder.passing(scores)
+        # Told where to look: no searching at all.
+        if ai_read and pages:
+            return await _asked_ai_read(doc, pages, started, warnings)
+
+        found_where = detect(doc, debug=debug)
+        door_pages, read = found_where.door_pages, found_where.read
+        # The architect lists a door schedule this file does not hold --
+        # another volume, or a sheet left out of the upload. Worth knowing
+        # before anyone prices from what is here.
+        for listed in found_where.missing:
+            warnings.append(f"The drawing index lists {listed}, but that "
+                            "sheet is not in this file.")
+        judged_found, judged_unsure = found_where.found, found_where.unsure
+        accepted_pages = {e.page for _, e in judged_found + judged_unsure}
+        scores, candidates = found_where.scores, found_where.candidates
         scan_ms = int((time.perf_counter() - started) * 1000)
-        log.info("page_finder pages=%s candidates=%s best=%s ms=%s",
-                 pages_scanned, [c.page for c in candidates],
-                 max((c.score for c in scores), default=0), scan_ms)
+        log.info("detect pages=%s found=%s unsure=%s ms=%s", pages_scanned,
+                 sorted({e.page for _, e in judged_found}),
+                 sorted({e.page for _, e in judged_unsure}), scan_ms)
 
         # A large set is slow whatever we do. Say so, so a long wait is visible
         # before a demo rather than during one.
@@ -367,17 +636,22 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
         page_scores = [PageScore(**c.as_dict()) for c in scores] if debug else []
 
         # --- Tier 1: deterministic ------------------------------------------
-        best = None
-        found: list[PageExtraction] = []
-        if candidates:
-            extractions = extract_pages(doc, candidates)
-            found = [e for e in extractions if e.rows]
-            for extraction in found:
-                if best is None or len(extraction.rows) > len(best.rows):
-                    best = extraction
-            for extraction in extractions:
-                if not extraction.rows:
-                    warnings.extend(extraction.warnings)
+        # Found tables only, when there are any. Unsure ones are returned only
+        # in their absence, and the result says so -- "is this your door
+        # schedule?" is a better answer than either a guess or nothing.
+        if ai_read:
+            located = sorted({e.page for _, e in judged_found + judged_unsure}
+                             | set(_unread_door_sheets(door_pages, accepted_pages)))
+            return await _asked_ai_read(
+                doc, located or [c.page for c in candidates], started, warnings)
+
+        status = "ok"
+        accepted = judged_found
+        if not accepted and judged_unsure:
+            accepted, status = judged_unsure, "unsure"
+        found: list[PageExtraction] = [e for _, e in accepted]
+        best = (max(accepted, key=lambda s: (s[0], len(s[1].rows)))[1]
+                if accepted else None)
 
         if best is not None and best.rows:
             # Columns the alias table could not place. No firm names them the
@@ -417,62 +691,25 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
             # more of the table -- otherwise the measured read stands.
             thin = _is_thin(best)
             if thin and allow_ai and settings.ai_enabled:
-                warnings.append(
-                    f"the text layer on page {best.page} looks incomplete "
-                    f"({thin}); re-reading the page as an image"
-                )
-                from app.ai.vision_extract import extract_with_vision
-
+                # Every table read off the page must describe doors -- more
+                # columns is not the same as the right table. This branch
+                # re-reads a page whose text layer looked thin, and on a set
+                # whose architectural sheets are all flattened to outlines the
+                # only page with any text was an electrical one: the re-read
+                # came back with its LIGHT FIXTURE SCHEDULE, nine columns wide,
+                # and nine beat the four we had. It won on width alone.
+                reread: list[ScheduleTable] = []
+                reread_warnings: list[str] = []
                 try:
-                    ai_rows, ai_headers, ai_warnings = await extract_with_vision(
-                        doc, best.page)
+                    reread = await _read_unread_sheets(doc, [best.page],
+                                                       reread_warnings,
+                                                       door_pages=door_pages)
                 except AiUpstreamError:
                     raise
-                except Exception as exc:  # noqa: BLE001 - a tier failure warns
-                    ai_rows, ai_headers, ai_warnings = [], [], [
-                        f"image re-read failed: {exc}"]
-
-                if ai_rows and not _is_a_door_schedule(ai_rows):
-                    # More columns is not the same as the right table. This
-                    # branch re-reads a page whose text layer looked thin, and
-                    # on a set whose architectural sheets are all flattened to
-                    # outlines the only page with any text is an electrical one
-                    # -- so the re-read came back with that sheet's LIGHT
-                    # FIXTURE SCHEDULE, nine columns wide, and nine beats the
-                    # four we had. It won on width alone.
-                    warnings.append(
-                        f"Page {best.page} was re-read as an image and returned "
-                        "a schedule that is not a door schedule -- none of its "
-                        "columns name a door. Ignored."
-                    )
-                    log.info("ai re-read rejected on page %s: no door columns",
-                             best.page)
-                    ai_rows = []
-
-                if ai_rows and len(ai_headers) > len(best.headers):
-                    warnings.extend(ai_warnings)
-                    duration = int((time.perf_counter() - started) * 1000)
-                    log.info("extracted method=ai_vision page=%s rows=%s ms=%s "
-                             "(deterministic read was thin: %s)",
-                             best.page, len(ai_rows), duration, thin)
-                    return ExtractionResult(
-                        method=ExtractionMethod.AI_VISION,
-                        pages_scanned=pages_scanned,
-                        source_pages=[best.page],
-                        row_count=len(ai_rows),
-                        duration_ms=duration,
-                        warnings=warnings,
-                        headers=ai_headers,
-                        rows=ai_rows,
-                        tables=[ScheduleTable(
-                            title=best.title, page=best.page, headers=ai_headers,
-                            row_count=len(ai_rows), rows=ai_rows)],
-                        page_scores=page_scores,
-                    )
-                warnings.append(
-                    "the image re-read did not recover more columns; "
-                    "keeping the text-layer result"
-                )
+                if reread and max(len(t.headers) for t in reread) > len(best.headers):
+                    warnings.extend(reread_warnings)
+                    return _ai_result(reread, pages_scanned, started, warnings,
+                                      page_scores, status)
 
             tables = [
                 ScheduleTable(title=e.title, page=e.page, headers=e.headers,
@@ -480,6 +717,15 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                               rows=e.rows, box=_table_box(e))
                 for e in sorted(found, key=lambda e: (e.page, -len(e.rows)))
             ]
+            # The index named more door schedule sheets than the text tier
+            # could read. One set names A5.12, CR1.04 and CR1.05; the last two
+            # read as text, and A5.12 -- three schedules, 150 doors, headings
+            # drawn as linework -- was dropped without a word. Read the rest as
+            # images and add them, rather than returning two thirds of a set.
+            if allow_ai and settings.ai_enabled:
+                tables += await _read_unread_sheets(
+                    doc, _unread_door_sheets(door_pages, accepted_pages), warnings,
+                    door_pages=door_pages)
             _levels_from_titles(tables)
             # Every door on the sheet, not the biggest table's doors.
             #
@@ -492,9 +738,9 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
             all_rows = [r for t in tables for r in t.rows]
             if len(tables) > 1:
                 warnings.append(
-                    f"{len(tables)} schedules on this sheet, read together: "
-                    + ", ".join(f"{t.title or 'untitled'} ({t.row_count})"
-                                for t in tables)
+                    f"{len(tables)} door schedules were read: "
+                    + ", ".join(f"{t.title or 'untitled'} (page {t.page}, "
+                                f"{t.row_count} doors)" for t in tables)
                 )
             duration = int((time.perf_counter() - started) * 1000)
             log.info("extracted method=%s page=%s tables=%s rows=%s ms=%s",
@@ -511,10 +757,17 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                 rows=all_rows,
                 tables=tables,
                 page_scores=page_scores,
+                status=status,
             )
 
         # --- Tier 2: AI vision, candidate pages only -------------------------
-        ai_pages = [c.page for c in candidates[:2]]
+        # The index's own door schedule sheets first, where they could not be
+        # read as text. Then candidates whose text gave no table at all. Never
+        # a page whose tables were read and judged not to be doors -- the model
+        # would only read the same piping schedule again, at a price.
+        ai_pages = (_unread_door_sheets(door_pages, accepted_pages)
+                    or [c.page for c in candidates if c.page not in read][:_MAX_AI_PAGES])
+        ai_pages = ai_pages[:_MAX_AI_PAGES]
 
         # Nothing passed the gates. On a small document the best-scoring page is
         # still worth a look, but that is a guess, not a find -- and it must not
@@ -527,73 +780,34 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
             ai_pages = select_fallback_pages(doc, scores, pages_scanned)
             speculative = bool(ai_pages) and not scanned
 
-            if scanned and ai_pages:
-                warnings.append(
-                    f"{len(scanned)} page(s) have no text layer; "
-                    f"reading page(s) {ai_pages} as images"
-                )
+
+        # A candidate whose tables were read and judged not to be doors is not
+        # a door schedule we failed to read -- it is no door schedule at all.
+        unread = [c.page for c in candidates if c.page not in read]
 
         def _give_up() -> RuntimeError:
-            if speculative or not candidates:
+            if speculative or not unread:
                 return NoScheduleFoundError(pages_scanned)
-            return NoRowsError([c.page for c in candidates], pages_scanned)
+            return NoRowsError(unread, pages_scanned)
 
         if not ai_pages:
             raise NoScheduleFoundError(pages_scanned)
 
         if not allow_ai:
-            warnings.append("AI fallback disabled for this request")
             raise _give_up()
 
         if not settings.ai_enabled:
             warnings.append(
-                "AI fallback unavailable: OPENROUTER_API_KEY is not configured"
+                "This drawing set needs image reading, which is not set up on "
+                "this server."
             )
             raise _give_up()
 
-        from app.ai.vision_extract import extract_with_vision
-
-        for page in ai_pages:
-            try:
-                rows, ai_headers, ai_warnings, box = await extract_with_vision(
-                    doc, page)
-            except AiUpstreamError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - a tier failure is a warning
-                warnings.append(f"AI fallback failed on page {page}: {exc}")
-                continue
-            warnings.extend(ai_warnings)
-            if rows and not _is_a_door_schedule(rows):
-                # The model read a table; it was not this one. On a set whose
-                # architectural sheets are all flattened to outlines, the only
-                # page with any text was an electrical sheet, and its LIGHT
-                # FIXTURE SCHEDULE came back as the door schedule: six rows of
-                # LED PANEL and TRAC HEAD, with ITEM, QTY, MANUFACTURER,
-                # CATALOG NO, WATT/VOLTAGE for columns. Every one of those went
-                # to `extra`, and not one door field was filled -- so the answer
-                # announced what it was, and we handed it over anyway.
-                warnings.append(
-                    f"Page {page} carries a schedule, but not a door schedule "
-                    "-- none of its columns name a door. Ignored."
-                )
-                log.info("ai tier rejected page %s: no door columns", page)
-                continue
-            if rows:
-                duration = int((time.perf_counter() - started) * 1000)
-                log.info("extracted method=ai_vision page=%s rows=%s ms=%s",
-                         page, len(rows), duration)
-                return ExtractionResult(
-                    method=ExtractionMethod.AI_VISION,
-                    pages_scanned=pages_scanned,
-                    source_pages=[page],
-                    row_count=len(rows),
-                    duration_ms=duration,
-                    warnings=warnings,
-                    headers=ai_headers,
-                    rows=rows,
-                    page_scores=page_scores,
-                    box=box,
-                )
+        tables = await _read_unread_sheets(doc, ai_pages, warnings,
+                                           door_pages=door_pages)
+        if tables:
+            return _ai_result(tables, pages_scanned, started, warnings,
+                              page_scores)
 
         raise _give_up()
 

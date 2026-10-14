@@ -69,3 +69,27 @@ async def require_caller(
                 detail="X-PlanckOff-User must be a uuid.",
             ) from exc
     return Caller(user_id=user_id or None, role=(role or "").strip())
+
+
+def parse_pages(raw: str | None) -> list[int] | None:
+    """`"29"` or `"136, 137"` as page numbers; None when not given.
+
+    Pages are the PDF's own, counted from 1 -- what a viewer shows, not the
+    sheet number printed in the title block.
+    """
+    if raw is None or not raw.strip():
+        return None
+    try:
+        pages = sorted({int(part) for part in raw.split(",") if part.strip()})
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="pages must be page numbers separated by commas, e.g. 29 "
+                   "or 136,137.",
+        ) from None
+    if not pages or pages[0] < 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="pages are counted from 1.",
+        )
+    return pages
