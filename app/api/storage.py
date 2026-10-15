@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
+import tempfile
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -25,6 +29,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import Caller, parse_pages, require_api_key, require_caller
@@ -201,6 +206,8 @@ async def add_uploaded_document(
     allow_ai: bool = Query(True, description="Permit the vision fallback tier"),
     reuse: bool = Query(True, description="Return a stored reading if this "
                                           "exact file is already in this job"),
+    background: bool = Query(False, description="Answer at once with a job id "
+                             "and read the set after; poll GET /jobs/{job_id}"),
     _key: str = Depends(require_api_key),
 ):
     """Read a set the browser has already put in storage.
@@ -229,8 +236,24 @@ async def add_uploaded_document(
         found = store.find_document(project_id, sha256)
         # Reused only if today's reader made it; an older reading is read again.
         if found and store.is_current(found):
+            if background:
+                job_id = store.create_job(project_id, kind="read", source_key=body.key,
+                                          filename=body.filename)
+                store.finish_job(job_id, "ready", document_id=found["id"])
+                return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={
+                    "job_id": job_id, "status": "ready", "document_id": found["id"],
+                    "reused": True})
             return {"document_id": found["id"], "reused": True,
                     "filename": found["filename"]}
+
+    if background:
+        job_id = store.create_job(project_id, kind="read", source_key=body.key,
+                                  filename=body.filename)
+        _read_later(job_id, project_id, body.key, filename=body.filename,
+                    sha256=sha256, revision=body.revision, plans=plans,
+                    allow_ai=allow_ai)
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED,
+                            content={"job_id": job_id, "status": "reading"})
 
     path = files.fetch(body.key)
     try:
@@ -240,6 +263,121 @@ async def add_uploaded_document(
             source_uri=body.key, plans=plans, allow_ai=allow_ai)
     finally:
         files.discard(path)
+
+
+# Readings running after their request answered (and plan passes, below).
+# Held here so a task is not collected while it runs.
+_READINGS: set[asyncio.Task] = set()
+
+# What a person waiting is told. What happened, never why.
+_NO_SCHEDULE = "No door schedule was found in this drawing set."
+_NOT_A_PDF = "This file could not be read as a PDF."
+_TRY_AGAIN = "Reading this drawing set failed. Please try again."
+
+
+def _read_later(job_id: str, project_id: str, key: str, *, filename: str,
+                sha256: str, revision: str | None, plans: bool, allow_ai: bool,
+                ai_read: bool = False, pages: list[int] | None = None) -> None:
+    """Read a stored set after its request has been answered, and record how
+    it ended on the job.
+
+    The serverless functions in front of this service stop at 300 seconds. A
+    scanned set read as images can take longer, and a request cut off mid-read
+    stored nothing and told the person nothing. Here the request is already
+    answered; the reading takes as long as it takes, and the job says when it
+    is done.
+    """
+    async def run() -> None:
+        started = time.perf_counter()
+        path = None
+        try:
+            path = await asyncio.to_thread(files.fetch, key)
+            done = await _read_and_store(
+                project_id, path, filename=filename, sha256=sha256,
+                size_bytes=files.size_of(key), revision=revision,
+                source_uri=key, plans=plans, allow_ai=allow_ai,
+                ai_read=ai_read, pages=pages)
+            store.finish_job(job_id, "ready", document_id=done["document_id"],
+                             doors=done.get("doors"))
+            log.info("job %s ready in %.0f s", job_id, time.perf_counter() - started)
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            if exc.status_code == 422 and "door schedule" in detail.lower():
+                store.finish_job(job_id, "no_schedule", message=_NO_SCHEDULE)
+            elif exc.status_code == 422:
+                store.finish_job(job_id, "failed", message=_NOT_A_PDF)
+            else:
+                store.finish_job(job_id, "failed", message=_TRY_AGAIN)
+            log.info("job %s ended %s after %.0f s: %s", job_id, exc.status_code,
+                     time.perf_counter() - started, detail)
+        except Exception as exc:  # noqa: BLE001 - recorded on the job
+            log.warning("job %s failed after %.0f s: %s", job_id,
+                        time.perf_counter() - started, exc)
+            try:
+                store.finish_job(job_id, "failed", message=_TRY_AGAIN)
+            except Exception:  # noqa: BLE001 - the stale check covers it
+                pass
+        finally:
+            if path is not None:
+                files.discard(path)
+
+    task = asyncio.get_running_loop().create_task(run())
+    _READINGS.add(task)
+    task.add_done_callback(_READINGS.discard)
+
+
+@router.get("/jobs/{job_id}")
+async def reading_job(job_id: str, _key: str = Depends(require_api_key)):
+    """How a background reading is going.
+
+    `status` is `reading` while the set is being read, then `ready` (with
+    `document_id` and `doors`), `no_schedule` or `failed`, each with a plain
+    `message` to show. Poll every few seconds until it is not `reading`.
+    """
+    _db()
+    job = store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="No such job.")
+    return {key: job.get(key) for key in (
+        "id", "status", "message", "document_id", "doors", "filename", "kind",
+        "created_at", "updated_at")}
+
+
+# Plan passes running after their upload answered. Held here so a task is not
+# collected while it runs.
+_PLAN_PASSES: set[asyncio.Task] = set()
+
+
+def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None) -> None:
+    """Locate the doors on the plans after the upload has been answered.
+
+    The pass reads its own copy of the PDF: the request that started it
+    deletes its file as soon as it answers. It waits its turn for a worker like
+    every other extraction, and a failure costs the plan results only -- the
+    schedule is already stored.
+    """
+    handle, name = tempfile.mkstemp(suffix=".pdf")
+    os.close(handle)
+    owned = Path(name)
+    shutil.copyfile(path, owned)
+
+    async def run() -> None:
+        started = time.perf_counter()
+        try:
+            found = await in_worker(audit(owned, rows=rows, schedule_page=schedule_page))
+            store.save_audit(document_id, found)
+            log.info("plan pass stored for %s: %d of %d doors located in %.0f s",
+                     document_id, len(found.located), found.door_count,
+                     time.perf_counter() - started)
+        except Exception as exc:  # noqa: BLE001 - the schedule still stands
+            log.warning("plan pass failed for %s after %.0f s: %s", document_id,
+                        time.perf_counter() - started, exc)
+        finally:
+            owned.unlink(missing_ok=True)
+
+    task = asyncio.get_running_loop().create_task(run())
+    _PLAN_PASSES.add(task)
+    task.add_done_callback(_PLAN_PASSES.discard)
 
 
 async def _read_and_store(project_id: str, path, *, filename: str,
@@ -275,19 +413,16 @@ async def _read_and_store(project_id: str, path, *, filename: str,
                                    "The result was not saved.")
     document_id, door_count = stored
 
-    # Locating the doors on the drawings is a second, slower pass, and it can
-    # fail on its own without costing the schedule that was just read.
+    # Locating the doors on the drawings is a second, slower pass, and it runs
+    # after this answer, not inside it. On a 199-sheet theatre set it took ten
+    # minutes; the request was cut off at five, the plan results were never
+    # stored, and the set showed no plan sheets at all. The schedule is saved
+    # and returned now; the sheets arrive when the pass finishes, which is what
+    # the viewer's "Check again" is for.
     located = None
     if plans:
-        try:
-            found = await in_worker(audit(
-                path, rows=result.rows,
-                schedule_page=result.source_pages[0]
-                if result.source_pages else None))
-            store.save_audit(document_id, found)
-            located = len(found.located)
-        except Exception as exc:  # noqa: BLE001 - the schedule still stands
-            log.warning("db: schedule stored, plan audit failed: %s", exc)
+        _plan_pass_later(document_id, path, result.rows,
+                         result.source_pages[0] if result.source_pages else None)
 
     # `doors` is what was stored, not what was read. They differ whenever a
     # number repeats within a level -- one set prints a partial schedule on an
@@ -644,6 +779,8 @@ async def reread_document(
     ai_read: bool = Query(False, description="Read the door schedule with the "
                           "image reader, as asked -- not only as a fallback"),
     pages: str | None = Query(None, description="Pages to read with ai_read, e.g. 29 or 136,137. Leave out to read the door schedule sheets found in the set."),
+    background: bool = Query(False, description="Answer at once with a job id "
+                             "and read the set after; poll GET /jobs/{job_id}"),
     _key: str = Depends(require_api_key),
 ):
     """Read a stored set again, from the file we already hold.
@@ -674,6 +811,17 @@ async def reread_document(
             status_code=410,
             detail="That set's file is no longer in storage, so it cannot be "
                    "read again. Upload it once more.")
+
+    if background:
+        job_id = store.create_job(found["project_id"], kind="reread", source_key=key,
+                                  filename=found.get("filename"))
+        _read_later(job_id, found["project_id"], key,
+                    filename=found.get("filename") or "set.pdf",
+                    sha256=found.get("sha256") or Path(key).stem, revision=None,
+                    plans=plans, allow_ai=allow_ai, ai_read=ai_read,
+                    pages=parse_pages(pages))
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED,
+                            content={"job_id": job_id, "status": "reading"})
 
     path = await asyncio.to_thread(files.fetch, key)
     try:

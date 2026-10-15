@@ -177,6 +177,55 @@ def set_project_status(project_id: str, status: str) -> bool:
     return True
 
 
+# --------------------------------------------------------------------------- #
+# reading jobs -- see db/019
+# --------------------------------------------------------------------------- #
+
+# A job still 'reading' after this long was left by a server that stopped.
+JOB_STALE_MINUTES = 45
+
+
+def create_job(project_id: str, *, kind: str, source_key: str | None,
+               filename: str | None) -> str:
+    """Start a reading job and return its id."""
+    row = {"project_id": project_id, "kind": kind, "source_key": source_key,
+           "filename": filename, "status": "reading"}
+    return client().table("reading_jobs").insert(row).execute().data[0]["id"]
+
+
+def finish_job(job_id: str, status: str, *, message: str | None = None,
+               document_id: str | None = None, doors: int | None = None) -> None:
+    """Record how a job ended: ready, no_schedule or failed."""
+    from datetime import datetime, timezone
+
+    client().table("reading_jobs").update({
+        "status": status, "message": message, "document_id": document_id,
+        "doors": doors, "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", job_id).execute()
+
+
+def get_job(job_id: str) -> dict[str, Any] | None:
+    """A job as the caller should see it, or None if there is no such job.
+
+    A job still 'reading' long after it started was left behind by a server
+    that stopped mid-read. It is reported as failed, so a waiting screen ends
+    with an answer instead of waiting for ever.
+    """
+    from datetime import datetime, timezone
+
+    found = client().table("reading_jobs").select("*").eq("id", job_id).execute()
+    if not found.data:
+        return None
+    job = found.data[0]
+    if job["status"] == "reading":
+        started = datetime.fromisoformat(job["updated_at"].replace("Z", "+00:00"))
+        if (datetime.now(timezone.utc) - started).total_seconds() > JOB_STALE_MINUTES * 60:
+            job["status"] = "failed"
+            job["message"] = ("Reading this drawing set was interrupted. "
+                              "Please upload it again.")
+    return job
+
+
 def stored_keys(project_id: str) -> list[str]:
     """Every stored file under a job, for deleting them alongside the rows."""
     db = client()
