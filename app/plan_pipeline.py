@@ -1108,7 +1108,10 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             rows, best_page = _read_schedule(doc, sheets, pages_scanned)
 
         tags = {r.door_tag for r in rows if r.door_tag}
-        plans = plan_index.floor_plans(sheets)
+        # The sheets this set's door numbers are printed on, where they are
+        # printed as text; titles only where they are not.
+        plans = (plan_index.door_plans(doc, sheets, tags, {best_page} if best_page else set())
+                 or plan_index.floor_plans(sheets))
 
         # A small project prints its schedule on the floor plan sheet, and the
         # schedule's own column of door numbers is then the easiest thing on

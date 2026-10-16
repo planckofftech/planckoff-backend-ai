@@ -187,6 +187,11 @@ _NOT_A_TITLE = ("KEYNOTE", "LEGEND", "SYMBOLS", "GENERAL NOTES", "NOTES:",
 # Below this many usable outline entries the outline is a cover-page list, not
 # a per-sheet index, and reading the pages is the honest fallback.
 _MIN_BOOKMARKS = 5
+# A door plan adds at least this many doors no larger sheet shows, and this
+# share of the schedule. Door numbers standing within _COLUMN_TOL of one
+# another, this share of them, are a table's column.
+_MIN_NEW_DOORS, _NEW_DOOR_SHARE = 2, 0.02
+_COLUMN_TOL, _TABLE_SHARE = 6.0, 0.5
 
 
 @dataclass(slots=True)
@@ -536,10 +541,103 @@ def index_sheets(doc: PdfDoc) -> list[PlanSheet]:
         covered = {s.page for s in from_toc}
         rest = [sheet_of(doc, page) for page in range(1, doc.page_count + 1)
                 if page not in covered]
-        return sorted(from_toc + rest, key=lambda s: s.page)
+        return _named_by_index(doc, sorted(from_toc + rest, key=lambda s: s.page))
     log.info("plan_index: no usable outline; reading %d title blocks",
              doc.page_count)
-    return [sheet_of(doc, page) for page in range(1, doc.page_count + 1)]
+    return _named_by_index(doc, [sheet_of(doc, page)
+                                 for page in range(1, doc.page_count + 1)])
+
+
+def _named_by_index(doc: PdfDoc, sheets: list[PlanSheet]) -> list[PlanSheet]:
+    """Each sheet's number and title as the cover sheet's drawing index gives
+    them, where the page prints its own entry.
+
+    The largest sheet-number-like text on a page is not always its number.
+    One set draws grid and detail bubbles -- A5, C1, B3 -- larger than the
+    title block's A-203, so its floor plans read as C1 and A5, were taken for
+    another discipline's sheets, and never searched. A page's own number is
+    the largest text on it that the index lists: references to other sheets
+    are printed smaller, and a bubble is not in the index at all.
+    """
+    from app.core import drawing_index
+
+    try:
+        entries = drawing_index.read_entries(doc)
+    except Exception:  # noqa: BLE001 - naming falls back to the title blocks
+        return sheets
+    listed = {drawing_index.normal_number(e.number): e for e in entries}
+    if not listed:
+        return sheets
+    named = []
+    for sheet in sheets:
+        own = drawing_index.own_number(doc, sheet.page, listed)
+        if own is None:
+            named.append(sheet)
+        else:
+            named.append(PlanSheet(page=sheet.page, number=own.number,
+                                   title=own.title or sheet.title))
+    return named
+
+
+def door_plans(doc: PdfDoc, sheets: list[PlanSheet], tags: set[str],
+               schedule_pages: set[int]) -> list[PlanSheet]:
+    """The sheets that draw this set's doors, found by its own door numbers.
+
+    A sheet title is the wrong thing to ask. One set titles its floor plans
+    PARTIAL MAIN FLOOR - EAST WING and never says PLAN; another titles its
+    millwork elevations MILLWORK PLANS. What a door plan has, and nothing else
+    has, is the schedule's door numbers printed across the drawing, one at
+    each door. So:
+
+      discipline  the door schedule's own -- its sheet A-806 says the doors
+                  are drawn on A sheets. The mechanical and electrical plans
+                  print the same numbers as room numbers;
+      scattered   the numbers stand across the sheet, not down one column --
+                  an area schedule or a room finish schedule lists them as a
+                  table;
+      new doors   each sheet kept adds doors no larger sheet already shows.
+                  Sections, enlargements and elevations repeat doors the
+                  plans carry, and drop out.
+
+    Empty where the drawings print no door numbers as text; the caller then
+    falls back to titles.
+    """
+    if not tags:
+        return []
+    by_page = {s.page: s for s in sheets}
+    disciplines = {by_page[p].discipline for p in schedule_pages
+                   if p in by_page and by_page[p].discipline}
+    found: list[tuple[PlanSheet, set[str]]] = []
+    for sheet in sheets:
+        if sheet.page in schedule_pages:
+            continue
+        if disciplines and sheet.discipline not in disciplines:
+            continue
+        items = [i for i in doc.text_items(sheet.page - 1) if i.text.strip() in tags]
+        if len({i.text.strip() for i in items}) < _MIN_NEW_DOORS:
+            continue
+        if _in_one_column(items):
+            continue
+        found.append((sheet, {i.text.strip() for i in items}))
+
+    found.sort(key=lambda f: -len(f[1]))
+    floor = max(_MIN_NEW_DOORS, int(len(tags) * _NEW_DOOR_SHARE))
+    covered: set[str] = set()
+    kept = []
+    for sheet, shows in found:
+        if len(shows - covered) >= floor:
+            kept.append(sheet)
+            covered |= shows
+    return sorted(kept, key=lambda s: s.page)
+
+
+def _in_one_column(items) -> bool:
+    """Do these door numbers stand down one column, as a table lists them?"""
+    if len(items) < _MIN_NEW_DOORS:
+        return False
+    xs = sorted(i.x0 for i in items)
+    best = max(sum(1 for x in xs if abs(x - anchor) <= _COLUMN_TOL) for anchor in xs)
+    return best >= len(items) * _TABLE_SHARE
 
 
 def other_architectural(sheets: list[PlanSheet],
