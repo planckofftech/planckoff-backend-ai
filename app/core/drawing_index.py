@@ -83,6 +83,9 @@ class IndexEntry:
     number: str
     title: str
     page: int | None = None  # 1-indexed, once a title block confirms it
+    # Placed by counting from a sheet whose number could be read, because its
+    # own title block could not be.
+    counted: bool = False
 
 
 def _normal(number: str) -> str:
@@ -275,4 +278,29 @@ def locate(doc: PdfDoc, entries: list[IndexEntry],
                 # Sheets after this one are shifted by the same amount.
                 offset = page - (order.get(target, 0) + 1)
                 break
+
+    # A sheet drawn as a picture has no number to read, and without OCR none
+    # can be read from it. One set exports its whole architectural part as
+    # pictures -- 136 of 174 pages -- and its door schedule sheet A-607 was
+    # never placed, so the set read as having no door schedule. The index is
+    # still in page order. The nearest sheet whose number could be read pins
+    # that order to the file -- C101, the index's 71st entry, on page 73 -- and
+    # counting from it puts A-607, the 65th, on page 67. What is read there is
+    # judged like any other table, so a wrong count reads as no schedule.
+    anchors = {order[n]: page for page, n in
+               ((page, _normal(number)) for page, number in read.items() if number)
+               if n in order}
+    for entry in (wanted if wanted is not None else entries):
+        if entry.page is not None or not anchors:
+            continue
+        k = order.get(_normal(entry.number))
+        if k is None:
+            continue
+        nearest = min(anchors, key=lambda a: abs(a - k))
+        if abs(nearest - k) > _NEAR:
+            continue
+        page = anchors[nearest] + (k - nearest)
+        if not 1 <= page <= doc.page_count or read.get(page):
+            continue  # off the file, or a page that reads as another sheet
+        entry.page, entry.counted = page, True
     return wanted if wanted is not None else entries
