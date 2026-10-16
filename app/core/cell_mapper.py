@@ -65,6 +65,8 @@ def header_texts(grid: TableGrid, headers: list[TextItem], items: list[TextItem]
     PANEL and FRAME groups yields "PANEL MAT'L" and "FRAME MAT'L" rather than
     two identical "MAT'L" columns.
     """
+    if grid.mode == "aligned":
+        return _aligned_headings(grid, items)
     if grid.mode == "ruled":
         # Rotated text is kept here, unlike everywhere else: a narrow column is
         # routinely headed sideways. Dropping those left six columns of one
@@ -98,6 +100,36 @@ def header_texts(grid: TableGrid, headers: list[TextItem], items: list[TextItem]
             col = grid.column_of(item.x0)
             if col is None:
                 col = grid.column_of(item.cx)
+            columns = [] if col is None else [col]
+        for col in columns:
+            buckets[col].append((item.y0, item.x0, item.text))
+    return [_join(b) for b in buckets]
+
+
+# Share of the narrower of a heading and a column's values that must overlap
+# for the heading to stand over that column.
+_SPAN_SHARE = 0.3
+
+
+def _aligned_headings(grid: TableGrid, items: list[TextItem]) -> list[str]:
+    """Headings of a table read from its values: each heading line's text over
+    the columns it spans.
+
+    A heading heads the columns whose values it stands over -- MEASUREMENTS
+    over HEIGHT and THICKNESS -- and, standing over none, the column it falls
+    in.
+    """
+    buckets: list[list[tuple[float, float, str]]] = [[] for _ in range(grid.n_cols)]
+    for item in items:
+        if not item.horizontal or not grid.header_top - 0.5 <= item.cy <= grid.header_bottom:
+            continue
+        if item.x1 < grid.left or item.x0 > grid.right:
+            continue
+        columns = [k for k, (a, b) in enumerate(grid.spans)
+                   if min(b, item.x1) - max(a, item.x0)
+                   >= _SPAN_SHARE * min(b - a, item.x1 - item.x0)]
+        if not columns:
+            col = grid.column_of(item.cx)
             columns = [] if col is None else [col]
         for col in columns:
             buckets[col].append((item.y0, item.x0, item.text))

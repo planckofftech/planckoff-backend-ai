@@ -78,7 +78,7 @@ _MAX_CAPTION_CELLS = 6
 
 @dataclass(slots=True)
 class TableGrid:
-    mode: str  # "ruled" | "banded"
+    mode: str  # "ruled" | "banded" | "aligned"
     left: float
     right: float
     header_top: float
@@ -86,6 +86,9 @@ class TableGrid:
     col_bounds: list[float]  # len == n_cols + 1
     row_bounds: list[float] = field(default_factory=list)  # ruled mode only
     warnings: list[str] = field(default_factory=list)
+    # Aligned mode: where each column's values stand, and the last row's foot.
+    spans: list[tuple[float, float]] = field(default_factory=list)
+    bottom: float | None = None
 
     @property
     def n_cols(self) -> int:
@@ -765,7 +768,11 @@ def locate_table(items: list[TextItem], rulings: Rulings, header_y: float,
     if grid is not None:
         _trim_to_tagged_rows(grid, items, tag_x)
         return grid, headers
-    grid = _banded_grid(headers, items, header_y)
+    # No column rules: read the table from its values -- see aligned_table.
+    # The heading-led reading stays only for a table too short to read that way.
+    from app.core.aligned_table import aligned_grid
+
+    grid = aligned_grid(items, tag_x, header_y) or _banded_grid(headers, items, header_y)
     return grid, headers
 
 

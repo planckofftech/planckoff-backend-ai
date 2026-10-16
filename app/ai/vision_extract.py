@@ -172,6 +172,44 @@ def _tag_column(items, rows: list[DoorRow]
             max(i.y1 for i in best), row_height)
 
 
+def _unconfirmed(items, rows: list[DoorRow]) -> list[str]:
+    """Door numbers the model read that the page does not print, and door
+    numbers printed in the table's own column that the model did not read.
+
+    Checking whole tables is not enough. On one pair of sheets every table was
+    plainly read from its page, and still five of 139 door numbers were made
+    up -- 160 where the sheet prints 160A and 160B, 172 beside 173A -- and four
+    printed ones were left out. The count came out right by coincidence. On a
+    page that prints its door numbers as text, each one can be checked.
+    """
+    from app.core.page_finder import TAG_RE
+
+    column = _tag_column(items, rows)
+    if column is None:
+        return []
+    left, top, bottom, row_height = column
+    read = [r.door_tag.strip() for r in rows if r.door_tag and r.door_tag.strip()]
+    printed = {i.text.strip() for i in items}
+    in_column = [i.text.strip() for i in items
+                 if abs(i.x0 - left) <= _COLUMN_TOL
+                 and top - row_height <= i.cy <= bottom + row_height
+                 and TAG_RE.match(i.text.strip())]
+    made_up = [t for t in read if t not in printed]
+    missed = [t for t in in_column if t not in set(read)]
+    warnings = []
+    if made_up:
+        warnings.append(
+            f"Door number(s) {', '.join(made_up)} could not be found on the "
+            "drawing. Check them against the sheet before pricing.")
+    if missed:
+        warnings.append(
+            f"Door number(s) {', '.join(missed)} are on the drawing but were not "
+            "read. Add them before pricing.")
+    if made_up or missed:
+        log.info("ai_vision unconfirmed=%d missed=%d", len(made_up), len(missed))
+    return warnings
+
+
 def _render_within_limit(doc: PdfDoc, page: int, dpi: int) -> bytes:
     """The page as a PNG the provider will accept.
 
@@ -338,6 +376,10 @@ async def read_tables(doc: PdfDoc, page: int) -> list[VisionTable]:
     for table, text_box, model_box in zip(tables, placed, model_boxes):
         table.box = (_padded(page, text_box, "text")
                      or _padded(page, model_box, "model"))
+    if checkable:
+        items = [i for i in doc.text_items(page - 1) if i.horizontal]
+        for table in tables:
+            table.warnings.extend(_unconfirmed(items, table.rows))
     log.info("ai_vision page=%s tables=%s rows=%s", page, len(tables),
              [len(t.rows) for t in tables])
     return tables
