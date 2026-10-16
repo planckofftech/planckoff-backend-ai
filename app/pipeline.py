@@ -382,6 +382,31 @@ async def _read_unread_sheets(doc: PdfDoc, pages: list[int],
     return tables
 
 
+# Told to the person when the image reader's provider refused a fallback read.
+# What happened, never why.
+_AI_DOWN = ("Some sheets could not be read as images right now. Read the set "
+            "again later to include them.")
+
+
+async def _fallback_read(doc: PdfDoc, pages: list[int], warnings: list[str],
+                         door_pages: dict[int, str]) -> list[ScheduleTable] | None:
+    """The image reader as a fallback: None when its provider refused.
+
+    A fallback that fails must leave the answer it was backing up. A revoked
+    key turned a set correctly found to hold no door schedule into "reading
+    failed", after the text tier had already given the right answer. Asked for
+    by a person, the provider's refusal still surfaces -- that read has nothing
+    else to stand on.
+    """
+    try:
+        return await _read_unread_sheets(doc, pages, warnings,
+                                         door_pages=door_pages)
+    except AiUpstreamError as exc:
+        log.error("ai fallback skipped, provider refused: %s", exc)
+        warnings.append(_AI_DOWN)
+        return None
+
+
 def _ai_result(tables: list[ScheduleTable], pages_scanned: int, started: float,
                warnings: list[str], page_scores: list | None = None,
                status: str = "ok") -> ExtractionResult:
@@ -698,15 +723,13 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                 # only page with any text was an electrical one: the re-read
                 # came back with its LIGHT FIXTURE SCHEDULE, nine columns wide,
                 # and nine beat the four we had. It won on width alone.
-                reread: list[ScheduleTable] = []
                 reread_warnings: list[str] = []
-                try:
-                    reread = await _read_unread_sheets(doc, [best.page],
-                                                       reread_warnings,
-                                                       door_pages=door_pages)
-                except AiUpstreamError:
-                    raise
-                if reread and max(len(t.headers) for t in reread) > len(best.headers):
+                reread = await _fallback_read(doc, [best.page], reread_warnings,
+                                              door_pages)
+                if reread is None:
+                    # The measured read stands; the provider is the one at fault.
+                    warnings.extend(reread_warnings)
+                elif reread and max(len(t.headers) for t in reread) > len(best.headers):
                     warnings.extend(reread_warnings)
                     return _ai_result(reread, pages_scanned, started, warnings,
                                       page_scores, status)
@@ -723,9 +746,10 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
             # drawn as linework -- was dropped without a word. Read the rest as
             # images and add them, rather than returning two thirds of a set.
             if allow_ai and settings.ai_enabled:
-                tables += await _read_unread_sheets(
-                    doc, _unread_door_sheets(door_pages, accepted_pages), warnings,
-                    door_pages=door_pages)
+                unread_sheets = _unread_door_sheets(door_pages, accepted_pages)
+                if unread_sheets:
+                    tables += await _fallback_read(
+                        doc, unread_sheets, warnings, door_pages) or []
             _levels_from_titles(tables)
             # Every door on the sheet, not the biggest table's doors.
             #
@@ -803,8 +827,9 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
             )
             raise _give_up()
 
-        tables = await _read_unread_sheets(doc, ai_pages, warnings,
-                                           door_pages=door_pages)
+        # The provider refusing gives the answer reached without it, as if the
+        # fallback were not set up.
+        tables = await _fallback_read(doc, ai_pages, warnings, door_pages)
         if tables:
             return _ai_result(tables, pages_scanned, started, warnings,
                               page_scores)

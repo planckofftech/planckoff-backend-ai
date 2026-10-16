@@ -6,6 +6,8 @@ is Python and not an extension of the TypeScript app (PLAN.md section 3).
 
 from __future__ import annotations
 
+import re
+import string
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -157,6 +159,58 @@ def _is_horizontal(direction: tuple[float, float], matrix: "fitz.Matrix") -> boo
     return abs(tdx) >= abs(tdy)
 
 
+# Text drawn in a font embedded without its character map arrives as the
+# font's own glyph numbers. Real text never holds control characters, so a font
+# whose text does is one of these -- see `_glyph_code_shifts`.
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_READABLE = set(string.ascii_letters + string.digits + " .,-/'\"#&():;%+*=")
+_MIN_READABLE = 0.9
+
+
+def _glyph_code_shifts(raw: dict) -> dict[str, int]:
+    """For each font whose text is glyph numbers, the shift that reads it.
+
+    A CAD export can embed a font without the map from its glyphs to letters;
+    the text layer then holds glyph numbers, which sit a fixed distance below
+    the letters they draw. One set's title blocks read "$-806" with control
+    characters for A-806, and "62&,$/" for SOCIAL. The sheet numbers matched
+    nothing in the drawing index and no sheet title named a floor plan, so the
+    schedule sheets were never led to and the plans were never found.
+
+    The distance is measured, not assumed: it is the shift that turns all of
+    the font's text on the page into ordinary characters. A font for which no
+    shift does is left as it came.
+    """
+    by_font: dict[str, list[str]] = {}
+    for block in raw.get("blocks", ()):
+        for line in block.get("lines", ()):
+            for span in line.get("spans", ()):
+                by_font.setdefault(span.get("font", ""), []).append(span["text"])
+
+    shifts: dict[str, int] = {}
+    for font, texts in by_font.items():
+        joined = "".join(texts)
+        if not _CONTROL.search(joined):
+            continue
+        chars = [ord(ch) for ch in joined if not ch.isspace() or _CONTROL.match(ch)]
+        # Only a font whose text as it stands cannot be read. A readable font
+        # with one stray symbol in it -- a bullet stored as a control code --
+        # was shifted wholesale on one set, and every word in it turned to
+        # nonsense.
+        if sum(chr(code) in _READABLE for code in chars) >= len(chars) * _MIN_READABLE:
+            continue
+        best, best_share = 0, 0.0
+        # Most of it, not all: a symbol drawn in the same font -- a trademark
+        # sign in a title block -- has no ordinary character to land on.
+        for shift in range(1, 96):
+            share = sum(chr(code + shift) in _READABLE for code in chars) / len(chars)
+            if share > best_share:
+                best, best_share = shift, share
+        if best and best_share >= _MIN_READABLE:
+            shifts[font] = best
+    return shifts
+
+
 class PdfDoc:
     """Owns a fitz.Document. Use as a context manager."""
 
@@ -236,13 +290,22 @@ class PdfDoc:
         # CAD exports routinely draw the same run twice at the same spot. Left
         # in, every such cell reads "VALUE VALUE" once the cell text is joined.
         seen: set[tuple[int, int, str]] = set()
+        shifts = _glyph_code_shifts(raw)
         for block in raw["blocks"]:
             if block.get("type") != 0:  # 0 = text, 1 = image
                 continue
             for line in block["lines"]:
                 horizontal = _is_horizontal(line.get("dir", (1.0, 0.0)), matrix)
                 for span in line["spans"]:
-                    text = span["text"].strip()
+                    text = span["text"]
+                    shift = shifts.get(span.get("font", ""))
+                    # Only a span that is itself unreadable. A font can carry
+                    # both: one set's notes font reads DOOR GENERAL NOTES
+                    # correctly beside runs of glyph numbers, and shifting the
+                    # whole font turned the readable words to nonsense.
+                    if shift and _CONTROL.search(text):
+                        text = "".join(chr(ord(ch) + shift) for ch in text)
+                    text = text.strip()
                     if not text:
                         continue
                     rect = fitz.Rect(span["bbox"]) * matrix

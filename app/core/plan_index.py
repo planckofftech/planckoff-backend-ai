@@ -527,7 +527,16 @@ def index_sheets(doc: PdfDoc) -> list[PlanSheet]:
     """
     from_toc = from_bookmarks(doc)
     if len(from_toc) >= max(_MIN_BOOKMARKS, doc.page_count // 3):
-        return from_toc
+        # The outline names the pages it covers, and only those. A set merged
+        # from several files can carry the outline of some and not the others:
+        # one had bookmarks for its cover and for every consultant's sheets,
+        # and none for the 82 architectural pages between them -- every floor
+        # plan in the set -- so no plan was ever found. The pages it leaves out
+        # are read from their title blocks.
+        covered = {s.page for s in from_toc}
+        rest = [sheet_of(doc, page) for page in range(1, doc.page_count + 1)
+                if page not in covered]
+        return sorted(from_toc + rest, key=lambda s: s.page)
     log.info("plan_index: no usable outline; reading %d title blocks",
              doc.page_count)
     return [sheet_of(doc, page) for page in range(1, doc.page_count + 1)]
