@@ -199,6 +199,28 @@ def _metric_columns(columns: list[list[str]], mapped: list[str | None]) -> set[i
     return metric
 
 
+# A door size written as a bare number, with at most the W or H a combined
+# size cell marks it with: 965, 2135H.
+_BARE_SIZE = re.compile(r"^(\d{3,4})\s*[WH]?$", re.IGNORECASE)
+# No door is this many inches wide or high, so a bare size this large is in
+# millimetres.
+_MIN_BARE_MM = 300
+
+
+def _bare_millimetres(text: str) -> str | None:
+    """A door's width or height written in millimetres without the unit.
+
+    A metric schedule states the unit once, in a note or a heading, and then
+    prints 965 and 2135. `_metric_columns` needs the unit on the value, so
+    these stayed as they were: a width of 965, read anywhere else as feet. For
+    a door's width or height, a bare number this large has only one meaning.
+    """
+    found = _BARE_SIZE.match((text or "").strip())
+    if not found or int(found.group(1)) < _MIN_BARE_MM:
+        return None
+    return dimensions.to_feet_inches(f"{found.group(1)} mm")
+
+
 def _is_noise(cells: list[str], tag_col: int) -> bool:
     """Drop grid artefacts that survived the row walk.
 
@@ -282,7 +304,10 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         claimed = header_strings[mapped.index("door_tag")]
         unmapped = [h for h in unmapped if h != claimed]
     tag_col = header_mapper.tag_column_index(mapped)
-
+    # What the headings decided, checked against what the columns hold.
+    mapped, size_col = header_mapper.settle_with_values(mapped, header_strings,
+                                                        columns)
+    unmapped = header_mapper.unmapped_headers(header_strings, mapped)
 
     rows: list[DoorRow] = []
     # How many cells were written in millimetres. Counted so the caller is told
@@ -324,6 +349,17 @@ def extract_page(doc: PdfDoc, candidate: PageCandidate,
         # A second line of the heading, wearing a door's clothes.
         if _is_heading_row(values.get("door_tag", "")):
             continue
+        if size_col is not None:
+            pair = header_mapper.size_pair(cells[size_col]
+                                           if size_col < len(cells) else "")
+            for field, part in zip(("door_width", "door_height"), pair or ()):
+                if not values.get(field):
+                    values[field] = part
+        for field in ("door_width", "door_height"):
+            sized = _bare_millimetres(values.get(field, ""))
+            if sized:
+                values[field] = sized
+                metric += 1
         _split_run_on_tag(values)
         rows.append(DoorRow(**values, level=band, extra=extra))
 

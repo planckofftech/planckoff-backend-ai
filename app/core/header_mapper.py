@@ -277,6 +277,89 @@ def infer_tag_column(mapped: list[str | None], columns: list[list[str]],
     return updated
 
 
+# Fields every door has: a door schedule states each door's width and height.
+# The word that names each, wherever it stands in a stacked heading.
+_EVERY_DOOR = {"door_width": "WIDTH", "door_height": "HEIGHT"}
+# Fields that name something -- a hardware set, a door type. A checkmark names
+# nothing.
+_IDENTIFIERS = ("hw_set", "door_type")
+# Two sizes in one cell, width first: 965W x 2135H, 3'-0" x 7'-0".
+_SIZE_PAIR = re.compile(r"^\s*(\d[^xX×]*?)\s*[xX×]\s*(\d.*?)\s*$")
+
+
+def _filled(values: list[str]) -> list[str]:
+    return [v.strip() for v in values if v and v.strip()]
+
+
+def settle_with_values(mapped: list[str | None], headers: list[str],
+                       columns: list[list[str]]) -> tuple[list[str | None], int | None]:
+    """Check what the headings decided against what the columns hold.
+
+    Returns the corrected fields and the column, if any, holding each door's
+    width and height together.
+
+    Headings alone mislead on a schedule whose headings are stacked three
+    deep. One set prints FRAME DATA / LITES / SIDELITE / WIDTH and FRAME DATA /
+    LITES / TRANSOM / HEIGHT before the door panel's own WIDTH, and the first
+    heading carrying the word took the field: every door's width came back as
+    the one sidelite's 495, and its height as a transom's. The values settle
+    it, by what a door schedule is:
+
+    - every door has a width and a height, so a column filled for one door in
+      seventy-nine belongs to a part of some doors -- the sidelite, the
+      transom -- and the door's own is the one filled for most of them;
+    - a hardware set or a door type names something, and a column of the same
+      checkmark on every filled row names nothing;
+    - a cell holding two sizes joined by an x -- 965W x 2135H -- states the
+      door's width and height together, and is read for whichever of them no
+      column of its own supplied.
+    """
+    rows = max((len(c) for c in columns), default=0)
+    out = list(mapped)
+
+    def filled(i: int) -> list[str]:
+        return _filled(columns[i]) if i < len(columns) else []
+
+    for i, field in enumerate(out):
+        if field in _IDENTIFIERS:
+            values = filled(i)
+            if values and all(len(v) <= 1 and not v.isalnum() for v in values):
+                out[i] = None
+
+    for field, word in _EVERY_DOOR.items():
+        current = out.index(field) if field in out else None
+        if current is not None and len(filled(current)) * 2 >= rows:
+            continue
+        candidates = [
+            i for i in range(min(len(headers), len(out)))
+            if (out[i] is None or i == current)
+            and f" {word} " in f" {normalize(headers[i])} "
+            and len(filled(i)) * 2 >= rows
+        ]
+        if current is not None:
+            out[current] = None
+        if candidates:
+            out[max(candidates, key=lambda i: len(filled(i)))] = field
+
+    size_col = None
+    if "door_width" not in out or "door_height" not in out:
+        for i in range(min(len(columns), len(out))):
+            if out[i] is not None:
+                continue
+            values = filled(i)
+            pairs = sum(1 for v in values if _SIZE_PAIR.match(v))
+            if values and len(values) * 2 >= rows and pairs * 2 > len(values):
+                size_col = i
+                break
+    return out, size_col
+
+
+def size_pair(text: str) -> tuple[str, str] | None:
+    """The width and height in a cell holding both, as written."""
+    found = _SIZE_PAIR.match(text or "")
+    return (found.group(1), found.group(2)) if found else None
+
+
 def unmapped_headers(headers: list[str], mapped: list[str | None]) -> list[str]:
     return [headers[i] for i, field in enumerate(mapped)
             if field is None and i < len(headers) and headers[i]]
