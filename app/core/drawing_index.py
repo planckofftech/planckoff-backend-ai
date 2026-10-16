@@ -184,6 +184,27 @@ def _entry(number, items) -> IndexEntry | None:
     return None
 
 
+def normal_number(number: str) -> str:
+    """A sheet number as the index and title blocks are compared."""
+    return _normal(number)
+
+
+def own_number(doc: PdfDoc, page: int, listed: dict[str, IndexEntry]
+               ) -> IndexEntry | None:
+    """The index entry this page prints as its own number, or None.
+
+    The largest text on the page that the index lists. References to other
+    sheets -- 3/A-404 under a section mark -- are set smaller than the title
+    block's own number, and grid bubbles are not in the index at all.
+    """
+    best = None
+    for item in doc.text_items(page - 1):
+        entry = listed.get(_normal(item.text.strip()))
+        if entry is not None and (best is None or item.size > best[0]):
+            best = (item.size, entry)
+    return best[1] if best else None
+
+
 def sheet_number_of(doc: PdfDoc, page: int, *, ocr: bool = True) -> str:
     """The sheet number in this page's title block, normalised, or ''.
 
