@@ -54,6 +54,7 @@ def build_rows(grid: TableGrid, items: list[TextItem], tag_col: int) -> list[lis
     body = [
         i for i in items
         if i.horizontal and i.y0 > grid.header_bottom
+        and (grid.bottom is None or i.cy <= grid.bottom)
         and grid.column_of(i.x0) is not None
     ]
     if not body:
