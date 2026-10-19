@@ -6,12 +6,15 @@ is Python and not an extension of the TypeScript app (PLAN.md section 3).
 
 from __future__ import annotations
 
+import logging
 import re
 import string
 from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
+
+log = logging.getLogger(__name__)
 
 
 class NotAPdfError(ValueError):
@@ -211,6 +214,17 @@ def _glyph_code_shifts(raw: dict) -> dict[str, int]:
     return shifts
 
 
+# Memory taken per byte of a page's drawing instructions once parsed into
+# paths; the upper end of what was measured -- see PdfDoc.geometry_mb.
+_PARSED_BYTES_PER_BYTE = 35
+
+
+def _geometry_budget_mb() -> int:
+    from app.config import get_settings
+
+    return get_settings().geometry_budget_mb
+
+
 class PdfDoc:
     """Owns a fitz.Document. Use as a context manager."""
 
@@ -334,13 +348,38 @@ class PdfDoc:
         """
         if self._drawing_page == page_index:
             return self._drawing_cache
-        try:
-            paths = self.doc[page_index].get_drawings()
-        except Exception:  # noqa: BLE001 - malformed content streams happen
+        # Let the last sheet go before parsing the next. Held across the parse,
+        # two busy sheets sat in memory at once.
+        self._drawing_page, self._drawing_cache, self._drawing_index = None, None, None
+        estimate = self.geometry_mb(page_index)
+        budget = _geometry_budget_mb()
+        if estimate > budget:
+            log.warning("page %d: about %.0f MB of drawing geometry, over the %d MB "
+                        "budget; door swings on this sheet are not measured",
+                        page_index + 1, estimate, budget)
             paths = None
+        else:
+            try:
+                paths = self.doc[page_index].get_drawings()
+            except Exception:  # noqa: BLE001 - malformed content streams happen
+                paths = None
         self._drawing_page, self._drawing_cache = page_index, paths
         self._drawing_index = None
         return paths
+
+    def geometry_mb(self, page_index: int) -> float:
+        """Roughly how much memory this page's parsed vector paths would take.
+
+        Read off the size of the page's drawing instructions, which costs a
+        fraction of a second: parsed, each byte of them takes 24-35 bytes of
+        memory (measured on sheets from 2.5 to 138 MB of instructions).
+        """
+        try:
+            size = sum(len(self.doc.xref_stream(x) or b"")
+                       for x in self.doc[page_index].get_contents())
+        except Exception:  # noqa: BLE001 - an unreadable stream is parsed as before
+            return 0.0
+        return size * _PARSED_BYTES_PER_BYTE / 1048576
 
     def _path_index(self, page_index: int, paths: list) -> dict:
         """Which paths lie in which part of the sheet, built once per page.

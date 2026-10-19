@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     # with the memory, not with the core count.
     max_concurrent_extractions: int = 1
 
+    # Memory one sheet's vector geometry may take when measuring door swings.
+    # One plan sheet carries 2.9 million paths -- a hatch drawn as lines -- and
+    # loading them took 4.4 GB, past the 4 GiB instance, which killed the plan
+    # pass with no trace. A sheet estimated over this is not measured; its doors
+    # are still placed by their printed numbers.
+    geometry_budget_mb: int = 2000
+
     # Page-finder thresholds. Fitted to one document -- see PLAN.md section 8.
     min_header_hits: int = 5
     min_tag_run: int = 8
