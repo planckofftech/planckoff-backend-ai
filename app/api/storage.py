@@ -18,7 +18,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
@@ -348,32 +348,74 @@ async def reading_job(job_id: str, _key: str = Depends(require_api_key)):
 _PLAN_PASSES: set[asyncio.Task] = set()
 
 
-def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None) -> None:
-    """Locate the doors on the plans after the upload has been answered.
+# What a person waiting on the plans is told. What happened, never why.
+_PLAN_FAILED = "Locating doors on the plans failed. Please try again."
 
-    The pass reads its own copy of the PDF: the request that started it
-    deletes its file as soon as it answers. It waits its turn for a worker like
-    every other extraction, and a failure costs the plan results only -- the
-    schedule is already stored.
+
+def _plan_job(project_id: str, document_id: str, source_key: str | None) -> str | None:
+    """Open a plan job for a document, or None where jobs cannot be recorded."""
+    try:
+        return store.create_job(project_id, kind="plan", source_key=source_key,
+                                filename=None, document_id=document_id)
+    except Exception as exc:  # noqa: BLE001 - the pass still runs without one
+        log.warning("plan job not recorded for %s: %s", document_id, exc)
+        return None
+
+
+def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
+                     job_id: str | None = None, *, key: str | None = None,
+                     detect: bool = False, budget_usd: float | None = None) -> None:
+    """Locate the doors on the plans after the request has been answered, and
+    record how it went on the plan job.
+
+    Locating doors on a large set runs for many minutes, and it used to leave
+    no trace: a pass that failed, or a server that stopped mid-way, looked
+    exactly like a pass still running, and the plan screen waited for ever.
+    The job says running, ready with the doors located, or failed.
+
+    Reads its own copy of the PDF -- `path`, copied, or the stored file under
+    `key` -- since the request that started it deletes its file on answering.
+    It waits its turn for a worker like every other extraction, and a failure
+    costs the plan results only; the schedule is already stored.
     """
-    handle, name = tempfile.mkstemp(suffix=".pdf")
-    os.close(handle)
-    owned = Path(name)
-    shutil.copyfile(path, owned)
+    owned: Path | None = None
+    if path is not None:
+        handle, name = tempfile.mkstemp(suffix=".pdf")
+        os.close(handle)
+        owned = Path(name)
+        shutil.copyfile(path, owned)
 
     async def run() -> None:
+        nonlocal owned
         started = time.perf_counter()
         try:
-            found = await in_worker(audit(owned, rows=rows, schedule_page=schedule_page))
+            if owned is None:
+                owned = await asyncio.to_thread(files.fetch, key)
+            found = await in_worker(audit(owned, rows=rows, detect=detect,
+                                          budget_usd=budget_usd,
+                                          schedule_page=schedule_page))
             store.save_audit(document_id, found)
+            if job_id:
+                store.finish_job(job_id, "ready", document_id=document_id,
+                                 doors=len(found.located))
             log.info("plan pass stored for %s: %d of %d doors located in %.0f s",
                      document_id, len(found.located), found.door_count,
                      time.perf_counter() - started)
         except Exception as exc:  # noqa: BLE001 - the schedule still stands
             log.warning("plan pass failed for %s after %.0f s: %s", document_id,
                         time.perf_counter() - started, exc)
+            if job_id:
+                try:
+                    store.finish_job(job_id, "failed", message=_PLAN_FAILED,
+                                     document_id=document_id)
+                except Exception:  # noqa: BLE001 - the stale check covers it
+                    pass
         finally:
-            owned.unlink(missing_ok=True)
+            if owned is not None:
+                if path is not None:
+                    owned.unlink(missing_ok=True)
+                else:
+                    files.discard(owned)
 
     task = asyncio.get_running_loop().create_task(run())
     _PLAN_PASSES.add(task)
@@ -422,7 +464,8 @@ async def _read_and_store(project_id: str, path, *, filename: str,
     located = None
     if plans:
         _plan_pass_later(document_id, path, result.rows,
-                         result.source_pages[0] if result.source_pages else None)
+                         result.source_pages[0] if result.source_pages else None,
+                         _plan_job(project_id, document_id, source_uri))
 
     # `doors` is what was stored, not what was read. They differ whenever a
     # number repeats within a level -- one set prints a partial schedule on an
@@ -569,7 +612,22 @@ async def stored_document(
             measured = [d for d in measured if d.get("is_primary")]
         out["detections"] = _name_the_counted_sheet(measured + placed, sheets)
         out["suppressed"] = len(store.tombstones(document_id))
+    out["plan_status"] = _plan_status(document_id)
     return out
+
+
+def _plan_status(document_id: str) -> dict[str, Any] | None:
+    """How the document's latest plan pass is going, or None if none was
+    recorded: reading while it runs, then ready (doors located) or failed."""
+    try:
+        job = store.latest_job(document_id, "plan")
+    except Exception:  # noqa: BLE001 - a status is not worth failing the read
+        return None
+    if job is None:
+        return None
+    return {"job_id": job["id"], "status": job["status"], "message": job.get("message"),
+            "located": job.get("doors"), "started_at": job.get("created_at"),
+            "updated_at": job.get("updated_at")}
 
 
 def _name_the_counted_sheet(detections: list[dict],
@@ -967,9 +1025,17 @@ async def audit_document(
                                             "only part that costs money."),
     budget_usd: float | None = Query(None, gt=0,
                                      description="Ceiling for this request"),
+    background: bool = Query(False, description="Answer at once with a plan "
+                             "job id and locate the doors after; poll GET "
+                             "/jobs/{job_id} or read plan_status on the "
+                             "document"),
     _key: str = Depends(require_api_key),
 ):
     """Locate a stored schedule's doors on the plans, as a separate call.
+
+    With `background=true` the call answers at once with a plan job, and the
+    pass runs for as long as the set needs. A pass already running for this
+    document is returned rather than started twice.
 
     Reading the table is steady at about ten seconds whatever the set; locating
     the doors runs from thirty seconds to over two minutes and is what the wait
@@ -1006,6 +1072,18 @@ async def audit_document(
 
     pages = (db.table("schedules").select("page")
              .eq("document_id", document_id).order("page").execute().data)
+    schedule_page = pages[0]["page"] if pages else None
+
+    if background:
+        running = store.latest_job(document_id, "plan")
+        if running and running["status"] == "reading":
+            return JSONResponse(status_code=status.HTTP_202_ACCEPTED,
+                                content={"job_id": running["id"], "status": "reading"})
+        job_id = _plan_job(found["project_id"], document_id, key)
+        _plan_pass_later(document_id, None, rows, schedule_page, job_id, key=key,
+                         detect=detect, budget_usd=budget_usd)
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED,
+                            content={"job_id": job_id, "status": "reading"})
 
     path = await asyncio.to_thread(files.fetch, key)
     try:

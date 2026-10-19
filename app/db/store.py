@@ -183,13 +183,28 @@ def set_project_status(project_id: str, status: str) -> bool:
 
 # A job still 'reading' after this long was left by a server that stopped.
 JOB_STALE_MINUTES = 45
+# Locating doors on the plans of a large set legitimately runs past half an
+# hour -- one 107-door water-treatment set took 37 minutes -- so a plan job is
+# given longer before it is called interrupted.
+PLAN_STALE_MINUTES = 120
+
+# What a person waiting is told when a job was left behind. What happened, never why.
+_INTERRUPTED = {
+    "plan": "Locating doors on the plans was interrupted. Please try again.",
+}
+_INTERRUPTED_READ = "Reading this drawing set was interrupted. Please upload it again."
 
 
 def create_job(project_id: str, *, kind: str, source_key: str | None,
-               filename: str | None) -> str:
-    """Start a reading job and return its id."""
+               filename: str | None, document_id: str | None = None) -> str:
+    """Start a job and return its id.
+
+    `kind` is read or reread for reading a set, plan for locating its doors on
+    the plans. A plan job names its document from the start, so the document
+    can say how its plan pass is going.
+    """
     row = {"project_id": project_id, "kind": kind, "source_key": source_key,
-           "filename": filename, "status": "reading"}
+           "filename": filename, "status": "reading", "document_id": document_id}
     return client().table("reading_jobs").insert(row).execute().data[0]["id"]
 
 
@@ -198,32 +213,45 @@ def finish_job(job_id: str, status: str, *, message: str | None = None,
     """Record how a job ended: ready, no_schedule or failed."""
     from datetime import datetime, timezone
 
-    client().table("reading_jobs").update({
-        "status": status, "message": message, "document_id": document_id,
-        "doors": doors, "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", job_id).execute()
+    update = {"status": status, "message": message, "doors": doors,
+              "updated_at": datetime.now(timezone.utc).isoformat()}
+    if document_id is not None:
+        update["document_id"] = document_id
+    client().table("reading_jobs").update(update).eq("id", job_id).execute()
 
 
-def get_job(job_id: str) -> dict[str, Any] | None:
-    """A job as the caller should see it, or None if there is no such job.
+def _as_seen(job: dict[str, Any]) -> dict[str, Any]:
+    """A job as the caller should see it.
 
-    A job still 'reading' long after it started was left behind by a server
-    that stopped mid-read. It is reported as failed, so a waiting screen ends
+    A job still 'reading' long after it last moved was left behind by a server
+    that stopped mid-way. It is reported as failed, so a waiting screen ends
     with an answer instead of waiting for ever.
     """
     from datetime import datetime, timezone
 
-    found = client().table("reading_jobs").select("*").eq("id", job_id).execute()
-    if not found.data:
-        return None
-    job = found.data[0]
-    if job["status"] == "reading":
-        started = datetime.fromisoformat(job["updated_at"].replace("Z", "+00:00"))
-        if (datetime.now(timezone.utc) - started).total_seconds() > JOB_STALE_MINUTES * 60:
-            job["status"] = "failed"
-            job["message"] = ("Reading this drawing set was interrupted. "
-                              "Please upload it again.")
+    if job["status"] != "reading":
+        return job
+    limit = PLAN_STALE_MINUTES if job.get("kind") == "plan" else JOB_STALE_MINUTES
+    moved = datetime.fromisoformat(job["updated_at"].replace("Z", "+00:00"))
+    if (datetime.now(timezone.utc) - moved).total_seconds() > limit * 60:
+        job["status"] = "failed"
+        job["message"] = _INTERRUPTED.get(job.get("kind"), _INTERRUPTED_READ)
     return job
+
+
+def get_job(job_id: str) -> dict[str, Any] | None:
+    """A job as the caller should see it, or None if there is no such job."""
+    found = client().table("reading_jobs").select("*").eq("id", job_id).execute()
+    return _as_seen(found.data[0]) if found.data else None
+
+
+def latest_job(document_id: str, kind: str) -> dict[str, Any] | None:
+    """The most recent job of this kind for a document, as the caller should
+    see it, or None if it never had one."""
+    found = (client().table("reading_jobs").select("*")
+             .eq("document_id", document_id).eq("kind", kind)
+             .order("created_at", desc=True).limit(1).execute())
+    return _as_seen(found.data[0]) if found.data else None
 
 
 def stored_keys(project_id: str) -> list[str]:
