@@ -38,6 +38,7 @@ from app.schemas import (
     DoorLocation,
     DoorRow,
     DoorSightingOut,
+    PageRef,
     PlanAudit,
     ScanCost,
     SheetRef,
@@ -68,6 +69,14 @@ _PAIR_OPENING = 1.5
 # and drawing this door on it is worse than leaving it unmeasured.
 _TAG_REACH = 1.0
 _DRY_RUN: ContextVar[bool] = ContextVar("plan_audit_dry_run", default=False)
+# Below this share of the schedule shown on the sheets found by door number,
+# the sheets named as floor plans are searched as well.
+_FEW_SHOWN = 0.5
+# Below this many pieces of text, a page's drawing cannot be read as text. A
+# sheet whose lettering was drawn as lines keeps only its title block: 20 to 58
+# pieces on every plan of one such set, where vector sheets in the other sets
+# carry 70 and up. A scan carries none at all.
+_UNREADABLE_SPANS = 60
 
 _COVERAGE_NOTE = (
     "Doors are matched by their number as printed on the floor plans. This "
@@ -126,6 +135,10 @@ def _sheets_worth_scanning(plans, tags_on: dict[int, set[str]]):
     by_page = {s.page: s for s in plans}
     pages = [p for p in tags_on if p in by_page and tags_on[p]]
     if not pages:
+        # No door number was found on any of them as text -- a scanned set,
+        # or one that draws its numbers as linework. Sweeping a sheet with
+        # nothing known on it is a whole-page scan, about 60 tiles, so none is
+        # read here; the person chooses which to read (POST .../reprocess).
         return [], [s.number or f"p{s.page}" for s in plans]
 
     # The sheet showing the most doors is the main plan by definition.
@@ -639,7 +652,8 @@ def _group_by_door(doors: list[DetectedDoorOut]) -> None:
 
 
 async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
-                  budget_usd: float, names: dict[int, str]
+                  budget_usd: float, names: dict[int, str],
+                  every_sheet: bool = False
                   ) -> tuple[list[DetectedDoorOut], ScanCost, list[str]]:
     """Find the doors as shapes, and match each to the schedule door beside it.
 
@@ -691,9 +705,19 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
     warnings: list[str] = []
     cache: dict[str, list[dict]] = {}
 
-    chosen, skipped = _sheets_worth_scanning(plans, tags_on)
+    # Sheets a person named are read whole, every one of them. They named them
+    # because the election got it wrong -- on one set it skipped every plan,
+    # because none printed its door numbers as text -- so it does not get a
+    # second vote.
+    chosen, skipped = ((list(plans), []) if every_sheet
+                       else _sheets_worth_scanning(plans, tags_on))
     scanned_tags = {t for s in chosen for t in tags_on.get(s.page, set())}
-    if skipped:
+    if skipped and not chosen:
+        # Not "the same rooms as a sheet being scanned": none is being scanned.
+        warnings.append(
+            "No door number could be read on " + ", ".join(skipped)
+            + ", so no sheet was read for doors. Choose the sheets to read.")
+    elif skipped:
         warnings.append(
             "Skipped " + ", ".join(skipped) + ": "
             + ("that sheet draws" if len(skipped) == 1 else "those sheets draw")
@@ -1060,12 +1084,36 @@ def _name_walls(doc, plans, detected) -> None:
         log.warning("plan_audit: wall types skipped (%s)", exc)
 
 
+def _unreadable(doc: PdfDoc, page: int) -> bool:
+    """Is this page's drawing too bare of text for anything but the vision
+    model? A page that cannot be read at all is not called unreadable."""
+    try:
+        return doc.span_count(page - 1) < _UNREADABLE_SPANS
+    except Exception:  # noqa: BLE001 - a broken page is judged elsewhere
+        return False
+
+
+def _every_page(doc: PdfDoc, sheets: list) -> list[PageRef]:
+    """Every page, named where it could be, so a person can choose any of them
+    to be read again -- above all the ones no text could be read from."""
+    named = {s.page: s for s in sheets}
+    out = []
+    for page in range(1, doc.page_count + 1):
+        sheet = named.get(page)
+        out.append(PageRef(page=page, number=sheet.number if sheet else "",
+                           title=sheet.title if sheet else "",
+                           unreadable=_unreadable(doc, page)))
+    return out
+
+
 async def audit(source: bytes | str | Path, *, detect: bool = False,
                 dry_run: bool = False,
                 budget_usd: float | None = None,
                 rows: list[DoorRow] | None = None,
                 schedule_page: int = 0,
-                tag_shape: str = "") -> PlanAudit:
+                tag_shape: str = "",
+                pages: list[int] | None = None,
+                doors: set[str] | None = None) -> PlanAudit:
     """PDF in, reconciliation out. Stateless.
 
     `rows` is a schedule that has already been read. Pass it and this does not
@@ -1091,6 +1139,11 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
     reject built on the assumption that a sheet uses one size, and on some
     sheets it does not -- stands down in its favour. Left empty, the convention
     is learned from the drawing and applied leniently, as it was before.
+
+    `pages` and `doors` narrow the pass to what a person asked to be redone:
+    `pages` are the sheets to look on, read whole and in place of the ones the
+    set's own door numbers would pick; `doors` are the numbers to look for, and
+    only those come back. Either, or both -- "door 117, on A-112".
     """
     started = time.perf_counter()
     _DRY_RUN.set(dry_run)
@@ -1108,10 +1161,36 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             rows, best_page = _read_schedule(doc, sheets, pages_scanned)
 
         tags = {r.door_tag for r in rows if r.door_tag}
-        # The sheets this set's door numbers are printed on, where they are
-        # printed as text; titles only where they are not.
-        plans = (plan_index.door_plans(doc, sheets, tags, {best_page} if best_page else set())
-                 or plan_index.floor_plans(sheets))
+        if doors:
+            tags &= doors
+        if pages:
+            # Where a person said to look. Named by the index where it knows
+            # the page, so the sheet still carries its number and title.
+            named = {s.page: s for s in sheets}
+            plans = [named.get(p) or plan_index.PlanSheet(page=p, number="", title="")
+                     for p in sorted(set(pages)) if 1 <= p <= pages_scanned]
+        else:
+            # The sheets this set's door numbers are printed on, where they
+            # are printed as text; titles where they are not.
+            plans = plan_index.door_plans(doc, sheets, tags,
+                                          {best_page} if best_page else set())
+            titled = plan_index.floor_plans(sheets)
+            if not plans:
+                plans = titled
+            elif len(plan_index.shown_on(doc, plans, tags)) < len(tags) * _FEW_SHOWN:
+                # A code sheet listing two room numbers is not where most of
+                # the doors are. On one set the real plans were scans, with no
+                # door number as text at all, and a single text sheet carrying
+                # two of 26 kept every one of them from being looked at.
+                # Only the ones with text to read. A plan whose lettering was
+                # drawn as lines has nothing for this pass to find, and
+                # searching its millions of strokes took that set from two
+                # minutes to fifteen. It is listed as unreadable on the
+                # document, for a person to send to the vision model.
+                have = {s.page for s in plans}
+                plans = sorted(plans + [s for s in titled if s.page not in have
+                                        and not _unreadable(doc, s.page)],
+                               key=lambda s: s.page)
 
         # A small project prints its schedule on the floor plan sheet, and the
         # schedule's own column of door numbers is then the easiest thing on
@@ -1119,37 +1198,47 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         # with itself and reports that everything agrees.
         avoid = _schedule_table(doc, best_page)
 
-        sightings = locate(doc, tags, plans, avoid, shape=tag_shape)
+        numbers = {s.number for s in sheets if s.number}
+        sightings = locate(doc, tags, plans, avoid, shape=tag_shape,
+                           sheet_numbers=numbers)
 
         # Second pass, for the doors the plainly-titled plans did not account
         # for. Sheet titles are not dependable enough to be the only filter --
         # see plan_index.other_architectural.
+        # Not where a person named the sheets: looking further than they said
+        # would put their doors back on the sheets they were taken off.
         missing = {s.tag for s in sightings if not s.found}
         searched = list(plans)
-        if missing:
+        if missing and not pages:
             spare = plan_index.other_architectural(sheets, plans)
             if spare:
                 log.info("plan_audit widening to %d more architectural sheets "
                          "for %d unplaced doors", len(spare), len(missing))
                 extra = {s.tag: s for s in locate(doc, missing, spare, avoid,
-                                                  shape=tag_shape)}
+                                                  shape=tag_shape,
+                                                  sheet_numbers=numbers)}
                 sightings = [extra.get(s.tag, s) if not s.found else s
                              for s in sightings]
                 searched += spare
 
         unscheduled = door_reconcile.tagged_but_unscheduled(doc, tags, plans)
-        result = door_reconcile.reconcile(rows, sightings, plans, unscheduled)
+        # Reconciled against the doors asked about, or every door not asked
+        # about is reported missing from the plans.
+        asked = [r for r in rows if r.door_tag in tags] if doors else rows
+        result = door_reconcile.reconcile(asked, sightings, plans, unscheduled)
 
         # Page sizes are needed to express positions as fractions of the page,
         # which is what the preview draws with.
-        pages = {c.page for s in sightings for c in s.candidates}
-        pages |= {u.page for u in unscheduled}
+        # Named apart from `pages`, which is still the person's own choice and
+        # decides below whether every sheet is read.
+        sized = {c.page for s in sightings for c in s.candidates}
+        sized |= {u.page for u in unscheduled}
         # Every floor plan too, whether or not a door was placed on it: a
         # viewer that draws arcs over the sheet needs its size to set up the
         # coordinate system, and a plan with nothing found on it is exactly the
         # one somebody will want to look at.
-        pages |= {s.page for s in searched}
-        sizes = {p: doc.page_size(p - 1) for p in pages}
+        sized |= {s.page for s in searched}
+        sizes = {p: doc.page_size(p - 1) for p in sized}
 
         detected: list[DetectedDoorOut] = []
         scan_cost = None
@@ -1158,7 +1247,12 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
                        else get_settings().detect_budget_usd)
             detected, scan_cost, scan_warnings = await _detect(
                 doc, plans, sightings, rows, sizes, ceiling,
-                {s.page: s.number or f"p{s.page}" for s in sheets})
+                {s.page: s.number or f"p{s.page}" for s in sheets},
+                every_sheet=bool(pages))
+            if doors:
+                # The model reads the whole sheet; only the doors asked about
+                # are an answer to this request.
+                detected = [d for d in detected if d.tag in tags]
             result.warnings.extend(scan_warnings)
             unlabelled = [d for d in detected if not d.tag]
             if unlabelled:
@@ -1195,6 +1289,8 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         # the set draws them in, and the nearest one governs the door.
         _name_walls(doc, plans, detected)
 
+        every_page = _every_page(doc, sheets)
+
     duration = int((time.perf_counter() - started) * 1000)
     log.info("plan_audit pages=%s doors=%s located=%s detected=%s ms=%s",
              pages_scanned, len(tags), len(result.found), len(detected),
@@ -1218,6 +1314,7 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
                      is_enlargement=s.is_enlargement)
             for s in plans
         ],
+        pages=every_page,
         door_count=len(tags),
         located=[_out(s, sizes) for s in result.found],
         not_on_plans=[_out(s, sizes) for s in result.missing_from_plans],

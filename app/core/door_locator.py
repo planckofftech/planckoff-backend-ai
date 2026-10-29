@@ -34,7 +34,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
-from app.core import wall_tags
+from app.core import stacked_tags, wall_tags
 from app.core.pdf_doc import PdfDoc, TextItem
 from app.core.plan_index import SHEET_NUMBER, PlanSheet
 
@@ -53,6 +53,8 @@ _NEIGHBOUR_Y = 28.0
 # A room number sits under its room name: same column, a line or so below.
 _STACK_X = 22.0
 _STACK_Y = 26.0
+# Why a candidate lost points for being a room's number.
+_ROOM = "sits under a room name"
 # A dimension string carries feet or inch marks.
 _DIMENSION = re.compile(r"[0-9]\s*['’\"]")
 
@@ -138,17 +140,28 @@ def _looks_like_a_room_number(item: TextItem, items: list[TextItem]) -> bool:
     return False
 
 
-def _in_a_reference_bubble(item: TextItem, items: list[TextItem]) -> bool:
+def _in_a_reference_bubble(item: TextItem, items: list[TextItem],
+                           sheet_numbers: set[str] | None = None) -> bool:
     """Is this the top half of a detail or section marker?
 
     Those are drawn as a circle split in two: the detail number above, the
     sheet it lives on below -- `4` over `A4.51`. The number alone is exactly
     door-tag shaped and set at the same size, and one such marker was reported
     as an unscheduled door.
+
+    A wall-type or door-type label under a door tag is shaped like a sheet
+    number too -- `A3`, `EW2` -- and took two real doors for bubbles, so the
+    room number of the same name won. Where the set's own sheet numbers are
+    known, the lower half has to be one of them, or be written the way only a
+    sheet number is, with its separator (`A4.51`, `A-511`): a bubble can point
+    at a sheet left out of this upload.
     """
     for other in items:
         text = other.text.strip()
         if not text or other is item or not SHEET_NUMBER.match(text):
+            continue
+        if (sheet_numbers and text not in sheet_numbers
+                and not any(c in text for c in ".-")):
             continue
         if (abs(other.cx - item.cx) <= _STACK_X
                 and 0 < other.y0 - item.y0 <= _STACK_Y):
@@ -176,7 +189,8 @@ def _company(item: TextItem, items: list[TextItem], tags: set[str]) -> tuple[int
 
 def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
            avoid: dict[int, list[tuple[float, float, float, float]]] | None = None,
-           size_filter: bool = True, shape: str = "") -> list[DoorSighting]:
+           size_filter: bool = True, shape: str = "",
+           sheet_numbers: set[str] | None = None) -> list[DoorSighting]:
     """Place every tag on the given sheets. Text only -- no rendering, no AI.
 
     `avoid` lists rectangles per page that must not be searched, in page points.
@@ -203,7 +217,10 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
     Given one, a number drawn in anything else is not a door and is not a
     candidate, and the size test stands down in its favour.
 
-    It belongs here rather than downstream, and the reason is the one case the
+    `sheet_numbers` are the set's own sheet numbers, which tell a detail
+    bubble's lower half from a type label -- see `_in_a_reference_bubble`.
+
+    `shape` belongs here rather than downstream, and the reason is the one case the
     whole test exists for. This function returns the best candidate *per page*,
     so where a sheet prints the same number twice -- once in a circle at the
     door, once bare in the middle of the room -- only one of the two ever
@@ -229,6 +246,8 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
             log.info("door_locator: page %d, ignoring %d text items inside the "
                      "schedule's own %d table(s)", sheet.page,
                      before - len(items), len(blanked))
+        # `101` over `A` is door 101A -- see stacked_tags.
+        items = stacked_tags.join(items, tags)
         # A named mark stands the size test down on its own. Leaving the two
         # to be turned off separately is a trap: the size filter runs first, so
         # a caller who names the mark and forgets the other flag gets tags
@@ -255,8 +274,8 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
                 candidate.reasons.append("only occurrence on the sheet")
             if _looks_like_a_room_number(item, items):
                 candidate.score -= 3
-                candidate.reasons.append("sits under a room name")
-            if _in_a_reference_bubble(item, items):
+                candidate.reasons.append(_ROOM)
+            if _in_a_reference_bubble(item, items, sheet_numbers):
                 candidate.score -= 4
                 candidate.reasons.append("sits above a sheet reference")
             bonus, why = _company(item, items, tags)
@@ -287,7 +306,10 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
             if len(ranked) > 1 and ranked[0].score == ranked[1].score:
                 contested = True
 
-        picked.sort(key=lambda c: -c.score)
+        # A tie between sheets goes to the one that is not a room number. On
+        # one set the room 117, alone on its sheet, scored level with door 117
+        # on the next sheet, and won by coming first.
+        picked.sort(key=lambda c: (-c.score, _ROOM in c.reasons))
         best = picked[0]
         if contested:
             confidence = "ambiguous"

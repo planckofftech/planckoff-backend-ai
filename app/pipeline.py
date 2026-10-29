@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.ai import spend
 from app.ai.client import AiUnavailableError, AiUpstreamError
 from app.config import get_settings
 from app.core import header_mapper, page_finder, schedule_judge
@@ -415,6 +416,7 @@ def _ai_result(tables: list[ScheduleTable], pages_scanned: int, started: float,
     Always its tables: a result with rows and no tables imports as "no
     schedule table" -- the door sheet is filled from the tables.
     """
+    tables = _drop_attached(tables, warnings)
     rows = [r for t in tables for r in t.rows]
     widest = max(tables, key=lambda t: t.row_count)
     duration = int((time.perf_counter() - started) * 1000)
@@ -526,6 +528,52 @@ class NoRowsError(RuntimeError):
         )
 
 
+# A table is about other tables' doors when this share of its rows, and at
+# least this many, name one of them.
+_ATTACHED_SHARE = 0.5
+_ATTACHED_MIN = 3
+
+
+def _drop_attached(tables: list[ScheduleTable], warnings: list[str]) -> list[ScheduleTable]:
+    """Leave out a table whose rows each belong to a door of another table.
+
+    A sidelite schedule printed beside the door schedule reads as one: its
+    caption ran into a FRAME heading, it has a DOOR# column, and its rows carry
+    widths, types and finishes. What gives it away is that DOOR# column -- every
+    one of its twelve rows named a door of the schedule next to it (SF 1 is
+    "D36 SEE ELEVATIONS"), and it was counted as twelve more doors. Of that
+    schedule's own 41 rows, not one names another door.
+
+    Never the last table: a schedule cannot be attached to nothing.
+    """
+    if len(tables) < 2:
+        return tables
+
+    def attached(table: ScheduleTable) -> int:
+        own = {r.door_tag for r in table.rows if r.door_tag}
+        others = {r.door_tag for t in tables if t is not table for r in t.rows
+                  if r.door_tag} - own
+
+        def names_another(row) -> bool:
+            values = [v for v in row.model_dump(exclude={"extra", "door_tag"}).values()
+                      if isinstance(v, str)] + [str(v) for v in row.extra.values()]
+            return any(v.split() and v.split()[0] in others for v in values)
+
+        return sum(1 for r in table.rows if names_another(r))
+
+    dropped = [t for t in tables
+               if (n := attached(t)) >= _ATTACHED_MIN
+               and n >= len(t.rows) * _ATTACHED_SHARE]
+    if not dropped or len(dropped) == len(tables):
+        return tables
+    for table in dropped:
+        warnings.append(f"Left out {table.title or 'a table'} (page {table.page}): "
+                        "it is not a list of doors.")
+        log.info("schedule page %s: %r left out, its rows name another table's "
+                 "doors", table.page, table.title)
+    return [t for t in tables if all(t is not d for d in dropped)]
+
+
 def _levels_from_titles(tables: list[ScheduleTable]) -> None:
     """Name each table's doors by what its caption says and the others do not.
 
@@ -605,6 +653,19 @@ def _levels_from_titles(tables: list[ScheduleTable]) -> None:
 async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                   debug: bool = False, ai_read: bool = False,
                   pages: list[int] | None = None) -> ExtractionResult:
+    """PDF in, JSON out -- see `_extract` -- with what the read spent on the
+    model, across every call it made, on the result."""
+    tally = spend.start()
+    result = await _extract(source, allow_ai=allow_ai, debug=debug,
+                            ai_read=ai_read, pages=pages)
+    result.ai_model = tally.model
+    result.ai_cost_usd = round(tally.usd, 4)
+    return result
+
+
+async def _extract(source: bytes | str | Path, *, allow_ai: bool = True,
+                   debug: bool = False, ai_read: bool = False,
+                   pages: list[int] | None = None) -> ExtractionResult:
     """PDF in, JSON out. Stateless.
 
     `source` is bytes or a path. A path keeps memory flat on a large set --
@@ -750,6 +811,7 @@ async def extract(source: bytes | str | Path, *, allow_ai: bool = True,
                 if unread_sheets:
                     tables += await _fallback_read(
                         doc, unread_sheets, warnings, door_pages) or []
+            tables = _drop_attached(tables, warnings)
             _levels_from_titles(tables)
             # Every door on the sheet, not the biggest table's doors.
             #

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 
+from app.ai import spend
 from app.ai.client import AiUnavailableError, get_client
 from app.config import get_settings
 from app.schemas import CANONICAL_FIELDS
@@ -131,6 +132,7 @@ async def resolve_headers(unknown: list[str],
                 {"role": "user", "content": _prompt(cleaned, samples)},
             ],
         )
+        spend.add(settings.ai_model, getattr(response, "usage", None))
         payload = json.loads(response.choices[0].message.content or "{}")
     except Exception as exc:  # noqa: BLE001 - a tier failure is a warning
         return {}, [f"header mapping failed, columns kept as extras ({exc})"]

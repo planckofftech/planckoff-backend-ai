@@ -24,6 +24,7 @@ from urllib.parse import unquote
 from collections import defaultdict
 from dataclasses import dataclass
 
+from app.core import stacked_tags
 from app.core.pdf_doc import PdfDoc
 
 log = logging.getLogger(__name__)
@@ -601,6 +602,12 @@ def door_plans(doc: PdfDoc, sheets: list[PlanSheet], tags: set[str],
 
     Empty where the drawings print no door numbers as text; the caller then
     falls back to titles.
+
+    Titles are still asked one thing: whether the sheet is plainly a drawing
+    of something other than a plan. An exterior elevation prints every
+    exterior door's number across the sheet, as a plan does, and on one set
+    two of them and a building section outranked three of the five partial
+    floor plans, took their doors, and pushed them out.
     """
     if not tags:
         return []
@@ -611,9 +618,12 @@ def door_plans(doc: PdfDoc, sheets: list[PlanSheet], tags: set[str],
     for sheet in sheets:
         if sheet.page in schedule_pages:
             continue
-        if disciplines and sheet.discipline not in disciplines:
+        if disciplines and not _same_discipline(sheet, disciplines):
             continue
-        items = [i for i in doc.text_items(sheet.page - 1) if i.text.strip() in tags]
+        if _not_a_plan(sheet.title):
+            continue
+        items = [i for i in stacked_tags.join(doc.text_items(sheet.page - 1), tags)
+                 if i.text.strip() in tags]
         if len({i.text.strip() for i in items}) < _MIN_NEW_DOORS:
             continue
         if _in_one_column(items):
@@ -622,13 +632,77 @@ def door_plans(doc: PdfDoc, sheets: list[PlanSheet], tags: set[str],
 
     found.sort(key=lambda f: -len(f[1]))
     floor = max(_MIN_NEW_DOORS, int(len(tags) * _NEW_DOOR_SHARE))
-    covered: set[str] = set()
+    # New within its own phase. A renovation draws the same floor once per
+    # phase, so phase III repeats door numbers phases I and II already showed
+    # -- and on one set an overall index sheet claimed them first and phase
+    # III, with ten doors, was dropped as adding nothing.
+    covered: dict[str, set[str]] = defaultdict(set)
     kept = []
     for sheet, shows in found:
-        if len(shows - covered) >= floor:
+        phase = _phase_of(sheet.title)
+        if len(shows - covered[phase]) >= floor:
             kept.append(sheet)
-            covered |= shows
+            covered[phase] |= shows
     return sorted(kept, key=lambda s: s.page)
+
+
+def _phase_of(title: str) -> str:
+    found = _PHASE.search((title or "").upper())
+    return found.group(1) if found else ""
+
+
+def shown_on(doc: PdfDoc, sheets: list[PlanSheet], tags: set[str]) -> set[str]:
+    """Which of these door numbers the sheets print as text, between them."""
+    return {i.text.strip() for s in sheets
+            for i in stacked_tags.join(doc.text_items(s.page - 1), tags)
+            if i.text.strip() in tags}
+
+
+def _same_discipline(sheet: PlanSheet, disciplines: set[str]) -> bool:
+    """Is this sheet drawn by the discipline that scheduled the doors?
+
+    By the first letter, as `is_architectural` reads it: AB, AD and AE are
+    architectural sheets like A. Matching the whole prefix threw away a set's
+    basement plan, AB-111, because its schedule sat on an A sheet -- and with
+    it the one door printed nowhere else. A prefix outside the A/I disciplines
+    -- CR, a clean room -- still has to match exactly, or its C would let the
+    civil sheets in.
+
+    The first letter alone lets in too much: an interiors package numbered its
+    electrical sheets IE1.01 to IE5.01 under an I schedule, and its one-line
+    diagram then held the best-scoring door 101. So a sheet admitted on the
+    letter alone must also be titled as a floor plan -- the electrical floor
+    plan is not one, by the rule that has always said so.
+    """
+    if sheet.discipline in disciplines:
+        return True
+    first = {d[:1] for d in disciplines if d[:1] in _DRAWS_DOORS}
+    return (sheet.discipline[:1] in first
+            and sheet.discipline not in _NOT_ARCHITECTURAL
+            and sheet.discipline not in _NOT_DOOR_PLANS
+            and sheet.is_floor_plan)
+
+
+# Architectural sub-disciplines that redraw the floor for another purpose. AG
+# is graphics: a sign location plan prints every door number, as the plan
+# does, and on one set 26 of 41 -- every one a copy.
+_NOT_DOOR_PLANS = frozenset({"AG"})
+# Drawings that show doors in another projection. Never a plan unless the
+# title also says it is one -- "ENLARGED PLANS & ELEVATIONS" draws its doors in
+# plan, "PARTIAL EXTERIOR ELEVATIONS" does not.
+_OTHER_PROJECTION = ("ELEVATION", "SECTION", "DETAIL")
+# The ceiling, which repeats every door number for its lights and is never
+# where a door is drawn -- unless it shares the sheet with the floor plan.
+_CEILING = ("REFLECTED CEILING", "CEILING PLAN", "RCP")
+
+
+def _not_a_plan(title: str) -> bool:
+    """Does the title plainly name a drawing that is not a floor plan?"""
+    title = (title or "").upper()
+    if any(_says(title, word) for word in _OTHER_PROJECTION) \
+            and not _SAYS_PLAN.search(title):
+        return True
+    return any(_says(title, word) for word in _CEILING) and not _is_the_floor(title)
 
 
 def _in_one_column(items) -> bool:

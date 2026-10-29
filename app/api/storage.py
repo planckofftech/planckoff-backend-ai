@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import Caller, parse_pages, require_api_key, require_caller
 from app.config import get_settings
 from app.api.offload import in_worker
+from app.core import review
 from app.core.pdf_doc import NotAPdfError
 from app.db import files, store
 from app.db.store import _insert as _insert_rows
@@ -298,7 +299,8 @@ def _read_later(job_id: str, project_id: str, key: str, *, filename: str,
                 source_uri=key, plans=plans, allow_ai=allow_ai,
                 ai_read=ai_read, pages=pages)
             store.finish_job(job_id, "ready", document_id=done["document_id"],
-                             doors=done.get("doors"))
+                             doors=done.get("doors"), message=done.get("review"),
+                             needs_review=bool(done.get("review")))
             log.info("job %s ready in %.0f s", job_id, time.perf_counter() - started)
         except HTTPException as exc:
             detail = str(exc.detail)
@@ -333,14 +335,19 @@ async def reading_job(job_id: str, _key: str = Depends(require_api_key)):
     `status` is `reading` while the set is being read, then `ready` (with
     `document_id` and `doors`), `no_schedule` or `failed`, each with a plain
     `message` to show. Poll every few seconds until it is not `reading`.
+
+    A `ready` job with `needs_review` true is stored and can be shown, but its
+    `message` says what to check before pricing from it.
     """
     _db()
     job = store.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="No such job.")
-    return {key: job.get(key) for key in (
+    found = {key: job.get(key) for key in (
         "id", "status", "message", "document_id", "doors", "filename", "kind",
         "created_at", "updated_at")}
+    found["needs_review"] = bool(job.get("needs_review"))
+    return found
 
 
 # Plan passes running after their upload answered. Held here so a task is not
@@ -364,7 +371,9 @@ def _plan_job(project_id: str, document_id: str, source_key: str | None) -> str 
 
 def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
                      job_id: str | None = None, *, key: str | None = None,
-                     detect: bool = False, budget_usd: float | None = None) -> None:
+                     detect: bool = False, budget_usd: float | None = None,
+                     pages: list[int] | None = None,
+                     doors: set[str] | None = None) -> None:
     """Locate the doors on the plans after the request has been answered, and
     record how it went on the plan job.
 
@@ -377,6 +386,9 @@ def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
     `key` -- since the request that started it deletes its file on answering.
     It waits its turn for a worker like every other extraction, and a failure
     costs the plan results only; the schedule is already stored.
+
+    With `pages` or `doors` it is a reprocess: only those are looked at, and
+    only what they cover is replaced -- see store.save_reprocess.
     """
     owned: Path | None = None
     if path is not None:
@@ -393,11 +405,17 @@ def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
                 owned = await asyncio.to_thread(files.fetch, key)
             found = await in_worker(audit(owned, rows=rows, detect=detect,
                                           budget_usd=budget_usd,
-                                          schedule_page=schedule_page))
-            store.save_audit(document_id, found)
+                                          schedule_page=schedule_page,
+                                          pages=pages, doors=doors))
+            if pages or doors:
+                store.save_reprocess(document_id, found, pages=pages, doors=doors)
+            else:
+                store.save_audit(document_id, found)
             if job_id:
+                note = review.plans(len(found.located), found.door_count)
                 store.finish_job(job_id, "ready", document_id=document_id,
-                                 doors=len(found.located))
+                                 doors=len(found.located), message=note,
+                                 needs_review=bool(note))
             log.info("plan pass stored for %s: %d of %d doors located in %.0f s",
                      document_id, len(found.located), found.door_count,
                      time.perf_counter() - started)
@@ -476,7 +494,8 @@ async def _read_and_store(project_id: str, path, *, filename: str,
     return {"document_id": document_id, "reused": False,
             "doors": door_count, "rows_read": result.row_count,
             "method": result.method.value,
-            "located_on_plans": located}
+            "located_on_plans": located,
+            "review": review.schedule(result)}
 
 
 @router.post("/projects/{project_id}/documents",
@@ -589,8 +608,11 @@ async def stored_document(
     # blank on every door, which no row can show.
     schedules = (db.table("schedules").select("*")
                  .eq("document_id", document_id).order("page").execute().data)
+    # Every page of the set, for choosing pages to read again. `sheets` is only
+    # the door plans; this is all of them, with the ones no text could be read
+    # from marked `unreadable`. Empty until the set's next plan pass.
     out = {"document": found.data[0], "doors": doors, "sheets": sheets,
-           "schedules": schedules}
+           "schedules": schedules, "pages": store.document_pages(document_id)}
     if detections:
         measured = (db.table("detections").select("*")
                     .eq("document_id", document_id).execute().data)
@@ -626,6 +648,7 @@ def _plan_status(document_id: str) -> dict[str, Any] | None:
     if job is None:
         return None
     return {"job_id": job["id"], "status": job["status"], "message": job.get("message"),
+            "needs_review": bool(job.get("needs_review")),
             "located": job.get("doors"), "started_at": job.get("created_at"),
             "updated_at": job.get("updated_at")}
 
@@ -1106,6 +1129,124 @@ async def audit_document(
             "duration_ms": result.duration_ms,
             "stored": saved, "warnings": result.warnings,
             "coverage_note": result.coverage_note}
+
+
+# Per request, so one click cannot run up the bill.
+_MAX_REPROCESS_PAGES = 10
+_MAX_REPROCESS_DOORS = 50
+
+
+class Reprocess(BaseModel):
+    """What a person wants read again on the plans: where to look, what to look
+    for, or both. At least one."""
+
+    pages: list[int] = Field(
+        default_factory=list,
+        description="Sheets to look on, as page numbers in the drawing set. "
+        "Each is read whole, in place of the sheets the pass chose itself.")
+    doors: list[str] = Field(
+        default_factory=list,
+        description="Door numbers to look for. Only these are replaced; every "
+        "other door stays as it is. With `pages`, they are looked for on "
+        "those sheets only.")
+
+
+@router.post("/documents/{document_id}/reprocess",
+             status_code=status.HTTP_202_ACCEPTED)
+async def reprocess_document(
+    document_id: str,
+    body: Reprocess,
+    budget_usd: float | None = Query(None, gt=0,
+                                     description="Ceiling for this request"),
+    _key: str = Depends(require_api_key),
+):
+    """Read chosen sheets, chosen doors, or chosen doors on chosen sheets again
+    with the vision model, and replace only what was asked about.
+
+    Sheets only: every door on them is redone. Doors only: those doors are
+    redone wherever the set's own pass finds them. Both: those doors, on those
+    sheets. A door a person placed by hand keeps its box, and one they removed
+    stays removed.
+
+    Always a job: answers at once with a plan job id; poll GET /jobs/{job_id}.
+    """
+    pages = sorted(set(body.pages))
+    doors = list(dict.fromkeys(t.strip() for t in body.doors if t and t.strip()))
+    if not pages and not doors:
+        raise HTTPException(status_code=422,
+                            detail="Name at least one sheet or one door to reprocess.")
+    if any(p < 1 for p in pages):
+        raise HTTPException(status_code=422, detail="Page numbers start at 1.")
+    if len(pages) > _MAX_REPROCESS_PAGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Reprocess up to {_MAX_REPROCESS_PAGES} sheets at a time.")
+    if len(doors) > _MAX_REPROCESS_DOORS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Reprocess up to {_MAX_REPROCESS_DOORS} doors at a time.")
+    if not get_settings().ai_enabled:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Image reading is not set up on this server.")
+
+    db = _db()
+    found = store.stored_pdf(document_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="No such document.")
+    key = store.drawings_uri(found)
+    if not key:
+        raise HTTPException(
+            status_code=409,
+            detail="That set's file was not kept, so its plans cannot be read. "
+                   "Only sets uploaded through /uploads can be reprocessed.")
+    if not files.available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="No file store configured.")
+    # The page count is the schedule file's. Where the drawings came as a
+    # second file it says nothing about them, and the pass drops a page the
+    # drawings do not have.
+    if pages and not found.get("plans_uri"):
+        counted = (db.table("documents").select("page_count")
+                   .eq("id", document_id).execute().data)
+        page_count = counted[0].get("page_count") if counted else None
+        beyond = [p for p in pages if page_count and p > page_count]
+        if beyond:
+            raise HTTPException(
+                status_code=422,
+                detail=f"This set has {page_count} pages; there is no page "
+                       f"{', '.join(map(str, beyond))}.")
+
+    rows = _stored_rows(db, document_id)
+    if not rows:
+        raise HTTPException(
+            status_code=422,
+            detail="That document has no doors stored, so there is nothing to "
+                   "locate. Read the schedule first.")
+    known = {r.door_tag for r in rows if r.door_tag}
+    unknown = [t for t in doors if t not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Not in this schedule: {', '.join(unknown)}.")
+
+    running = store.latest_job(document_id, "plan")
+    if running and running["status"] == "reading":
+        raise HTTPException(
+            status_code=409,
+            detail="The plans of this set are already being read. Try again "
+                   "when that has finished.")
+
+    stored_pages = (db.table("schedules").select("page")
+                    .eq("document_id", document_id).order("page").execute().data)
+    schedule_page = stored_pages[0]["page"] if stored_pages else None
+
+    job_id = _plan_job(found["project_id"], document_id, key)
+    _plan_pass_later(document_id, None, rows, schedule_page, job_id, key=key,
+                     detect=True, budget_usd=budget_usd,
+                     pages=pages or None, doors=set(doors) or None)
+    return JSONResponse(status_code=status.HTTP_202_ACCEPTED,
+                        content={"job_id": job_id, "status": "reading",
+                                 "pages": pages, "doors": doors})
 
 
 class NewDetection(BaseModel):

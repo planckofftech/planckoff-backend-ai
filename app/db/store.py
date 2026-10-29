@@ -209,8 +209,10 @@ def create_job(project_id: str, *, kind: str, source_key: str | None,
 
 
 def finish_job(job_id: str, status: str, *, message: str | None = None,
-               document_id: str | None = None, doors: int | None = None) -> None:
-    """Record how a job ended: ready, no_schedule or failed."""
+               document_id: str | None = None, doors: int | None = None,
+               needs_review: bool = False) -> None:
+    """Record how a job ended: ready, no_schedule or failed -- and, for a
+    ready one, whether its answer needs a person's eye (see core.review)."""
     from datetime import datetime, timezone
 
     update = {"status": status, "message": message, "doors": doors,
@@ -218,6 +220,15 @@ def finish_job(job_id: str, status: str, *, message: str | None = None,
     if document_id is not None:
         update["document_id"] = document_id
     client().table("reading_jobs").update(update).eq("id", job_id).execute()
+    if needs_review:
+        # Apart from the rest, so a database without the column still records
+        # how the job ended; the message says the same thing in words.
+        try:
+            client().table("reading_jobs").update({"needs_review": True}).eq(
+                "id", job_id).execute()
+        except Exception as exc:  # noqa: BLE001 - the message still carries it
+            log.warning("db: needs_review not recorded -- apply "
+                        "db/020_needs_review.sql: %s", exc)
 
 
 def _as_seen(job: dict[str, Any]) -> dict[str, Any]:
@@ -548,6 +559,95 @@ def manual_detections(document_id: str) -> list[dict[str, Any]]:
         return []
 
 
+def _detection_row(org_id: str, document_id: str, sheet_id: str, door) -> dict[str, Any]:
+    """One detection as it is stored."""
+    arc = door.arc
+    return {
+        "org_id": org_id, "document_id": document_id,
+        "sheet_id": sheet_id, "door_tag": door.tag or None,
+        "x0": door.location.x0, "y0": door.location.y0,
+        "x1": door.location.x1, "y1": door.location.y1,
+        "kind": door.type, "swing": door.swing or None,
+        "source": door.source, "confidence": door.confidence or None,
+        "measured_width": door.measured_width or None,
+        "is_primary": door.primary, "sheet_scale": door.sheet_scale,
+        "also_on": door.also_on,
+        # Flat, like the box and the arc beside them: a detection is
+        # read back with `select *`, and the nested `tag_box` of the
+        # audit response is a shape no stored reader has ever seen.
+        "tag_x0": door.tag_box.x0 if door.tag_box else None,
+        "tag_y0": door.tag_box.y0 if door.tag_box else None,
+        "tag_x1": door.tag_box.x1 if door.tag_box else None,
+        "tag_y1": door.tag_box.y1 if door.tag_box else None,
+        "tag_shape": door.tag_shape or None,
+        "hinge_x": arc.hinge_x if arc else None,
+        "hinge_y": arc.hinge_y if arc else None,
+        "radius": arc.radius if arc else None,
+        "start_deg": arc.start_deg if arc else None,
+        "end_deg": arc.end_deg if arc else None,
+        "residual": arc.residual if arc else None,
+        "other_leaf": (door.other_leaf.model_dump()
+                       if door.other_leaf else None),
+    }
+
+
+def _record_walls(db, document_id: str, detected) -> None:
+    """Write each door's wall type onto `doors`, from its primary sighting.
+
+    The wall type belongs to the door, not to one sheet's sighting of it.
+    That is also what puts it within reach of `corrections`: keyed on the
+    door number, applied by `doors_current`, surviving every re-read.
+    """
+    walls = {
+        door.tag: {
+            "wall_type": door.wall_type or None,
+            "wall_type_options": door.wall_type_options or None,
+            "wall_type_source": door.wall_type_source or None,
+        }
+        for door in detected
+        if door.tag and door.primary
+        and (door.wall_type or door.wall_type_options)
+    }
+    for tag, values in walls.items():
+        db.table("doors").update(values).eq(
+            "document_id", document_id).eq("door_tag", tag).execute()
+    if walls:
+        log.info("db: wall type recorded for %d door(s)", len(walls))
+
+
+def _record_pages(db, document_id: str, pages) -> None:
+    """Every page of the set, named, for a person choosing pages to read again.
+
+    On its own, so a database without db/021_document_pages.sql still stores
+    the audit and only this list is missing.
+    """
+    if not pages:
+        return
+    try:
+        rows = [{"document_id": document_id, "page": p.page,
+                 "number": p.number or None, "title": p.title or None,
+                 "unreadable": p.unreadable} for p in pages]
+        for start in range(0, len(rows), _BATCH):
+            db.table("document_pages").upsert(
+                rows[start:start + _BATCH],
+                on_conflict="document_id,page").execute()
+    except Exception as exc:  # noqa: BLE001 - the list is extra, the audit is not
+        log.warning("db: page list not recorded -- apply "
+                    "db/021_document_pages.sql: %s", exc)
+
+
+def document_pages(document_id: str) -> list[dict[str, Any]]:
+    """Every page of a set, in order, as the last plan pass named them. Empty
+    for a set no plan pass has listed yet."""
+    try:
+        return (client().table("document_pages")
+                .select("page, number, title, unreadable")
+                .eq("document_id", document_id).order("page").execute().data)
+    except Exception as exc:  # noqa: BLE001 - a missing list is not worth failing over
+        log.warning("db: page list not read: %s", exc)
+        return []
+
+
 def save_audit(document_id: str, audit: PlanAudit) -> bool:
     """Store where each door was found and what its swing measures."""
     try:
@@ -592,55 +692,10 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
             if key in seen:
                 continue
             seen.add(key)
-            arc = door.arc
-            rows.append({
-                "org_id": org_id, "document_id": document_id,
-                "sheet_id": sheet_id[page], "door_tag": door.tag or None,
-                "x0": door.location.x0, "y0": door.location.y0,
-                "x1": door.location.x1, "y1": door.location.y1,
-                "kind": door.type, "swing": door.swing or None,
-                "source": door.source, "confidence": door.confidence or None,
-                "measured_width": door.measured_width or None,
-                "is_primary": door.primary, "sheet_scale": door.sheet_scale,
-                "also_on": door.also_on,
-                # Flat, like the box and the arc beside them: a detection is
-                # read back with `select *`, and the nested `tag_box` of the
-                # audit response is a shape no stored reader has ever seen.
-                "tag_x0": door.tag_box.x0 if door.tag_box else None,
-                "tag_y0": door.tag_box.y0 if door.tag_box else None,
-                "tag_x1": door.tag_box.x1 if door.tag_box else None,
-                "tag_y1": door.tag_box.y1 if door.tag_box else None,
-                "tag_shape": door.tag_shape or None,
-                "hinge_x": arc.hinge_x if arc else None,
-                "hinge_y": arc.hinge_y if arc else None,
-                "radius": arc.radius if arc else None,
-                "start_deg": arc.start_deg if arc else None,
-                "end_deg": arc.end_deg if arc else None,
-                "residual": arc.residual if arc else None,
-                "other_leaf": (door.other_leaf.model_dump()
-                               if door.other_leaf else None),
-            })
+            rows.append(_detection_row(org_id, document_id, sheet_id[page], door))
         _insert("detections", rows)
-
-        # The wall type belongs to the door, not to one sheet's sighting of it,
-        # so it is written onto `doors` from whichever sighting is primary.
-        # That is also what puts it within reach of `corrections`: keyed on the
-        # door number, applied by `doors_current`, surviving every re-read.
-        walls = {
-            door.tag: {
-                "wall_type": door.wall_type or None,
-                "wall_type_options": door.wall_type_options or None,
-                "wall_type_source": door.wall_type_source or None,
-            }
-            for door in audit.detected
-            if door.tag and door.primary
-            and (door.wall_type or door.wall_type_options)
-        }
-        for tag, values in walls.items():
-            db.table("doors").update(values).eq(
-                "document_id", document_id).eq("door_tag", tag).execute()
-        if walls:
-            log.info("db: wall type recorded for %d door(s)", len(walls))
+        _record_walls(db, document_id, audit.detected)
+        _record_pages(db, document_id, audit.pages)
 
         if suppressed:
             log.info("db: %d detection(s) left out -- removed by hand earlier",
@@ -655,6 +710,114 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
     except Exception as exc:  # noqa: BLE001 - storing must not break an audit
         log.warning("db: could not store the audit: %s", exc)
         return False
+
+
+def save_reprocess(document_id: str, audit: PlanAudit, *,
+                   pages: list[int] | None = None,
+                   doors: set[str] | None = None) -> dict[str, Any] | None:
+    """Store a pass a person asked for, replacing only what it was asked about.
+
+    `save_audit` rebuilds the whole document, which is right for a pass over
+    every sheet and wrong here: redoing door 117 must not wipe the 36 doors
+    nobody asked about. So the detections replaced are the ones the request
+    covers -- on the named sheets, of the named doors, or both -- and the rest
+    stand. A door a person placed by hand on a sheet is theirs; nothing is
+    written beside it there.
+
+    Returns what changed, or None where nothing could be stored.
+    """
+    try:
+        db = client()
+        document = (db.table("documents").select("id, org_id, project_id")
+                    .eq("id", document_id).execute())
+        if not document.data:
+            return None
+        org_id = document.data[0]["org_id"]
+
+        # Sheets are added, never rebuilt: manual boxes key on the page, but
+        # the frontend holds sheet ids, and a sheet nobody asked about keeps
+        # its own.
+        existing = (db.table("sheets").select("*")
+                    .eq("document_id", document_id).execute().data)
+        sheet_id = {s["page"]: s["id"] for s in existing}
+        new = [s for s in audit.floor_plans if s.page not in sheet_id]
+        made = _insert("sheets", [
+            {"document_id": document_id, "page": s.page, "number": s.number,
+             "title": s.title, "level": s.level, "leads": s.leads,
+             "scanned": s.scanned, "is_enlargement": s.is_enlargement,
+             "width_pt": s.width, "height_pt": s.height}
+            for s in new
+        ])
+        sheet_id.update({s.page: m["id"] for s, m in zip(new, made)})
+        for s in audit.floor_plans:
+            if s.scanned and s not in new:
+                db.table("sheets").update({"scanned": True, "leads": True}).eq(
+                    "id", sheet_id[s.page]).execute()
+
+        asked_sheets = {sheet_id[p] for p in pages if p in sheet_id} if pages else None
+
+        def covered(det: dict) -> bool:
+            return ((asked_sheets is None or det["sheet_id"] in asked_sheets)
+                    and (not doors or det.get("door_tag") in doors))
+
+        current = (db.table("detections").select("id, sheet_id, door_tag, is_primary")
+                   .eq("document_id", document_id).execute().data)
+        replaced = [d["id"] for d in current if covered(d)]
+        for start in range(0, len(replaced), _BATCH):
+            db.table("detections").delete().in_(
+                "id", replaced[start:start + _BATCH]).execute()
+
+        dead = tombstones(document_id)
+        hand = {(m["page"], m["door_tag"]) for m in manual_detections(document_id)
+                if m.get("door_tag")}
+        rows, seen, kept, suppressed = [], set(), set(), 0
+        for door in audit.detected:
+            page = door.location.page
+            if dead and is_suppressed(
+                    {"page": page, "door_tag": door.tag or None,
+                     "x0": door.location.x0, "y0": door.location.y0,
+                     "x1": door.location.x1, "y1": door.location.y1}, dead):
+                suppressed += 1
+                continue
+            if door.tag and (page, door.tag) in hand:
+                kept.add(door.tag)
+                continue
+            if page not in sheet_id:
+                continue
+            key = (door.tag or "", sheet_id[page])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(_detection_row(org_id, document_id, sheet_id[page], door))
+
+        # A door now primary on the sheet it was redone on is no longer primary
+        # on the sheet it was left on, or it is counted twice.
+        primary = {r["door_tag"] for r in rows if r["is_primary"] and r["door_tag"]}
+        gone = set(replaced)
+        demote = [d["id"] for d in current if d["id"] not in gone
+                  and d.get("is_primary") and d.get("door_tag") in primary]
+        if demote:
+            db.table("detections").update({"is_primary": False}).in_(
+                "id", demote).execute()
+
+        _insert("detections", rows)
+        written = {r["door_tag"] for r in rows if r["door_tag"]}
+        _record_walls(db, document_id,
+                      [d for d in audit.detected if d.tag in written])
+        _record_pages(db, document_id, audit.pages)
+
+        log.info("db: reprocess replaced %d detection(s) with %d; %d left as "
+                 "placed by hand, %d left out as removed by hand",
+                 len(replaced), len(rows), len(kept), suppressed)
+        _log_run(org_id, document.data[0]["project_id"], document_id, "audit",
+                 audit=audit, doors=audit.door_count)
+        return {"replaced": len(replaced), "added": len(rows),
+                "kept_hand_placed": sorted(kept), "left_out_removed": suppressed}
+    except NoDatabase:
+        return None
+    except Exception as exc:  # noqa: BLE001 - storing must not break a pass
+        log.warning("db: could not store the reprocess: %s", exc)
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -680,7 +843,9 @@ def _log_run(org_id: str, project_id: str, document_id: str, kind: str, *,
         row.update(method=result.method.value,
                    pages_scanned=result.pages_scanned,
                    duration_ms=result.duration_ms,
-                   warnings=result.warnings)
+                   warnings=result.warnings,
+                   model=result.ai_model or None,
+                   cost_usd=result.ai_cost_usd)
     if audit is not None:
         counted = [d for d in audit.detected if d.primary]
         row.update(pages_scanned=audit.pages_scanned,

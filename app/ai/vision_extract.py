@@ -11,6 +11,7 @@ import base64
 import logging
 from dataclasses import dataclass, field
 
+from app.ai import spend
 from app.ai.client import AiUnavailableError, AiUpstreamError, get_client
 from app.ai.header_map import resolve_headers
 from app.ai.response_parser import parse_tables
@@ -334,6 +335,8 @@ async def read_tables(doc: PdfDoc, page: int) -> list[VisionTable]:
         if usage:
             log.info("ai_vision tokens prompt=%s completion=%s attempt=%s",
                      usage.prompt_tokens, usage.completion_tokens, attempt)
+        # Every attempt is billed, the empty ones included.
+        spend.add(settings.ai_model, usage)
 
         parsed = parse_tables(response.choices[0].message.content or "")
         if parsed:
