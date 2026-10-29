@@ -263,6 +263,10 @@ class PdfDoc:
             raise exc if isinstance(exc, NotAPdfError) else NotAPdfError(str(exc))
         self.doc = doc
         self._text_cache: dict[int, list[TextItem]] = {}
+        # How many spans each page read carried. Kept for every page, unlike
+        # the spans themselves, so a page read once is never read again to be
+        # counted.
+        self._span_counts: dict[int, int] = {}
         self._drawing_page: int = -1
         self._drawing_cache: list | None = None
         self._drawing_index: dict | None = None
@@ -334,7 +338,15 @@ class PdfDoc:
         if len(self._text_cache) >= _TEXT_CACHE_PAGES:
             self._text_cache.pop(next(iter(self._text_cache)))
         self._text_cache[page_index] = items
+        self._span_counts[page_index] = len(items)
         return items
+
+    def span_count(self, page_index: int) -> int:
+        """How many pieces of text the page carries, read only if it has not
+        been already."""
+        if page_index not in self._span_counts:
+            self.text_items(page_index)
+        return self._span_counts[page_index]
 
     def _drawings(self, page_index: int) -> list | None:
         """The page's vector paths, parsed once.

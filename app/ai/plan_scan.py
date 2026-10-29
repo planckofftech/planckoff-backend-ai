@@ -76,6 +76,11 @@ _WALL_DOORS = 4.0
 _WALL_REACH_DOORS = 6.0
 # Hard ceiling per request. A loop bug must not be able to run up a bill.
 MAX_TILES = 40
+# The longest answer one tile may give, thinking included. Left unset, the
+# provider reserves the model's whole 65,536 against the balance before every
+# call, and a nearly spent account refused a tile that would have cost cents.
+# A tile lists a few dozen doors at most; this is several times that.
+_MAX_OUTPUT_TOKENS = 16000
 # A first guess at the box, sized from the schedule and centred on the point.
 # It is a placeholder: app/core/swing_finder.py replaces it with the measured
 # extent of the door's own arc wherever there is an arc to measure. It survives
@@ -505,6 +510,7 @@ async def scan_sheet(doc: PdfDoc, page: int,
                 response = await client.chat.completions.create(
                     model=chosen,
                     temperature=0,
+                    max_tokens=_MAX_OUTPUT_TOKENS,
                     response_format={"type": "json_object"},
                     messages=[{
                         "role": "user",
@@ -523,7 +529,13 @@ async def scan_sheet(doc: PdfDoc, page: int,
             if usage:
                 report.prompt_tokens += usage.prompt_tokens or 0
                 report.completion_tokens += usage.completion_tokens or 0
-            found = _parse_doors(response.choices[0].message.content or "")
+            choice = response.choices[0]
+            if getattr(choice, "finish_reason", None) == "length":
+                # Cut off mid-answer: what parsed is kept, and the gap is said.
+                report.warnings.append(
+                    f"page {page}: one part of this sheet gave too long an answer "
+                    "and was read only in part")
+            found = _parse_doors(choice.message.content or "")
             if cache is not None:
                 cache[key] = found
 

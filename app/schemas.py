@@ -148,6 +148,10 @@ class ExtractionResult(BaseModel):
         description="Where the table was found, when the AI tier read it. The "
         "preview draws this; without it an AI-read page shows no outline.",
     )
+    ai_model: str = Field("", description="The model(s) this read called; "
+                          "empty when it called none")
+    ai_cost_usd: float = Field(0.0, description="What those calls cost, estimated "
+                               "from their token counts")
 
 
 class SheetRef(BaseModel):
@@ -186,6 +190,21 @@ class SheetRef(BaseModel):
         "than draw the whole floor? Enlargements and reduced-scale keys are "
         "worth showing -- they are how a person finds one door on a plan too "
         "big to read -- but they are not where the count comes from.",
+    )
+
+
+class PageRef(BaseModel):
+    """One page of the set, whatever it draws -- so a person can choose any of
+    them to be read again, not only the ones taken for door plans."""
+
+    page: int
+    number: str = Field("", description="Sheet number, where one could be read")
+    title: str = Field("", description="Sheet title, where one could be read")
+    unreadable: bool = Field(
+        False,
+        description="Is the drawing on this page almost bare of readable "
+        "text -- a scan, or lettering drawn as lines? Only the vision model can "
+        "find doors on such a page, so these are the ones worth choosing first.",
     )
 
 
@@ -383,6 +402,7 @@ class PlanAudit(BaseModel):
     duration_ms: int = 0
     schedule_page: int = 0
     floor_plans: list[SheetRef] = Field(default_factory=list)
+    pages: list[PageRef] = Field(default_factory=list)
     door_count: int = 0
     located: list[DoorSightingOut] = Field(default_factory=list)
     not_on_plans: list[DoorSightingOut] = Field(default_factory=list)
