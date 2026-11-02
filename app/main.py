@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
+from app.api.prices import router as prices_router
 from app.api.routes import router
 from app.api.storage import router as storage_router
 from app.config import get_settings
@@ -53,4 +54,6 @@ app.include_router(router)
 # remembers them, and the second is useless without a database while the first
 # has never needed one.
 app.include_router(storage_router)
+# Hardware list prices. Reads only what scripts/load_price_book.py stored.
+app.include_router(prices_router)
 
