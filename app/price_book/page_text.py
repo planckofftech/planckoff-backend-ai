@@ -24,7 +24,8 @@ _SAME_LINE = 2.5
 _TALL = 2.0
 
 MONEY = re.compile(r"^\$\d{1,3}(,\d{3})*(\.\d\d)?$")
-DECIMAL = re.compile(r"^\d{1,3}(,\d{3})*\.\d\d$")
+# Trimco prints "1061.30", without the thousands comma.
+DECIMAL = re.compile(r"^(\d{1,3}(,\d{3})*|\d{4,5})\.\d\d$")
 
 
 @dataclass
@@ -70,6 +71,8 @@ def clean(text: str) -> str:
     text = text.replace("‑", "-").replace("‐", "-").replace("–", "-")
     text = text.replace(" ", " ").replace(" ", " ")
     text = text.replace("”", '"').replace("″", '"').replace("’", "'")
+    # Control characters some books carry from their typesetting.
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
     return " ".join(text.split())
 
 
