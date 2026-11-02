@@ -28,11 +28,25 @@ from app.price_book.rows import PriceRow, match_key
 
 Status = Literal["priced", "needs_review", "not_found", "book_not_loaded"]
 
-# Abbreviations hardware schedules use for a maker, for the makers loaded.
+# What hardware schedules write for a maker: the industry's two-letter codes
+# (HA, VD, LC ...) and common short forms. A code whose maker has no book loaded
+# still names the maker in the answer, so "LC" reads as "LCN", not as unknown.
 _ALIASES = {
     "VON": "Von Duprin", "VD": "Von Duprin", "VONDUPRIN": "Von Duprin",
-    "HAG": "Hager", "HAGER": "Hager", "HAGERCOMPANIES": "Hager",
+    "HA": "Hager", "HAG": "Hager", "HAGER": "Hager", "HAGERCOMPANIES": "Hager",
+    "LC": "LCN", "IV": "Ives", "SC": "Schlage", "ZE": "Zero", "PE": "Pemko",
+    "RO": "Rockwood", "SA": "Sargent", "CR": "Corbin Russwin", "MK": "McKinney",
+    "GL": "Glynn-Johnson", "GJ": "Glynn-Johnson", "TR": "Trimco", "YA": "Yale",
+    "BE": "Best", "FA": "Falcon", "AR": "Adams Rite",
+    "NO": "Norton Rixson", "RF": "Norton Rixson", "NORTON": "Norton Rixson", "RIXSON": "Norton Rixson",
+    "NG": "National Guard", "NGP": "National Guard",
+    # Markar is printed in Pemko's book.
+    "MR": "Pemko", "MARKAR": "Pemko",
+    "CORBIN": "Corbin Russwin", "RUSSWIN": "Corbin Russwin", "DORMA": "dormakaba",
+    "DONJO": "Don-Jo", "TOWNSTEEL": "TownSteel", "ACCENTRA": "Yale",
 }
+# Bracketed notes a schedule adds after the item: '[10" x 34"]', '[36"]'.
+_BRACKETED = re.compile(r"\[[^\]]*\]")
 
 
 @dataclass
@@ -108,6 +122,12 @@ def manufacturer_of(name: str, loaded: set[str]) -> str | None:
     return maker if maker in loaded else None
 
 
+def _not_loaded(name: str) -> str:
+    maker = _ALIASES.get(match_key(name))
+    named = f"'{name}' ({maker})" if maker and match_key(maker) != match_key(name) else f"'{name}'"
+    return f"No price book for {named} has been loaded"
+
+
 def _spans(text: str) -> list[str]:
     """Keys of every run of consecutive words: "9948 EO F" -> 9948, 9948EO, ..."""
     words = [w for w in re.split(r"[\s,;]+", text) if w]
@@ -123,12 +143,16 @@ def quote(item: Item, source: Source) -> Quote:
     maker = manufacturer_of(item.manufacturer, {b.manufacturer for b in loaded.values()})
     if maker is None:
         return Quote("book_not_loaded", manufacturer=item.manufacturer,
-                     reasons=[f"No price book for '{item.manufacturer}' has been loaded"])
+                     reasons=[_not_loaded(item.manufacturer)])
     q = Quote("priced", manufacturer=maker, finish=item.finish)
 
     # The model may carry its size, finish or maker with it ("9948EO-F 4' 626").
-    model_text = sizes.strip_sizes(item.model)
-    tried = set(_spans(model_text)) or set(_spans(sizes.strip_sizes(item.description)))
+    # With no model number, the schedule's description usually starts with one:
+    # 'BB1168 4 1/2" x 4" NRP'.
+    model_text = sizes.strip_sizes(_BRACKETED.sub(" ", item.model))
+    if not _spans(model_text):
+        model_text = sizes.strip_sizes(_BRACKETED.sub(" ", item.description))
+    tried = set(_spans(model_text))
     if not tried:
         q.status = "not_found"
         q.reasons.append("No model number given")
@@ -137,8 +161,8 @@ def quote(item: Item, source: Source) -> Quote:
     keys = {r.key for r in found if r.kind == "base"}
     if not keys:
         q.status = "not_found"
-        q.reasons.append(f"'{item.model or item.description}' is not in the {maker} "
-                         "price books loaded")
+        q.reasons.append(f"'{item.model or item.description}' is not on the {maker} "
+                         "price book pages read so far")
         close = source.similar(maker, max(tried, key=len))
         if close:
             q.reasons.append("Closest models in the book: " + ", ".join(close))
@@ -175,7 +199,31 @@ def quote(item: Item, source: Source) -> Quote:
                    for r in extra)
     q.list_price = round(sum(p.list_price for p in q.parts), 2)
     q.extended_price = round(q.list_price * item.quantity, 2)
+
+    # A word left over may be an option with a price of its own -- NRP is $7.02
+    # a hinge in Hager's book -- so the price stands but is not taken as whole.
+    left = _left_over(model_text, key, q.finish)
+    if left:
+        q.status = "needs_review"
+        q.reasons.append(f"{', '.join(left)} not priced; check whether it adds to "
+                         f"the {q.model} price")
     return q
+
+
+def _left_over(text: str, key: str, finish: str) -> list[str]:
+    """Words of the text that are not the model, its finish, or an 'x' between."""
+    words = [w for w in re.split(r"[\s,;]+", text) if match_key(w)]
+    for i in range(len(words)):
+        for j in range(i + 1, min(len(words), i + 5) + 1):
+            if match_key("".join(words[i:j])) == key:
+                words = words[:i] + words[j:]
+                break
+        else:
+            continue
+        break
+    same = finishes.same(finish) if finish else set()
+    return [w for w in words
+            if match_key(w) != "X" and not (same and finishes.norm(w) in same)]
 
 
 def _label(row: PriceRow) -> str:
@@ -227,7 +275,13 @@ def _by_size(q: Quote, base: list[PriceRow], rows: list[PriceRow],
         m = re.search(r"\d[\d\s./-]*\"?\s*[xX×]\s*\d[\d\s./-]*\"?", text)
         wanted = sizes.dimensions(m.group(0)) if m else None
     if wanted is None:
+        if len(printed) == 1 and sizes.dimensions(printed[0]) is not None:
+            return base, []
         if len(printed) == 1:
+            # 'Under 8" high': the price holds only for plates that size.
+            q.status = "needs_review"
+            q.reasons.append(f"Size not given; {q.model} is priced for {printed[0]}")
+            q.size = printed[0]
             return base, []
         q.status = "needs_review"
         q.reasons.append(f"Size not given; {q.model} is priced by size: {'; '.join(printed)}")
@@ -287,6 +341,11 @@ class MemorySource:
 
     def rows(self, manufacturer: str, keys: set[str]) -> list[PriceRow]:
         return [r for k in keys for r in self._by_key.get((manufacturer, k), [])]
+
+    def starting_with(self, manufacturer: str, prefix: str, limit: int) -> list[PriceRow]:
+        found = [r for (m, k), rs in self._by_key.items()
+                 if m == manufacturer and k.startswith(prefix) for r in rs if r.kind == "base"]
+        return sorted(found, key=lambda r: r.key)[:limit]
 
     def similar(self, manufacturer: str, key: str) -> list[str]:
         models = {r.key: r.model for (m, _), rs in self._by_key.items()

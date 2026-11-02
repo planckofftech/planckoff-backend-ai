@@ -13,13 +13,13 @@ import logging
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.deps import require_api_key
 from app.db.client import NoDatabase
-from app.price_book import store
-from app.price_book.lookup import Item, quote
+from app.price_book import search, store
+from app.price_book.lookup import Item, manufacturer_of, quote
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["prices"], dependencies=[Depends(require_api_key)])
@@ -71,10 +71,56 @@ async def price_items(body: PriceRequest) -> dict[str, Any]:
 
 @router.get("/price-books")
 async def price_books() -> dict[str, Any]:
-    """The books loaded, and how much of each was read."""
+    """The books loaded, and how much of each was read.
+
+    `manufacturers` is each maker once, by full name, for a dropdown: a maker
+    with several books (dormakaba has nine) appears once there and once per
+    book in `books`.
+    """
     try:
         books = await asyncio.to_thread(store.loaded_books)
     except NoDatabase as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"No database configured: {exc}") from exc
-    return {"books": books}
+    makers = sorted({b["manufacturer"] for b in books}, key=str.lower)
+    return {"manufacturers": makers, "books": books}
+
+
+def _search(manufacturer: str, q: str, limit: int) -> dict[str, Any]:
+    source = store.DbSource()
+    loaded = {b.manufacturer for b in source.books().values()}
+    maker = manufacturer_of(manufacturer, loaded)
+    if maker is None:
+        raise LookupError(manufacturer)
+    query = search.read_query(q)
+    found = search.suggest(source, maker, q, limit + 1)
+    books = source.books()
+    return {
+        "manufacturer": maker,
+        "query": {"model": query.key, "finish": query.finish,
+                  "size": list(query.size) if query.size else None},
+        "results": [{**asdict(s), "effective_date": books[s.book].effective_date
+                     if s.book in books else None} for s in found[:limit]],
+        "more": len(found) > limit,
+    }
+
+
+@router.get("/price-books/search")
+async def search_price_books(
+    manufacturer: str = Query(..., description="Full name (Hager) or schedule code (HA)"),
+    q: str = Query(..., max_length=100, description="Model as typed, optionally with finish and size"),
+    limit: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Products whose model starts with what was typed, for suggestions as one types.
+
+    Fewer than two letters or digits of model returns no results rather than
+    the whole book. `more` says the list was cut at `limit`.
+    """
+    try:
+        return await asyncio.to_thread(_search, manufacturer, q, limit)
+    except LookupError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"No price book for '{manufacturer}' has been loaded")
+    except NoDatabase as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"No database configured: {exc}") from exc

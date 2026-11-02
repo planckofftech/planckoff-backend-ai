@@ -109,6 +109,15 @@ class DbSource:
         models = {g["match_key"]: g["model"] for g in got}
         return [models[k] for k in difflib.get_close_matches(key, list(models), n=5)]
 
+    def starting_with(self, manufacturer: str, prefix: str, limit: int) -> list[PriceRow]:
+        """Products whose model starts with `prefix`, nearest first, for suggestions."""
+        self.books()
+        got = (self._db.table("price_rows").select("*")
+               .eq("manufacturer", manufacturer).eq("kind", "base")
+               .like("match_key", f"{prefix}%")
+               .order("match_key").limit(min(limit, _PAGE)).execute().data)
+        return [self._price_row(g) for g in got]
+
     def _price_row(self, g: dict[str, Any]) -> PriceRow:
         return PriceRow(
             manufacturer=g["manufacturer"], model=g["model"], kind=g["kind"],
