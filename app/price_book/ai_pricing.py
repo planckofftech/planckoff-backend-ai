@@ -173,7 +173,10 @@ def as_quote(maker: str, item: Written, quantity: float, row: dict | None) -> di
                   it and a person has to (no price)
     not_found     the product has not been priced with AI yet
     """
-    base = {"manufacturer": maker, "model": item.model or item.description, "finish": item.finish,
+    # ai_price_id is what POST /price-books/ai-prices/{id}/confirm takes; null
+    # when the product has no stored AI price to confirm.
+    base = {"ai_price_id": row.get("id") if row else None,
+            "manufacturer": maker, "model": item.model or item.description, "finish": item.finish,
             "size": item.size, "list_price": None, "extended_price": None, "parts": [],
             "reasons": [], "options": [], "book": "", "effective_date": None}
     if row is None:
@@ -201,7 +204,8 @@ def as_suggestion(row: dict) -> dict:
     """A stored AI price in the shape GET /price-books/search has always answered."""
     part = (row.get("parts") or [{}])[0]
     page = next((p for p in row.get("pages") or [] if p.get("pdf_page") == part.get("pdf_page")), {})
-    return {"model": row.get("model") or row.get("description", ""), "finish": row.get("finish", ""),
+    return {"ai_price_id": row.get("id"),
+            "model": row.get("model") or row.get("description", ""), "finish": row.get("finish", ""),
             "size": row.get("size", ""), "description": row.get("name") or row.get("description", ""),
             "list_price": float(row["list_price"]), "book": part.get("book", ""),
             "pdf_page": part.get("pdf_page"), "printed_page": page.get("printed_page", ""),

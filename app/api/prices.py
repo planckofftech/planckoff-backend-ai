@@ -66,7 +66,8 @@ def _price_all(items: list[PriceItem]) -> list[dict[str, Any]]:
     for n, (item, w) in enumerate(zip(items, written)):
         maker = maker_of[n]
         if maker is None:
-            q = {"status": "book_not_loaded", "manufacturer": item.manufacturer, "list_price": None,
+            q = {"status": "book_not_loaded", "ai_price_id": None, "manufacturer": item.manufacturer,
+                 "list_price": None,
                  "extended_price": None, "parts": [], "options": [], "book": "", "effective_date": None,
                  "model": item.model_number or item.description, "finish": item.finish, "size": item.size,
                  "reasons": [f"No price book for '{item.manufacturer}' has been loaded"]}
