@@ -23,28 +23,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-from app.price_book import finishes, sizes
+from app.price_book import finishes, makers, sizes
 from app.price_book.rows import PriceRow, match_key
 
 Status = Literal["priced", "needs_review", "not_found", "book_not_loaded"]
 
-# What hardware schedules write for a maker: the industry's two-letter codes
-# (HA, VD, LC ...) and common short forms. A code whose maker has no book loaded
-# still names the maker in the answer, so "LC" reads as "LCN", not as unknown.
-_ALIASES = {
-    "VON": "Von Duprin", "VD": "Von Duprin", "VONDUPRIN": "Von Duprin",
-    "HA": "Hager", "HAG": "Hager", "HAGER": "Hager", "HAGERCOMPANIES": "Hager",
-    "LC": "LCN", "IV": "Ives", "SC": "Schlage", "ZE": "Zero", "PE": "Pemko",
-    "RO": "Rockwood", "SA": "Sargent", "CR": "Corbin Russwin", "MK": "McKinney",
-    "GL": "Glynn-Johnson", "GJ": "Glynn-Johnson", "TR": "Trimco", "YA": "Yale",
-    "BE": "Best", "FA": "Falcon", "AR": "Adams Rite",
-    "NO": "Norton Rixson", "RF": "Norton Rixson", "NORTON": "Norton Rixson", "RIXSON": "Norton Rixson",
-    "NG": "National Guard", "NGP": "National Guard",
-    # Markar is printed in Pemko's book.
-    "MR": "Pemko", "MARKAR": "Pemko",
-    "CORBIN": "Corbin Russwin", "RUSSWIN": "Corbin Russwin", "DORMA": "dormakaba",
-    "DONJO": "Don-Jo", "TOWNSTEEL": "TownSteel", "ACCENTRA": "Yale",
-}
 # Bracketed notes a schedule adds after the item: '[10" x 34"]', '[36"]'.
 _BRACKETED = re.compile(r"\[[^\]]*\]")
 
@@ -111,19 +94,18 @@ class Source(Protocol):
     def books(self) -> dict[str, Book]: ...                     # by file name
     def rows(self, manufacturer: str, keys: set[str]) -> list[PriceRow]: ...
     def similar(self, manufacturer: str, key: str) -> list[str]: ...
+    def codes(self) -> dict[str, makers.Code]: ...              # the maker-code table
 
 
-def manufacturer_of(name: str, loaded: set[str]) -> str | None:
-    key = match_key(name)
-    for maker in loaded:
-        if match_key(maker) == key:
-            return maker
-    maker = _ALIASES.get(key)
+def manufacturer_of(name: str, loaded: set[str],
+                    codes: dict[str, makers.Code] | None = None) -> str | None:
+    """The loaded maker a schedule's manufacturer means, or None."""
+    maker, _, _ = makers.resolve(name, loaded, makers.standard_codes() if codes is None else codes)
     return maker if maker in loaded else None
 
 
-def _not_loaded(name: str) -> str:
-    maker = _ALIASES.get(match_key(name))
+def _not_loaded(name: str, codes: dict[str, makers.Code]) -> str:
+    maker, _, _ = makers.resolve(name, set(), codes)
     named = f"'{name}' ({maker})" if maker and match_key(maker) != match_key(name) else f"'{name}'"
     return f"No price book for {named} has been loaded"
 
@@ -140,10 +122,11 @@ def _spans(text: str) -> list[str]:
 
 def quote(item: Item, source: Source) -> Quote:
     loaded = source.books()
-    maker = manufacturer_of(item.manufacturer, {b.manufacturer for b in loaded.values()})
+    codes = source.codes()
+    maker = manufacturer_of(item.manufacturer, {b.manufacturer for b in loaded.values()}, codes)
     if maker is None:
         return Quote("book_not_loaded", manufacturer=item.manufacturer,
-                     reasons=[_not_loaded(item.manufacturer)])
+                     reasons=[_not_loaded(item.manufacturer, codes)])
     q = Quote("priced", manufacturer=maker, finish=item.finish)
 
     # The model may carry its size, finish or maker with it ("9948EO-F 4' 626").
@@ -338,6 +321,9 @@ class MemorySource:
 
     def books(self) -> dict[str, Book]:
         return self._books
+
+    def codes(self) -> dict[str, makers.Code]:
+        return makers.standard_codes()
 
     def rows(self, manufacturer: str, keys: set[str]) -> list[PriceRow]:
         return [r for k in keys for r in self._by_key.get((manufacturer, k), [])]

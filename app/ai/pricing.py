@@ -40,6 +40,27 @@ _PRICES: dict[str, tuple[float, float]] = {
     "qwen/qwen2.5-vl-72b-instruct": (0.25, 0.75),
     "openai/gpt-4o": (2.50, 10.00),
     "anthropic/claude-sonnet-4.5": (3.00, 15.00),
+    # The price-book candidates (AI-Model-Choice-and-Costs, OpenRouter list
+    # prices on 30 October 2026).
+    "qwen/qwen3.7-flash": (0.03, 0.13),
+    "google/gemini-2.5-flash-lite": (0.10, 0.40),
+    "bytedance-seed/seed-2.0-mini": (0.10, 0.40),
+    "anthropic/claude-haiku-5.5": (0.10, 0.50),
+    "openai/gpt-6-luna": (0.10, 0.50),
+    "qwen/qwen3.8-flash": (0.15, 0.47),
+    "z-ai/glm-5.3-flash": (0.15, 0.50),
+    "mistralai/mistral-small-2603": (0.15, 0.60),
+    "qwen/qwen3.7-plus": (0.32, 1.28),
+    "mistralai/mistral-large-4-0": (0.70, 2.10),
+    "google/gemini-3.8-flash": (0.825, 4.125),
+    "openai/gpt-6.1-terra": (1.00, 5.00),
+    "x-ai/grok-4.7": (2.00, 6.00),
+    "qwen/qwen3.8-max-0902": (2.00, 6.00),
+    "anthropic/claude-sonnet-5.5": (2.00, 10.00),
+    "google/gemini-4-argon": (2.00, 10.00),
+    "openai/gpt-6.1-sol": (2.00, 10.00),
+    "anthropic/claude-opus-5.5": (4.00, 20.00),
+    "anthropic/claude-fable-5.1": (10.00, 50.00),
 }
 # An unknown model is priced at the dearest rate on the list, never the
 # cheapest. Guessing low is how a bill becomes a surprise.
