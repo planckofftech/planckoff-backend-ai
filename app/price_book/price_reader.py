@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 import fitz
 
-from app.price_book import call_log, page_text, pdfs
+from app.price_book import call_log, measure, page_text, pdfs
 from app.price_book.page_finder import Found, PagePick, Product
 
 log = logging.getLogger(__name__)
@@ -172,7 +172,8 @@ def _prompt(call: _Call, labels: dict[tuple[str, int], str]) -> str:
         "length as required (cut to the opening), LDW means less door width (a plate "
         "the door's width less the inches given: 10\" x 2\" LDW is 10\" high, 2\" less "
         "than the door). They say the size depends on the door: where the price depends "
-        "on that size and the size is written (\"- 6'\", \"[10\" x 34\"]\"), use it; where "
+        "on that size and the size is written (\"- 6'\", \"[10\" x 34\"]\") or the door "
+        "width is given (10\" x 2\" LDW on a 36\" door is 10\" x 34\"), use it; where "
         "it is not written, status unclear and say the size is needed. Never pick the "
         "smallest size instead.\n"
         "- A listing or label in the model number (UL, ADA) costs nothing unless a "
@@ -227,8 +228,8 @@ def _read(found: Found, raw: object, by_label: dict[str, tuple[str, int]]) -> Re
     out.model_total = _amount(raw.get("total")) if raw.get("total") is not None else None
     if out.status == "priced" and not out.parts:
         out.status = "unclear"
-    if out.status == "priced" and _by_length(out.parts) and not _LENGTH.search(
-            f"{found.product.description} {found.product.model} {found.product.size}"):
+    written = f"{found.product.description} {found.product.model} {found.product.size}"
+    if out.status == "priced" and _by_length(out.parts) and not _LENGTH.search(written)             and measure.length_units(written, found.product.door_width) is None:
         # Priced per foot with no length given is a rate, not the price of one.
         out.status = "unclear"
         out.note = (out.note + " Priced by length, and the schedule gives no length.").strip()

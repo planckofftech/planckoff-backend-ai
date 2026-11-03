@@ -121,6 +121,8 @@ def check_printed(model: str, read: Read, pages: PageText) -> Checked:
     so the answer is kept but cannot count as agreed until a person looks.
     """
     out = Checked(model, read)
+    product = read.product
+    text = " ".join(t for t in (product.model, product.description, product.size) if t)
     for part in read.parts:
         has_text, numbers = pages.numbers(part.book, part.pdf_page)
         if not has_text:
@@ -129,14 +131,13 @@ def check_printed(model: str, read: Read, pages: PageText) -> Checked:
         elif round(part.amount, 2) not in numbers or part.amount <= 0:
             out.printed = False
             out.problems.append(f"{part.price_text} is not printed on p{part.pdf_page}")
-        elif part.per.strip().lower() in _EACH and pages.priced_by_measure(part.book, part.pdf_page):
+        elif part.per.strip().lower() in _EACH and pages.priced_by_measure(part.book, part.pdf_page) \
+                and not measure.same_size_row(part.row, text, product.door_width):
             # Both models read a per-foot or per-area rate as the price of one
             # (Hager 835S "x LAR", 190S plates); agreeing did not make it right.
             out.printed = False
             out.problems.append(f"p{part.pdf_page} prices by length or area; "
                                 f"{part.price_text} was read as the price of one")
-    product = read.product
-    text = " ".join(t for t in (product.model, product.description, product.size) if t)
     for part in read.parts:
         is_rate, units = measure.expected_units(part.per, text, product.door_width)
         if not is_rate:
@@ -148,9 +149,13 @@ def check_printed(model: str, read: Read, pages: PageText) -> Checked:
             out.problems.append(f"{part.price_text} is per {part.per}; the size to count it "
                                 "by is not on the schedule")
         elif abs(part.units - units) > _CENT:
-            out.printed = False
+            # The rate was read and checked above; only the count is off, and
+            # the count is ours to make. Both models then agree on the same sum.
             out.problems.append(f"{part.price_text} per {part.per} was counted {part.units:g} times; "
-                                f"the size gives {units:g}")
+                                f"counted {units:g} from the size")
+            part.units = units
+    if read.status == "priced" and read.parts:
+        read.total = round(sum(p.extended for p in read.parts), 2)
     if read.status == "priced" and read.model_total is not None and read.total is not None \
             and abs(read.model_total - read.total) > _CENT:
         # Ours is the sum used; the model's own differing is worth a look.
