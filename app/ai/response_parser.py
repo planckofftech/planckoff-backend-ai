@@ -21,6 +21,52 @@ def _strip_fences(text: str) -> str:
     return match.group(1) if match else text.strip()
 
 
+def first_object(content: str | None) -> dict:
+    """The first JSON object in a reply, or {}.
+
+    Some models ignore the JSON response format and answer in a code fence with
+    a note after it (Haiku 5.5); json.loads of the whole reply then fails and a
+    right answer reads as no answer.
+    """
+    text = _strip_fences(content or "")
+    start = text.find("{")
+    if start < 0:
+        return {}
+    text = text[start:]
+    try:
+        found, _ = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        # Gemini 2.5 Flash has ended a whole, correct answer one brace short;
+        # closing what is left open recovers it. A reply cut off mid-value
+        # still fails and reads as no answer.
+        try:
+            found, _ = json.JSONDecoder().raw_decode(text + _closers(text))
+        except json.JSONDecodeError:
+            return {}
+    return found if isinstance(found, dict) else {}
+
+
+def _closers(text: str) -> str:
+    """The brackets that close what `text` leaves open, outside strings."""
+    stack: list[str] = []
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    return "".join(reversed(stack))
+
+
 def _salvage_objects(text: str) -> list[dict]:
     """Walk a truncated array and recover every object that did close.
 

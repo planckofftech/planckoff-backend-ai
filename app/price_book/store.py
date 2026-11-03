@@ -9,12 +9,16 @@ dies half way leaves the book partly loaded, and the fix is to run it again.
 from __future__ import annotations
 
 import difflib
+from datetime import datetime, timezone
 import logging
 from typing import Any
 
 from app.db.client import client
+from app.price_book import makers
+from app.price_book.book_map import BookMap, IndexEntry, PageEntry
+from app.price_book.page_finder import Book as MappedBook
 from app.price_book.lookup import Book
-from app.price_book.rows import BookRead, PriceRow
+from app.price_book.rows import BookRead, PriceRow, match_key
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +64,98 @@ def _row(book_id: str, r: PriceRow) -> dict[str, Any]:
     }
 
 
+def save_map(book_map: BookMap, sha256: str) -> None:
+    """Store a book's map, replacing any earlier map of the same file."""
+    db = client()
+    name = book_map.file_name
+    db.table("price_book_pages").delete().eq("file_name", name).execute()
+    db.table("price_book_index").delete().eq("file_name", name).execute()
+    pages = [{"file_name": name, "sha256": sha256, "pdf_page": p.pdf_page,
+              "printed_page": p.printed_page, "heading": p.heading, "prices": p.prices,
+              "models": p.models, "has_text": p.has_text} for p in book_map.pages]
+    for i in range(0, len(pages), _BATCH):
+        db.table("price_book_pages").insert(pages[i:i + _BATCH]).execute()
+    index = [{"file_name": name, "model": e.model, "match_key": match_key(e.model),
+              "printed_page": e.printed_page, "pdf_page": e.pdf_page,
+              "index_page": e.index_page} for e in book_map.index]
+    for i in range(0, len(index), _BATCH):
+        db.table("price_book_index").insert(index[i:i + _BATCH]).execute()
+    log.info("price book map %s: %d pages, %d index entries", name, len(pages), len(index))
+
+
+def maker_codes() -> dict[str, makers.Code]:
+    """The code table: the standard codes, under whatever Supabase holds.
+
+    Read with the standard codes underneath, so a database the migration has
+    not reached yet still knows HA is Hager.
+    """
+    codes = makers.standard_codes()
+    try:
+        got = client().table("manufacturer_codes").select("*").execute().data
+    except Exception as exc:  # noqa: BLE001 - no table yet is not an outage
+        log.warning("manufacturer_codes not read, using the standard codes: %s", exc)
+        return codes
+    for g in got:
+        codes[g["code"]] = makers.Code(g["code"], g["manufacturer"], g["source"],
+                                       g["verified"], g["note"])
+    return codes
+
+
+def set_code(code: makers.Code) -> None:
+    """Add a code or replace what it says."""
+    client().table("manufacturer_codes").upsert({
+        "code": code.code, "manufacturer": code.manufacturer, "source": code.source,
+        "verified": code.verified, "note": code.note,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+
+def maps_print(file_names: list[str], models: list[str]) -> set[str]:
+    """Which of these models the maps of these books list on a page."""
+    if not file_names or not models:
+        return set()
+    got = (client().table("price_book_pages").select("models")
+           .in_("file_name", file_names).ov("models", models).execute().data)
+    printed = {m for g in got for m in g["models"]}
+    return {m for m in models if m in printed}
+
+
+def who_prints(models: list[str]) -> dict[str, set[str]]:
+    """For each model, the books whose maps list it on a page."""
+    out: dict[str, set[str]] = {m: set() for m in models}
+    if not models:
+        return out
+    got = (client().table("price_book_pages").select("file_name, models")
+           .ov("models", models).limit(_PAGE).execute().data)
+    for g in got:
+        for m in set(g["models"]) & set(models):
+            out[m].add(g["file_name"])
+    return out
+
+
+def book_maps(file_names: list[str]) -> list[MappedBook]:
+    """The stored maps of these books, for step A. A book with no map is left out."""
+    db = client()
+    out = []
+    for name in file_names:
+        pages, start = [], 0
+        while True:
+            got = (db.table("price_book_pages").select("*").eq("file_name", name)
+                   .order("pdf_page").range(start, start + _PAGE - 1).execute().data)
+            pages.extend(PageEntry(g["pdf_page"], g["printed_page"], g["heading"], g["prices"],
+                                   g["models"], g["has_text"]) for g in got)
+            if len(got) < _PAGE:
+                break
+            start += _PAGE
+        if not pages:
+            continue
+        index = (db.table("price_book_index").select("model, printed_page, pdf_page, index_page")
+                 .eq("file_name", name).not_.is_("pdf_page", "null").limit(_PAGE * 5).execute().data)
+        out.append(MappedBook(name, pages, [IndexEntry(g["model"], g["printed_page"], g["index_page"],
+                                                       g["pdf_page"]) for g in index]))
+    return out
+
+
 def loaded_books() -> list[dict[str, Any]]:
     """Every book stored, with how much of it was read."""
     return (client().table("price_books")
@@ -79,6 +175,12 @@ class DbSource:
         self._db = client()
         self._books: dict[str, Book] | None = None
         self._file_of: dict[str, str] = {}
+        self._codes: dict[str, makers.Code] | None = None
+
+    def codes(self) -> dict[str, makers.Code]:
+        if self._codes is None:
+            self._codes = maker_codes()
+        return self._codes
 
     def books(self) -> dict[str, Book]:
         if self._books is None:
@@ -125,3 +227,104 @@ class DbSource:
             pdf_page=g["pdf_page"], printed_page=g["printed_page"], finish=g["finish"],
             size=g["size"], description=g["description"], note=g["note"],
             book=self._file_of.get(g["book_id"], ""))
+
+
+# --------------------------------------------------------------------------- #
+# prices read by AI, and the runs that read them
+# --------------------------------------------------------------------------- #
+
+def ai_prices_for(manufacturer: str, product_keys: list[str]) -> dict[str, dict[str, Any]]:
+    """Stored AI prices of these products, by product key."""
+    if not product_keys:
+        return {}
+    got = (client().table("ai_prices").select("*").eq("manufacturer", manufacturer)
+           .in_("product_key", product_keys).execute().data)
+    return {g["product_key"]: g for g in got}
+
+
+def save_ai_price(row: dict[str, Any]) -> dict[str, Any]:
+    """Store a product's verdict, replacing an unverified one. A verified price
+    is a person's word and is not overwritten by a later run."""
+    db = client()
+    found = (db.table("ai_prices").select("*").eq("manufacturer", row["manufacturer"])
+             .eq("product_key", row["product_key"]).execute().data)
+    if found and found[0]["verified"]:
+        return found[0]
+    row = {**row, "updated_at": datetime.now(timezone.utc).isoformat()}
+    return db.table("ai_prices").upsert(row, on_conflict="manufacturer,product_key").execute().data[0]
+
+
+def ai_price(price_id: str) -> dict[str, Any] | None:
+    got = client().table("ai_prices").select("*").eq("id", price_id).execute().data
+    return got[0] if got else None
+
+
+def confirm_ai_price(price_id: str, list_price: float, note: str) -> dict[str, Any]:
+    return (client().table("ai_prices").update({
+        "list_price": list_price, "verified": True, "verified_note": note,
+        "verified_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", price_id).execute().data[0])
+
+
+def search_ai_prices(manufacturer: str, prefix: str, verified_only: bool, limit: int) -> list[dict[str, Any]]:
+    q = (client().table("ai_prices").select("*").eq("manufacturer", manufacturer)
+         .like("match_key", f"{prefix}%"))
+    if verified_only:
+        q = q.eq("verified", True)
+    return q.order("match_key").limit(min(limit, _PAGE)).execute().data
+
+
+def start_run(items: list[dict[str, Any]], project_id: str | None) -> str:
+    return (client().table("ai_price_runs").insert({
+        "project_id": project_id, "status": "running", "items": items,
+    }).execute().data[0]["id"])
+
+
+def finish_run(run_id: str, result: dict[str, Any] | None, error: str = "") -> None:
+    client().table("ai_price_runs").update({
+        "status": "failed" if error else "done", "result": result,
+        "counts": (result or {}).get("counts"), "usd": (result or {}).get("usd", 0),
+        "error": error[:1000], "finished_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", run_id).execute()
+
+
+def run_of(run_id: str) -> dict[str, Any] | None:
+    got = client().table("ai_price_runs").select("*").eq("id", run_id).execute().data
+    return got[0] if got else None
+
+
+def save_calls(calls: list, run_id: str | None, project_id: str | None) -> None:
+    """Keep the AI calls a run made (call_log.Call), for the cost report."""
+    from dataclasses import asdict
+
+    rows = [{**asdict(c), "run_id": run_id, "project_id": project_id,
+             "usd": round(c.usd, 6)} for c in calls]
+    for i in range(0, len(rows), _BATCH):
+        client().table("ai_price_calls").insert(rows[i:i + _BATCH]).execute()
+
+
+def mapped_books() -> dict[str, list[str]]:
+    """Each maker's books that have a map in Supabase: what pricing with AI reads.
+
+    From the book registry (app/price_book/readers.BOOKS, file -> maker) and
+    price_book_pages -- never from price_books or price_rows, which hold the
+    prices code read before pricing moved to AI and can be cleared without
+    the AI noticing.
+    """
+    from app.price_book.readers import BOOKS
+
+    got = client().table("price_book_pages").select("file_name").eq("pdf_page", 1).execute().data
+    mapped = {g["file_name"] for g in got}
+    out: dict[str, list[str]] = {}
+    for name, (maker, _) in BOOKS.items():
+        if name in mapped:
+            out.setdefault(maker, []).append(name)
+    return out
+
+
+def settled_ai_prices(manufacturer: str, prefix: str, limit: int) -> list[dict[str, Any]]:
+    """AI prices with a price: agreed by two models, or confirmed by a person."""
+    return (client().table("ai_prices").select("*").eq("manufacturer", manufacturer)
+            .like("match_key", f"{prefix}%").not_.is_("list_price", "null")
+            .order("verified", desc=True).order("match_key").limit(min(limit, _PAGE)).execute().data)

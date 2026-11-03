@@ -42,6 +42,16 @@ class Settings(BaseSettings):
     # be changed on the evidence of scripts/door_bakeoff.py without disturbing
     # the schedule tier. Empty means "use ai_model".
     ai_detect_model: str = "google/gemini-2.5-pro"
+    # Reading prices from the manufacturers' books, and naming a maker from a
+    # schedule's code. Its own setting so models can be tried on price pages
+    # (AI-Model-Choice-and-Costs) without moving the other tiers. Empty means
+    # "use ai_model".
+    ai_price_model: str = ""
+    # The second model every price is read with. Two models have to read the
+    # same price before it shows as agreed (app/price_book/ai_check.py). Must
+    # differ from the first to be worth anything; empty turns the second read
+    # off and nothing is ever agreed.
+    ai_price_check_model: str = "anthropic/claude-haiku-5.5"
     ai_render_dpi: int = 200
     # How wide a door should be in the picture the detector sees. Measured:
     # at 80 px recall was 78%% and boxes landed in open rooms; at 160 px it
@@ -109,6 +119,10 @@ class Settings(BaseSettings):
     @property
     def ai_detect(self) -> str:
         return self.ai_detect_model or self.ai_model
+
+    @property
+    def ai_price(self) -> str:
+        return self.ai_price_model or self.ai_model
 
     @property
     def ai_enabled(self) -> bool:
