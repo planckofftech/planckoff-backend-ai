@@ -67,7 +67,10 @@ class Product:
     def text(self) -> str:
         parts = [self.name, self.model, self.description,
                  f"finish {self.finish}" if self.finish else "",
-                 f"size {self.size}" if self.size else ""]
+                 f"size {self.size}" if self.size else "",
+                 # LDW plates and LAR thresholds are sized from the door; without
+                 # it both models called a kick plate unclear.
+                 f"door width {self.door_width:g}\"" if self.door_width else ""]
         return " | ".join(p for p in parts if p)
 
 

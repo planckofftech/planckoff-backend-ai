@@ -11,6 +11,7 @@ price cannot come from arithmetic two models happened to get the same wrong way.
     190S 10" x 2" LDW          on a 36" door: 10 x 34 -> 3.40; no door width: None
     726 x LAR - 20'            20 feet
     488S @ HEAD [19 LF]        19 feet
+    413S x LAR                 on a 36" door: 3 feet (LAR: length as required)
 
 A plate side is rounded up to the whole inch, as Hager says ("8 x 31-1/2, price
 as 8 x 32"). A length that is not a whole number of feet is not rounded: the
@@ -64,8 +65,14 @@ def plate_units(text: str, door_width: float | None = None) -> float | None:
     return None
 
 
-def length_units(text: str) -> float | None:
-    """Feet of length the text gives, when it is a whole number of feet."""
+_LAR = re.compile(r"\bLAR\b", re.I)
+
+
+def length_units(text: str, door_width: float | None = None) -> float | None:
+    """Feet of length the text gives, when it is a whole number of feet.
+
+    "LAR" with no length written is cut to the opening: the door's width.
+    """
     feet = None
     for part in _BRACKET.findall(text) + [text]:
         m = _LF.search(part)
@@ -81,6 +88,8 @@ def length_units(text: str) -> float | None:
             inches = _inches(m.group(1))
             feet = inches / 12 if inches else None
             break
+    if feet is None and door_width and _LAR.search(text):
+        feet = door_width / 12
     if feet is None or abs(feet - round(feet)) > 1e-6:
         return None
     return float(round(feet))
@@ -92,8 +101,23 @@ def expected_units(per: str, text: str, door_width: float | None = None) -> tupl
     if unit in AREA_UNITS or ("sq" in unit and "in" in unit):
         return True, plate_units(text, door_width)
     if unit in LENGTH_UNITS:
-        return True, length_units(text)
+        return True, length_units(text, door_width)
     return False, None
+
+
+def same_size_row(row: str, text: str, door_width: float | None = None) -> bool:
+    """Whether a price row read is a size the book prints ready-priced, and it
+    is the plate's size from the schedule.
+
+    Hager prints a few common plates as one price under the rate table
+    ("10" x 34" (List Pricing) 60.43"): that price is the price of one, not a
+    rate, but only for a plate of exactly that size.
+    """
+    row = row.replace("”", '"').replace("″", '"')
+    if not _PLATE.search(row):
+        return False
+    wanted = plate_units(text, door_width)
+    return wanted is not None and plate_units(row) == wanted
 
 
 def door_width(text: str | float | None) -> float | None:
