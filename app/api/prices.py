@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,7 +20,7 @@ from app.api.deps import require_api_key
 from app.db.client import NoDatabase
 from app.ai.client import AiUnavailableError
 from app.config import get_settings
-from app.price_book import ai_pricing, call_log, makers, measure, page_finder, search, store
+from app.price_book import agent_pricing, ai_pricing, call_log, makers, measure, page_finder, search, store
 from app.price_book.lookup import Item, manufacturer_of, quote
 
 log = logging.getLogger(__name__)
@@ -355,6 +355,10 @@ class AiPriceRequest(BaseModel):
     project_id: str | None = Field(None, max_length=100)
     reuse_verified: bool = Field(True, description="Take a product a person has verified from the "
                                                    "table instead of reading it again")
+    engine: Literal["pipeline", "agent"] | None = Field(
+        None, description="pipeline: step A finds pages, step B reads them. agent: an agent searches "
+                          "the whole book and builds the price part by part, a second model checks "
+                          "it. Empty takes the server's setting (AI_PRICE_ENGINE).")
 
 
 # Runs in progress, held so the event loop does not drop them half way.
@@ -362,12 +366,12 @@ _RUNS: set[asyncio.Task] = set()
 
 
 async def _run(run_id: str, items: list[makers.Written], reuse: bool,
-               project_id: str | None) -> None:
+               project_id: str | None, engine: str) -> None:
     settings = get_settings()
     calls = call_log.start()
+    price_project = agent_pricing.price_project if engine == "agent" else ai_pricing.price_project
     try:
-        result = await ai_pricing.price_project(items, run_id, settings.ai_price,
-                                                settings.ai_price_check_model, reuse)
+        result = await price_project(items, run_id, settings.ai_price, settings.ai_price_check_model, reuse)
     except Exception as exc:  # noqa: BLE001 - a failed run is reported on the run
         log.exception("AI price run %s failed", run_id)
         await asyncio.to_thread(store.finish_run, run_id, None, f"{type(exc).__name__}: {exc}")
@@ -393,30 +397,41 @@ async def start_ai_price(body: AiPriceRequest) -> dict[str, Any]:
                             detail="AI not configured: OPENROUTER_API_KEY is not set")
     items = [makers.Written(i.id or f"#{n}", i.manufacturer, i.model_number, i.finish, i.size,
                             i.description, i.name, measure.door_width(i.door_width)) for n, i in enumerate(body.items)]
+    engine = body.engine or get_settings().ai_price_engine
     try:
         run_id = await asyncio.to_thread(
             store.start_run, [asdict(i) for i in items], body.project_id)
+        if engine == "agent":
+            await asyncio.to_thread(store.queue_items, run_id, [i.id for i in items])
     except NoDatabase as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"No database configured: {exc}") from exc
-    task = asyncio.create_task(_run(run_id, items, body.reuse_verified, body.project_id))
+    task = asyncio.create_task(_run(run_id, items, body.reuse_verified, body.project_id, engine))
     _RUNS.add(task)
     task.add_done_callback(_RUNS.discard)
-    return {"run_id": run_id, "status": "running", "items": len(items)}
+    return {"run_id": run_id, "status": "running", "items": len(items), "engine": engine}
 
 
 @router.get("/price-books/ai-price/{run_id}")
 async def ai_price_run(run_id: str) -> dict[str, Any]:
-    """A run's status; once done, each item's answer and what the run cost."""
+    """A run's status; once done, each item's answer and what the run cost.
+
+    An agent run also gives `progress`: every item as it stands now -- queued,
+    working with the step its agent is on, or done with its answer -- so rows
+    can be shown as they finish instead of when the run ends.
+    """
     try:
         run = await asyncio.to_thread(store.run_of, run_id)
+        progress = await asyncio.to_thread(store.run_items, run_id) if run else []
     except NoDatabase as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"No database configured: {exc}") from exc
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such run")
-    return {k: run[k] for k in ("id", "project_id", "status", "result", "counts", "usd", "error",
-                                "created_at", "finished_at")}
+    done = sum(1 for p in progress if p["status"] == "done")
+    return {**{k: run[k] for k in ("id", "project_id", "status", "result", "counts", "usd", "error",
+                                   "created_at", "finished_at")},
+            "progress": progress, "done": done, "total": len(progress)}
 
 
 class ConfirmBody(BaseModel):
@@ -441,7 +456,8 @@ async def confirm_ai_price(price_id: str, body: ConfirmBody) -> dict[str, Any]:
         if price is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                                 detail="This price was not agreed; send the list_price to confirm")
-        return await asyncio.to_thread(store.confirm_ai_price, price_id, float(price), body.note)
+        return await asyncio.to_thread(store.confirm_ai_price, price_id, float(price), body.note,
+                                       ai_pricing.parts_for(row, float(price)))
     except NoDatabase as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"No database configured: {exc}") from exc

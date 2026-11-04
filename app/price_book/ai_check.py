@@ -31,6 +31,8 @@ from app.price_book.price_reader import Read
 
 # Every number on a page that could be a price: "$2,408", "68.31", "1,061.30".
 _NUMBER = re.compile(r"\$?\d{1,3}(?:,\d{3})+(?:\.\d+)?|\$?\d+(?:\.\d+)?")
+# A deduction as printed: "-$268.00" (Schlage, less conventional cylinder).
+_DEDUCTION = re.compile(r"(?<![\w.])-\$(\d{1,3}(?:,\d{3})*(?:\.\d+)?)")
 _CENT = 0.005
 # A page saying its prices are rates, by length or by area.
 _MEASURE = re.compile(r"U/M is (feet|foot)|per (lineal |linear )?(foot|ft)(?![a-z])|"
@@ -63,12 +65,18 @@ class Judged:
 
 
 def _amounts(text: str) -> set[float]:
+    """Every number on the page; a deduction printed "-$268.00" also as -268.00.
+
+    Only a minus printed against a dollar sign makes a negative: "10-075" is a
+    part number, not 10 and -75.
+    """
     out = set()
     for token in _NUMBER.findall(text):
         try:
             out.add(round(float(token.replace("$", "").replace(",", "")), 2))
         except ValueError:
             continue
+    out.update(-round(float(m.replace(",", "")), 2) for m in _DEDUCTION.findall(text))
     return out
 
 
@@ -128,7 +136,7 @@ def check_printed(model: str, read: Read, pages: PageText) -> Checked:
         if not has_text:
             out.printed = False
             out.problems.append(f"p{part.pdf_page} is a picture page; {part.price_text} not checked")
-        elif round(part.amount, 2) not in numbers or part.amount <= 0:
+        elif round(part.amount, 2) not in numbers or part.amount == 0:
             out.printed = False
             out.problems.append(f"{part.price_text} is not printed on p{part.pdf_page}")
         elif part.per.strip().lower() in _EACH and pages.priced_by_measure(part.book, part.pdf_page) \

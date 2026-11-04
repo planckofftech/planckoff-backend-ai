@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     # differ from the first to be worth anything; empty turns the second read
     # off and nothing is ever agreed.
     ai_price_check_model: str = "anthropic/claude-haiku-5.5"
+    # How POST /price-books/ai-price prices when a request does not say:
+    # "pipeline" (step A finds pages, step B reads them) or "agent" (agents
+    # search the whole book; app/price_book/agent_pricing.py). Stays "pipeline"
+    # until the trial of the agents is measured.
+    ai_price_engine: str = "pipeline"
     ai_render_dpi: int = 200
     # How wide a door should be in the picture the detector sees. Measured:
     # at 80 px recall was 78%% and boxes landed in open rooms; at 160 px it
