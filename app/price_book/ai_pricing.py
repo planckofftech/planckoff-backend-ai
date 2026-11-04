@@ -78,6 +78,8 @@ def _row(maker: str, product: page_finder.Product, found: page_finder.Found,
         "parts": _answer(agreed)["parts"] if agreed else [],
         "answers": [_answer(a) for a in judged.answers],
         "pages": [asdict(p) for p in found.pages], "run_id": run_id,
+        # Cleared, so a product the agents priced before keeps none of their words.
+        "engine": "pipeline", "notes": [], "needs": [], "orderable": True, "reasons": [],
     }
 
 
@@ -164,6 +166,70 @@ def _public(row: dict) -> dict:
 # stored AI prices in the shapes the frontend already reads
 # --------------------------------------------------------------------------- #
 
+def _readings(row: dict, model: str, item: Written) -> list[dict]:
+    """What each AI model read for a price that was not settled, as choices.
+
+    Shown so a person starts from the book's page and the numbers read there
+    rather than from nothing; never counted as a price until one is chosen.
+    A reading the checks held back is still shown, with why it was held.
+    """
+    out: dict[float, dict] = {}
+    for a in row.get("answers") or []:
+        parts = a.get("parts") or []
+        total = a.get("total")
+        if total is None:
+            total = sum(p.get("extended", p.get("amount")) or 0 for p in parts)
+        total = round(float(total), 2)
+        if total <= 0:
+            continue
+        held = (a.get("problems") or [a.get("note") or ""])[0] if a.get("total") is None else ""
+        o = out.setdefault(total, {"model": model, "size": item.size, "finish": item.finish,
+                                   "list_price": total, "description": a.get("label") or "read by AI",
+                                   "book": parts[0].get("book", "") if parts else "",
+                                   "pdf_page": parts[0].get("pdf_page") if parts else None,
+                                   "row": parts[0].get("row", "") if parts else "",
+                                   "read_by": [], "held_because": held})
+        o["read_by"].append(a.get("model", ""))
+    return sorted(out.values(), key=lambda o: o["list_price"])
+
+
+def _why_unsettled(row: dict, item: Written) -> list[str]:
+    """Each model's own words on why it gave no price, so the row says why
+    without the run it came from."""
+    if not (item.model or item.description).strip():
+        return ["The schedule gives no model number to look up"]
+    if row.get("engine") == "agent":
+        # The agents say why in their own words: the checker's, and what to specify.
+        return [str(r) for r in (row.get("reasons") or []) + (row.get("needs") or [])][:6]
+    out: list[str] = []
+    for a in row.get("answers") or []:
+        if a.get("status") == "not_on_pages":
+            why = "No page in the book was found for this product"
+        else:
+            why = (a.get("note") or (a.get("problems") or [""])[0] or "").strip()
+        name = (a.get("model") or "").split("/")[-1]
+        if why and not any(why in o for o in out):
+            out.append(f"{name}: {why}" if name else why)
+    return out[:4]
+
+
+def parts_for(row: dict, price: float) -> list[dict] | None:
+    """The parts of the answer a confirmed price is, so a reused price keeps its pages.
+
+    A person confirming one of an `options` product's prices (rose $1,841 or
+    escutcheon $1,870) sends that option's total; its parts are kept with it.
+    None when the price is none of the answers' totals -- typed from the page --
+    and the row's parts are left as they are.
+    """
+    if row.get("verdict") == "agreed" and row.get("parts"):
+        return None
+    for a in row.get("answers") or []:
+        if a.get("role") != "checker" and a.get("total") is not None and a.get("parts") \
+                and abs(float(a["total"]) - price) < 0.005:
+            return a["parts"]
+    return None
+
+
 def as_quote(maker: str, item: Written, quantity: float, row: dict | None) -> dict:
     """An item's stored AI price in the shape POST /prices has always answered.
 
@@ -183,11 +249,12 @@ def as_quote(maker: str, item: Written, quantity: float, row: dict | None) -> di
         return {**base, "status": "not_found",
                 "reasons": ["Not priced yet: run AI pricing for this project (POST /price-books/ai-price)"]}
     if row.get("list_price") is None:
-        totals = sorted({a["total"] for a in row.get("answers") or [] if a.get("total") is not None})
+        first = ("The code leaves a choice open; each option below was checked, a person picks one"
+                 if row.get("verdict") == "options" else
+                 "The AI could not settle this price from the book; a person confirms it")
         return {**base, "status": "needs_review",
-                "reasons": ["The AI could not settle this price from the book; a person confirms it"],
-                "options": [{"model": base["model"], "size": item.size, "finish": item.finish,
-                             "list_price": t, "description": "read by AI"} for t in totals]}
+                "reasons": [first] + _why_unsettled(row, item),
+                "options": _readings(row, base["model"], item)}
     price = float(row["list_price"])
     parts = [{"label": p.get("label", ""), "list_price": p.get("extended", p.get("amount")),
               "pdf_page": p.get("pdf_page"), "printed_page": "", "book": p.get("book", "")}

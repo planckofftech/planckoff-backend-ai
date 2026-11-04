@@ -259,9 +259,11 @@ def ai_price(price_id: str) -> dict[str, Any] | None:
     return got[0] if got else None
 
 
-def confirm_ai_price(price_id: str, list_price: float, note: str) -> dict[str, Any]:
+def confirm_ai_price(price_id: str, list_price: float, note: str,
+                     parts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    change: dict[str, Any] = {} if parts is None else {"parts": parts}
     return (client().table("ai_prices").update({
-        "list_price": list_price, "verified": True, "verified_note": note,
+        **change, "list_price": list_price, "verified": True, "verified_note": note,
         "verified_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", price_id).execute().data[0])
@@ -328,3 +330,51 @@ def settled_ai_prices(manufacturer: str, prefix: str, limit: int) -> list[dict[s
     return (client().table("ai_prices").select("*").eq("manufacturer", manufacturer)
             .like("match_key", f"{prefix}%").not_.is_("list_price", "null")
             .order("verified", desc=True).order("match_key").limit(min(limit, _PAGE)).execute().data)
+
+
+def guides(file_names: list[str]) -> dict[str, dict[str, Any]]:
+    """The stored guides of these books, by file name (db/028_price_book_guides.sql)."""
+    if not file_names:
+        return {}
+    got = client().table("price_book_guides").select("*").in_("file_name", file_names).execute().data
+    return {g["file_name"]: g for g in got}
+
+
+def save_guide(file_name: str, sha256: str, guide: dict[str, Any], model: str, usd: float) -> dict[str, Any]:
+    """Store a book's guide. One a person has reviewed is their word and is kept."""
+    db = client()
+    found = db.table("price_book_guides").select("*").eq("file_name", file_name).execute().data
+    if found and found[0]["reviewed"]:
+        return found[0]
+    return db.table("price_book_guides").upsert({
+        "file_name": file_name, "sha256": sha256, "guide": guide, "model": model, "usd": round(usd, 6),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }, on_conflict="file_name").execute().data[0]
+
+
+def queue_items(run_id: str, item_ids: list[str]) -> None:
+    """One progress row per item of a run, queued (db/029_ai_price_agents.sql)."""
+    # An id sent twice is one row: it is one item to the frontend.
+    rows = [{"run_id": run_id, "item_id": i, "position": n, "status": "queued"}
+            for n, i in enumerate(dict.fromkeys(item_ids))]
+    for i in range(0, len(rows), _BATCH):
+        client().table("ai_price_run_items").insert(rows[i:i + _BATCH]).execute()
+
+
+def item_progress(run_id: str, item_ids: list[str | None], status: str, step: str = "",
+                  answer: dict[str, Any] | None = None) -> None:
+    """Move items of a run on: working with the step their agent is on, or done with the answer."""
+    ids = [i for i in item_ids if i is not None]
+    if not ids:
+        return
+    change: dict[str, Any] = {"status": status, "step": step[:200],
+                              "updated_at": datetime.now(timezone.utc).isoformat()}
+    if answer is not None:
+        change["answer"] = answer
+    client().table("ai_price_run_items").update(change).eq("run_id", run_id).in_("item_id", ids).execute()
+
+
+def run_items(run_id: str) -> list[dict[str, Any]]:
+    """A run's items as they stand, in the order they were sent."""
+    return (client().table("ai_price_run_items").select("item_id, position, status, step, answer, updated_at")
+            .eq("run_id", run_id).order("position").execute().data)
