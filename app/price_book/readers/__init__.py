@@ -68,6 +68,8 @@ BOOKS: dict[str, tuple[str, tuple[Reader, ...]]] = {
     "Allegion_FastTrack_Price_Book_110064.pdf": ("Allegion FastTrack", _TABLE),
     "Allegion_ProExpress_Price_Book_110445.pdf": ("Allegion ProExpress", _TABLE),
     "Glynn-Johnson_Price_Book_110061.pdf": ("Glynn-Johnson", _TABLE),
+    # The full HES list; the one-page partial beside it is only its cover.
+    "HES_Feb_2_2026_Pricelist.pdf": ("HES", _TABLE),
     "Ives_Price_Book_110060.pdf": ("Ives", _TABLE),
     "Peaks_Plus_Price_Book_06012026.pdf": ("Kaba Ilco", _TABLE),
     "Kwikset-Box-Pack-Price-Book-Effective-August-2026.pdf": ("Kwikset", _TABLE),
@@ -117,7 +119,7 @@ SKIPPED: dict[str, str] = {
     "NGP_Price_Book_2-1-2026.pdf": "replaced by the June 2026 NGP list",
     "AADSS1261453.pdf": "no printed prices found",
     "Alarm_Controls_Feb_2_2026_Pricelist_partial.pdf": "no printed prices found",
-    "HES_Feb_2_2026_Pricelist_partial.pdf": "no printed prices found",
+    "HES_Feb_2_2026_Pricelist_partial.pdf": "the cover page of the full HES list, which is read",
     "Securitron_Feb_2_2026_Pricelist_partial.pdf": "no printed prices found",
     "PRICING_GUIDE.pdf": "no printed prices found",
     "rockwood_lites_and_louvers_price_book_2026.pdf": "no printed prices found",

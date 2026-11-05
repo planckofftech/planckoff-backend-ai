@@ -44,6 +44,8 @@ STANDARD: dict[str, str] = {
     "GLY": "Glynn-Johnson", "STE": "Steelcraft", "DOR": "dormakaba", "PEM": "Pemko",
     "ROC": "Rockwood", "SAR": "Sargent", "COR": "Corbin Russwin", "MCK": "McKinney",
     "NOR": "Norton Rixson", "TRI": "Trimco", "YAL": "Yale", "BES": "Best",
+    # HES electric strikes: schedules write it either way.
+    "HES": "HES", "HS": "HES",
 }
 
 Source = str   # 'name' | 'table' | 'ai' | 'none'
@@ -60,6 +62,9 @@ class Code:
     source: str = "standard"          # standard | user | ai
     verified: bool = True
     note: str = ""
+    # A person said this maker has no price book (Alarm Controls). The code then
+    # answers "no price book" instead of being guessed at or matched elsewhere.
+    no_book: bool = False
 
 
 @dataclass

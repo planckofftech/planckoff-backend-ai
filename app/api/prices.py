@@ -491,6 +491,9 @@ async def list_ai_prices(
 class CodeBody(BaseModel):
     manufacturer: str = Field(..., min_length=1, max_length=100)
     note: str = Field("", max_length=200)
+    no_book: bool = Field(False, description="The maker has no price book: the code then answers "
+                                             "'no price book for this maker' instead of being matched "
+                                             "to another maker's book")
 
 
 @router.get("/price-books/manufacturer-codes")
@@ -509,7 +512,11 @@ async def put_code(code: str, body: CodeBody) -> dict[str, Any]:
     """Add or correct a code, as a person: it is stored verified.
 
     The maker must be one whose book is loaded, by its full name or a known
-    code, so a typo cannot point a code at no book.
+    code, so a typo cannot point a code at no book. A maker with no book is
+    saved only as the explicit choice `no_book: true` ("AK" is Alarm Controls,
+    whose prices are not on file): the code then answers "no price book" rather
+    than being guessed at or matched to another maker's book. `no_book` for a
+    maker whose book is loaded is refused -- that is a typo or a mistake.
     """
     key = makers.match_key(code)
     if not key:
@@ -517,19 +524,52 @@ async def put_code(code: str, body: CodeBody) -> dict[str, Any]:
                             detail="A code needs at least one letter or digit")
 
     def _put() -> makers.Code:
-        maker = manufacturer_of(body.manufacturer, set(store.mapped_books()), store.maker_codes())
-        if maker is None:
+        loaded, codes = set(store.mapped_books()), store.maker_codes()
+        maker = manufacturer_of(body.manufacturer, loaded, codes)
+        if body.no_book:
+            if maker is not None:
+                raise ValueError(maker)
+            # A known code typed as the name ("HS") saves the maker it stands for.
+            named, _, _ = makers.resolve(body.manufacturer, set(), codes)
+            entry = makers.Code(key, named or " ".join(body.manufacturer.split()), "user", True,
+                                body.note, no_book=True)
+        elif maker is None:
             raise LookupError(body.manufacturer)
-        entry = makers.Code(key, maker, "user", True, body.note)
+        else:
+            entry = makers.Code(key, maker, "user", True, body.note)
         store.set_code(entry)
         return entry
 
     try:
         entry = await asyncio.to_thread(_put)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"{exc} has a price book loaded; save the code without no_book")
     except LookupError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f"No price book for '{body.manufacturer}' has been loaded")
+                            detail=f"No price book for '{body.manufacturer}' has been loaded. If this "
+                                   "maker has no price book, save the code with no_book: true")
     except NoDatabase as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"No database configured: {exc}") from exc
     return asdict(entry)
+
+
+@router.delete("/price-books/manufacturer-codes/{code}")
+async def delete_code(code: str) -> dict[str, Any]:
+    """Remove a code saved by mistake.
+
+    A standard code (HA, VD...) removed from the table still reads as the
+    standard one: `now` says what the code means after the delete, null when
+    it is unknown again.
+    """
+    key = makers.match_key(code)
+    try:
+        deleted = await asyncio.to_thread(store.delete_code, key) if key else False
+        now = (await asyncio.to_thread(store.maker_codes)).get(key) if deleted else None
+    except NoDatabase as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"No database configured: {exc}") from exc
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No saved code '{code}'")
+    return {"deleted": key, "now": asdict(now) if now else None}
