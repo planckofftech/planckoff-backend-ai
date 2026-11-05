@@ -27,6 +27,24 @@ _BATCH = 500
 _PAGE = 1000
 
 
+def _quote(value: Any) -> str:
+    """One value for a PostgREST list, quoted so any character in it is taken literally."""
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
+def _any_of(values: Any) -> str:
+    """An `in` filter for these values. postgrest-py's in_() quotes a value only when it
+    holds , : ( ) and never escapes a quote inside it, so an id like 4-1/2" matched
+    nothing and its row was silently missed."""
+    return "(" + ",".join(_quote(v) for v in values) + ")"
+
+
+def _array(values: Any) -> str:
+    """An array literal for an `ov` filter, quoted the same way."""
+    return "{" + ",".join(_quote(v) for v in values) + "}"
+
+
 def save(book: BookRead, sha256: str) -> str:
     """Store a book that was read, replacing any earlier read of the same file."""
     db = client()
@@ -97,7 +115,7 @@ def maker_codes() -> dict[str, makers.Code]:
         return codes
     for g in got:
         codes[g["code"]] = makers.Code(g["code"], g["manufacturer"], g["source"],
-                                       g["verified"], g["note"])
+                                       g["verified"], g["note"], bool(g.get("no_book")))
     return codes
 
 
@@ -105,9 +123,15 @@ def set_code(code: makers.Code) -> None:
     """Add a code or replace what it says."""
     client().table("manufacturer_codes").upsert({
         "code": code.code, "manufacturer": code.manufacturer, "source": code.source,
-        "verified": code.verified, "note": code.note,
+        "verified": code.verified, "note": code.note, "no_book": code.no_book,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).execute()
+
+
+def delete_code(code: str) -> bool:
+    """Remove a code from the table; whether there was one. A standard code
+    removed still reads as the standard one underneath (maker_codes)."""
+    return bool(client().table("manufacturer_codes").delete().eq("code", code).execute().data)
 
 
 def maps_print(file_names: list[str], models: list[str]) -> set[str]:
@@ -115,7 +139,7 @@ def maps_print(file_names: list[str], models: list[str]) -> set[str]:
     if not file_names or not models:
         return set()
     got = (client().table("price_book_pages").select("models")
-           .in_("file_name", file_names).ov("models", models).execute().data)
+           .filter("file_name", "in", _any_of(file_names)).filter("models", "ov", _array(models)).execute().data)
     printed = {m for g in got for m in g["models"]}
     return {m for m in models if m in printed}
 
@@ -197,7 +221,7 @@ class DbSource:
         start = 0
         while True:
             got = (self._db.table("price_rows").select("*")
-                   .eq("manufacturer", manufacturer).in_("match_key", sorted(keys))
+                   .eq("manufacturer", manufacturer).filter("match_key", "in", _any_of(sorted(keys)))
                    .order("id").range(start, start + _PAGE - 1).execute().data)
             out.extend(self._price_row(g) for g in got)
             if len(got) < _PAGE:
@@ -238,7 +262,7 @@ def ai_prices_for(manufacturer: str, product_keys: list[str]) -> dict[str, dict[
     if not product_keys:
         return {}
     got = (client().table("ai_prices").select("*").eq("manufacturer", manufacturer)
-           .in_("product_key", product_keys).execute().data)
+           .filter("product_key", "in", _any_of(product_keys)).execute().data)
     return {g["product_key"]: g for g in got}
 
 
@@ -336,7 +360,7 @@ def guides(file_names: list[str]) -> dict[str, dict[str, Any]]:
     """The stored guides of these books, by file name (db/028_price_book_guides.sql)."""
     if not file_names:
         return {}
-    got = client().table("price_book_guides").select("*").in_("file_name", file_names).execute().data
+    got = client().table("price_book_guides").select("*").filter("file_name", "in", _any_of(file_names)).execute().data
     return {g["file_name"]: g for g in got}
 
 
@@ -371,7 +395,7 @@ def item_progress(run_id: str, item_ids: list[str | None], status: str, step: st
                               "updated_at": datetime.now(timezone.utc).isoformat()}
     if answer is not None:
         change["answer"] = answer
-    client().table("ai_price_run_items").update(change).eq("run_id", run_id).in_("item_id", ids).execute()
+    client().table("ai_price_run_items").update(change).eq("run_id", run_id).filter("item_id", "in", _any_of(ids)).execute()
 
 
 def run_items(run_id: str) -> list[dict[str, Any]]:
