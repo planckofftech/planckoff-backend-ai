@@ -33,8 +33,23 @@ _FEET_INCH = re.compile(r"(\d+)\s*'\s*(?:-?\s*(\d+(?:\.\d+)?)\s*\")?")
 _LF = re.compile(r"(\d+(?:\.\d+)?)\s*(?:LF|FT|FEET|FOOT)(?![A-Z])", re.I)
 _BRACKET = re.compile(r"\[([^\]]*)\]")
 
-AREA_UNITS = {"100 sq in", "100 square inches", "hundred square inches", "per 100 sq in"}
-LENGTH_UNITS = {"foot", "feet", "ft", "lf", "per foot", "linear foot", "lineal foot"}
+# A unit is read by what it says, not matched against a list: books and models
+# write the same unit many ways ("foot", "per LF", "lin. ft", "100 sq. in.").
+# Anything that is neither a length nor an area -- each, pair, a pack of 100, a
+# box, a roll -- is a price for what the book sells, counted by the schedule.
+_AREA_UNIT = re.compile(r"\bsq\b|\bsquare\b", re.I)
+_HUNDRED_SQ_IN = re.compile(r"(100|hundred)\s*(sq\.?|square)\s*(in\b|inch)", re.I)
+_LENGTH_UNIT = re.compile(r"\b(foot|feet|ft|lf|lin|linear|lineal)\b", re.I)
+
+
+def is_area(per: str) -> bool:
+    """A rate by area: per 100 sq in, per sq ft."""
+    return bool(_AREA_UNIT.search(per))
+
+
+def is_length(per: str) -> bool:
+    """A rate by length: per foot, per LF, lin. ft. A square foot is an area."""
+    return bool(_LENGTH_UNIT.search(per)) and not is_area(per)
 
 
 def _inches(text: str) -> float | None:
@@ -97,10 +112,12 @@ def length_units(text: str, door_width: float | None = None) -> float | None:
 
 def expected_units(per: str, text: str, door_width: float | None = None) -> tuple[bool, float | None]:
     """(is this a rate code counts, the count). Not a rate: (False, None)."""
-    unit = per.strip().lower()
-    if unit in AREA_UNITS or ("sq" in unit and "in" in unit):
-        return True, plate_units(text, door_width)
-    if unit in LENGTH_UNITS:
+    if is_area(per):
+        # The plate count is in hundreds of square inches, the unit Hager and
+        # Rockwood print. Any other area (per sq in, per sq ft) is still a rate,
+        # but one we do not count: it goes to a person, never through as one.
+        return True, plate_units(text, door_width) if _HUNDRED_SQ_IN.search(per) else None
+    if is_length(per):
         return True, length_units(text, door_width)
     return False, None
 
