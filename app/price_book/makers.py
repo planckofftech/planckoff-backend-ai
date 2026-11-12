@@ -46,6 +46,9 @@ STANDARD: dict[str, str] = {
     "NOR": "Norton Rixson", "TRI": "Trimco", "YAL": "Yale", "BES": "Best",
     # HES electric strikes: schedules write it either way.
     "HES": "HES", "HS": "HES",
+    # ASSA ABLOY access control: Alarm Controls (maglocks, push plates, key
+    # switches) and Securitron (maglocks, power supplies).
+    "AK": "Alarm Controls", "SU": "Securitron",
 }
 
 Source = str   # 'name' | 'table' | 'ai' | 'none'

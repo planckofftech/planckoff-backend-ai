@@ -19,7 +19,7 @@ prints it, with the book's words.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from app.price_book import agent, book_skills
@@ -72,8 +72,20 @@ SYSTEM = (
     "- If you cannot find the price of a piece, do not guess: leave it out, set status "
     "unclear and say in notes what is missing.\n"
     "- Prices are list prices for ONE unit. A price per foot or per area is a rate: give "
-    "per ('foot', '100 sq in') and units from the size the schedule writes; with no size "
-    "written, status unclear.\n"
+    "per ('foot', '100 sq in') and units from the size the schedule writes.\n"
+    "- When the price depends on a size the schedule does not give (a plate's width, a "
+    "length 'as required', the feet of head and jambs), do not stop: set status options and "
+    "give one option per size, each with all its parts and its size in square brackets in "
+    "`size` ('[10\" x 34\"]' for a plate, '[36\"]' for a length). Use the sizes the book "
+    "prints ready-priced or sells in stock lengths; when it prints none, use common door "
+    "sizes (3'-0\", 3'-6\", 4'-0\" wide, 7'-0\" high), lengths rounded up to whole feet. "
+    "Say in needs_from_person which size has to be chosen.\n"
+    "- A product sold only by the pack or box (silencers in a pack of 100) is priced by the "
+    "pack: the pack price is the price, per 'pack of 100', units 1, status priced. Never "
+    "split it into a price per piece; say the pack size in notes.\n"
+    "- B4E on a plate (kick, mop, armor, push) is bevelled 4 edges, the standard plate: "
+    "written or not, the plate's price includes it. Add a charge for it only where the book "
+    "prints one; a book that never mentions it is no reason for status unclear.\n"
     "- Finish names have equivalents: US26D = 626, US32D = 630, US3 = 605, US4 = 606, "
     "US10B = 613, US15 = 619, US26 = 625, US28 = 628, US19/BLK/BLACK = black.\n"
     "- Be economical: when the guide or the contents says where a section is, search "
@@ -108,6 +120,9 @@ SUBMIT = {
                     "items": {"type": "object", "properties": {
                         "label": {"type": "string", "description": "'' for a single option, else the choice, "
                                                                      "e.g. 'Rose trim (A, B or C)'"},
+                        "size": {"type": "string", "description": "The size this option assumes when the "
+                                                                   "schedule gives none, in square brackets: "
+                                                                   "'[10\" x 34\"]', '[36\"]'; else ''"},
                         "parts": {"type": "array", "items": _PART}},
                         "required": ["label", "parts"]}},
         "orderable": {"type": "boolean", "description": "false when the book says the code cannot be ordered as written"},
@@ -160,7 +175,21 @@ def _check(args: dict[str, Any], shelf: book_skills.Shelf) -> list[str]:
     return wrong
 
 
+def _option_size(option: dict) -> str:
+    """The size an option assumes, bracketed: measure reads a bracketed size as
+    the plate as cut, or the length, so the count is still worked out in code."""
+    size = str(option.get("size") or "").strip()[:40]
+    if not size:
+        return ""
+    return size if size.startswith("[") else f"[{size.strip('[]')}]"
+
+
 def _read(product: Product, status: str, option: dict, shelf: book_skills.Shelf) -> Read:
+    # A size the schedule leaves out is a choice: each option is priced and
+    # checked at the size it names, without touching the schedule's own size.
+    size = _option_size(option)
+    if size and status == "options":
+        product = replace(product, size=f"{product.size} {size}".strip())
     # Each option of an open choice is itself a complete price: read as priced.
     out = Read(product, "priced" if status in ("priced", "options") else "unclear")
     for p in option.get("parts") or []:
@@ -203,7 +232,8 @@ async def price(product: Product, manufacturer: str, shelf: book_skills.Shelf, m
     status = a.get("status") if a.get("status") in ("priced", "options", "unclear", "not_found") else "unclear"
     options = [o for o in a.get("options") or [] if isinstance(o, dict)][:MAX_OPTIONS]
     return Priced(product, status,
-                  [(str(o.get("label", ""))[:120], _read(product, status, o, shelf)) for o in options],
+                  [(str(o.get("label") or _option_size(o).strip("[]"))[:120], _read(product, status, o, shelf))
+                   for o in options],
                   bool(a.get("orderable", True)),
                   [str(n)[:400] for n in a.get("notes") or []][:12],
                   [str(n)[:300] for n in a.get("needs_from_person") or []][:6],
