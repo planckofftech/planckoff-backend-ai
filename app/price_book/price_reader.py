@@ -42,11 +42,12 @@ REPLY_TOKENS = 8000
 
 # A length written on a schedule: 36", 3', 19 LF, 20 FT.
 _LENGTH = re.compile(r"\d\s*(\"|'|(LF|FT|FEET|FOOT)(?![A-Z]))", re.I)
-_EACH = {"each", "ea", "set", "pair", "pr", "kit", ""}
 
 
 def _by_length(parts: list["Part"]) -> bool:
-    return any(p.per.strip().lower() not in _EACH for p in parts)
+    """Whether any part is a rate per foot. A pack, box or roll is not: the book
+    sells it whole and its price is the price (Rockwood 608-RKW, pack of 100)."""
+    return any(measure.is_length(p.per) for p in parts)
 
 
 class CutOff(RuntimeError):
