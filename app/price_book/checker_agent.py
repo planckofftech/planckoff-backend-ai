@@ -46,13 +46,18 @@ SYSTEM = (
     "rightly (what it is, given its place) and whether any piece that costs something "
     "was left out or any part added that the code does not ask for.\n"
     "2. Each part: open its page and say whether it is the right row and the right column "
-    "for this product (function, design or trim, finish), and whether it is a price for "
-    "one, not a rate per foot or per area or a price for a pack.\n"
+    "for this product (function, design or trim, finish), and whether its unit is right: a "
+    "price for one, or a rate per foot or per area counted by the size the schedule or the "
+    "option names (an option may assume a size the schedule leaves out; that is a choice, "
+    "not an error). A product the book sells only by the pack or box is priced by the "
+    "pack: the pack price is right.\n"
     "3. The notes: anything the pages say that the answer misses (not available with, "
     "must also be specified).\n\n"
     "The reading is only what each piece of the code means and what it adds. A choice the "
     "code leaves open that the answer already prices as options is not a reading error, "
     "and neither is anything about the notes: put what the notes miss in missed.\n\n"
+    "B4E on a plate is bevelled 4 edges, the standard plate: its price is in the plate's "
+    "price unless the book prints a charge for it, so pricing nothing for it is right.\n\n"
     "Schedules write codes loosely: no periods, options in any order, defaults left out "
     "(the cylinder or strike a base price already includes). Judge what each piece means "
     "and what it costs, not how the code is written; a default left out is not an error.\n\n"
@@ -110,7 +115,8 @@ def answer_text(priced: Priced, shelf: book_skills.Shelf) -> str:
     out = [f"Status: {priced.status}"
            + ("" if priced.orderable else "; the book says the code cannot be ordered as written")]
     for i, (label, read) in enumerate(priced.options, 1):
-        out.append(f"Option {i}: {label or '(the only one)'}")
+        out.append(f"Option {i}: {label or '(the only one)'}"
+                   + (f" | size: {read.product.size}" if read.product.size else ""))
         for j, p in enumerate(read.parts, 1):
             out.append(f"  Part {j}: {p.label} | {labels.get(p.book, p.book)} p.{p.pdf_page} | "
                        f"{p.price_text} per {p.per} x {p.units:g} | read from: {p.row}")
