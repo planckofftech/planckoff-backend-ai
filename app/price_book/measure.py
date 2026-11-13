@@ -9,6 +9,8 @@ price cannot come from arithmetic two models happened to get the same wrong way.
     190S 10" x 34"             10 x 34 = 340 sq in -> 3.40
     190S 10" x 1" LDW - 23"    10 high, 23 wide    -> 2.30   (LDW: less door width)
     190S 10" x 2" LDW          on a 36" door: 10 x 34 -> 3.40; no door width: None
+    8400 4" X 1" LOW           LOW is LDW typed with an O: 4 x 35 -> 1.40
+    4" x 1"                    a sliver, not a plate: None, for a person
     726 x LAR - 20'            20 feet
     488S @ HEAD [19 LF]        19 feet
     413S x LAR                 on a 36" door: 3 feet (LAR: length as required)
@@ -27,7 +29,12 @@ from app.price_book import sizes
 
 _INCH = r"(\d+(?:\.\d+)?(?:\s*-?\s*\d+/\d+)?)\s*\""
 _PLATE = re.compile(_INCH + r"\s*[xX×]\s*" + _INCH)
-_LDW = re.compile(r"\bLDW\b", re.I)
+# "Less door width", as schedules write it: LDW, LOW (the same, typed with an
+# O), L.D.W., "less door width", "less width".
+_LDW = re.compile(r"\bL\.?\s*[DO]\.?\s*W\b\.?|\bLESS\s+(DOOR\s+)?WIDTH\b", re.I)
+# A plate narrower than this, written as its own width, is not a plate: it is
+# a "less door width" the code did not recognise, and goes to a person.
+_MIN_PLATE_WIDTH = 6.0
 _DASH_INCH = re.compile(r"-\s*" + _INCH + r"(?!\s*[xX×])")
 _FEET_INCH = re.compile(r"(\d+)\s*'\s*(?:-?\s*(\d+(?:\.\d+)?)\s*\")?")
 _LF = re.compile(r"(\d+(?:\.\d+)?)\s*(?:LF|FT|FEET|FOOT)(?![A-Z])", re.I)
@@ -74,6 +81,10 @@ def plate_units(text: str, door_width: float | None = None) -> float | None:
             width = _inches(dash.group(1)) if dash else (door_width - second if door_width else None)
         else:
             width = second
+            # "4\" x 1\"" for a mop plate is never a plate 1" wide: counting it
+            # would price a sliver (TEST-38, $6.98 for a $244 plate).
+            if min(height, width) < _MIN_PLATE_WIDTH and max(height, width) < _MIN_PLATE_WIDTH * 2:
+                return None
         if width is None or width <= 0:
             return None
         return round(math.ceil(height) * math.ceil(width) / 100, 2)
