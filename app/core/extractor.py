@@ -409,6 +409,45 @@ _SPLIT_MARK = re.compile(r"^(\d{1,4})\s+([A-Za-z]{1,2})$")
 _TRAILING_WORDS = re.compile(r"^(\S+)\s+(.*[A-Za-z]{3}.*)$")
 
 
+# What separates the doors a row lists: commas, semicolons, "&", "AND", or a
+# line break the cell wrapped at.
+_TAG_LIST_SEP = re.compile(r"\s*(?:[,;&]|\bAND\b|\s)\s*", re.I)
+
+
+def listed_tags(tag: str) -> list[str]:
+    """The door numbers a cell lists, where it lists more than one -- else [].
+
+    A schedule that has several doors built the same writes them in one row:
+    Safari's storefront row reads "104,105,106,107,108," and the next
+    "101,102,103,109 110,111,112,113". Kept as one door, five and eight doors
+    became one each, with a number no plan prints.
+
+    Every part must be shaped like a door number, so "105 B" -- one door's
+    mark -- and "STAIR 1" are never split.
+    """
+    from app.core.page_finder import TAG_RE
+
+    parts = [p for p in _TAG_LIST_SEP.split((tag or "").strip()) if p]
+    if len(parts) < 2 or not all(TAG_RE.match(p) for p in parts):
+        return []
+    return parts
+
+
+def one_row_per_door(rows: list[DoorRow]) -> tuple[list[DoorRow], list[str]]:
+    """Rows with a listed door number split into one row per door, each
+    carrying the whole row's spec. Returns (rows, the cells that were split)."""
+    out: list[DoorRow] = []
+    split: list[str] = []
+    for row in rows:
+        tags = listed_tags(row.door_tag)
+        if not tags:
+            out.append(row)
+            continue
+        split.append(row.door_tag.strip())
+        out.extend(row.model_copy(update={"door_tag": t}, deep=True) for t in tags)
+    return out, split
+
+
 def _split_run_on_tag(values: dict[str, str]) -> None:
     """Separate a door number from the room name that ran into its cell.
 

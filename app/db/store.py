@@ -340,9 +340,76 @@ def _insert(table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+# Door columns added after the table was made (db/033). Until that has run,
+# their values are stored in `extra`, where they always used to be.
+_NEWER_DOOR_FIELDS = ("door_thickness", "frame_type")
+
+
+def _insert_doors(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Store door rows, and still store them if db/033 has not been run.
+
+    A missing column fails the whole insert, and with it the schedule a
+    person waited for. So that one failure is retried with the newer fields
+    folded back into `extra`."""
+    try:
+        return _insert("doors", rows)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        if not any(f in str(exc) for f in _NEWER_DOOR_FIELDS):
+            raise
+        log.warning("db: doors stored without %s (has db/033 been run?)",
+                    ", ".join(_NEWER_DOOR_FIELDS))
+        older = []
+        for row in rows:
+            row = dict(row)
+            extra = dict(row.get("extra") or {})
+            for field in _NEWER_DOOR_FIELDS:
+                value = row.pop(field, None)
+                if value:
+                    extra.setdefault(field, value)
+            row["extra"] = extra
+            older.append(row)
+        return _insert("doors", older)
+
+
 # --------------------------------------------------------------------------- #
 # the schedule
 # --------------------------------------------------------------------------- #
+
+def _same_schedule(a: dict, page: int, title: str) -> bool:
+    def norm(t):
+        return " ".join((t or "").upper().split())
+    return a.get("page") == page and norm(a.get("title")) == norm(title)
+
+
+def removed_schedules(db, document_id: str) -> list[dict]:
+    """The schedules a person removed from this document. [] before db/034."""
+    try:
+        got = (db.table("documents").select("removed_schedules")
+               .eq("id", document_id).execute().data)
+    except Exception as exc:  # noqa: BLE001 - the column may not exist yet
+        log.info("db: removed schedules not read (has db/034 been run?): %s", exc)
+        return []
+    return (got[0].get("removed_schedules") if got else None) or []
+
+
+def _leave_out_removed(db, document_id: str, result: ExtractionResult) -> None:
+    """Take the schedules a person removed out of a fresh reading."""
+    gone = removed_schedules(db, document_id)
+    if not gone or not result.tables:
+        return
+    keep = [t for t in result.tables
+            if not any(_same_schedule(g, t.page, t.title) for g in gone)]
+    if len(keep) == len(result.tables):
+        return
+    left = len(result.tables) - len(keep)
+    result.tables = keep
+    result.rows = [r for t in keep for r in t.rows]
+    result.row_count = len(result.rows)
+    result.warnings.append(
+        f"{left} schedule(s) removed from this set earlier were left out again.")
+    log.info("db: %d removed schedule(s) left out of the re-read of %s",
+             left, document_id)
+
 
 def save_extraction(*, org: str = "", project: str = "", filename: str,
                     result: ExtractionResult, sha256: str, size_bytes: int,
@@ -396,6 +463,9 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
         db.table("doors").delete().eq("document_id", document_id).execute()
         db.table("schedules").delete().eq("document_id", document_id).execute()
 
+        # Schedules a person removed stay removed. Taken out of the result
+        # itself, so the caller handed it back does not show them either.
+        _leave_out_removed(db, document_id, result)
         tables = result.tables or []
         made = _insert("schedules", [
             {"document_id": document_id, "page": t.page, "title": t.title,
@@ -412,6 +482,15 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
             for t in tables
         ])
         schedule_id = {t.page: m["id"] for t, m in zip(tables, made)}
+        # Each door with the schedule it came from. It used to be every door
+        # with the first table's id -- keyed by page, so two tables on one page
+        # were one schedule -- and no door could be traced to its own table,
+        # which removing a schedule needs. The rows are the tables' rows in
+        # order; where they are not, the old link is all there is.
+        if sum(len(t.rows) for t in tables) == len(result.rows):
+            owner = [m["id"] for t, m in zip(tables, made) for _ in t.rows]
+        else:
+            owner = [schedule_id.get(tables[0].page if tables else 0)] * len(result.rows)
 
         rows, seen, repeated = [], set(), []
         for index, door in enumerate(result.rows):
@@ -453,11 +532,10 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
             values["door_tag"] = tag
             rows.append({
                 "org_id": org_id, "document_id": document_id,
-                "schedule_id": schedule_id.get(
-                    tables[0].page if tables else 0),
+                "schedule_id": owner[index],
                 "row_index": index, **values, "extra": door.extra,
             })
-        _insert("doors", rows)
+        _insert_doors(rows)
 
         # Put back the ones a person found, unless the schedule now carries
         # that number itself -- a door that has since been scheduled belongs to
@@ -658,6 +736,8 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
             return False
         org_id = document.data[0]["org_id"]
 
+        # Read before the wipe: the types people set, to put back below.
+        typed = _types_by_hand(db, document_id)
         db.table("detections").delete().eq("document_id", document_id).execute()
         db.table("sheets").delete().eq("document_id", document_id).execute()
 
@@ -669,6 +749,7 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
             for s in audit.floor_plans
         ])
         sheet_id = {s.page: m["id"] for s, m in zip(audit.floor_plans, made)}
+        _record_unread(db, sheet_id, audit.unread)
 
         # Boxes a person has already removed. The geometry pass is
         # deterministic, so without this the same wrong box is written back on
@@ -693,6 +774,7 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
                 continue
             seen.add(key)
             rows.append(_detection_row(org_id, document_id, sheet_id[page], door))
+        _keep_types(rows, typed, {v: k for k, v in sheet_id.items()})
         _insert("detections", rows)
         _record_walls(db, document_id, audit.detected)
         _record_pages(db, document_id, audit.pages)
@@ -712,9 +794,106 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
         return False
 
 
+# An unnumbered box keeps a person's type across a re-read where the new box's
+# centre is this close to the old one's, as a fraction of the page.
+_SAME_DOOR = 0.01
+
+
+def _types_by_hand(db, document_id: str) -> list[dict]:
+    """The door types people set on detected boxes, read before a pass
+    rebuilds them -- each with its page and centre, to find the same door in
+    what replaces it. [] before db/032 has been run."""
+    try:
+        rows = (db.table("detections")
+                .select("sheet_id, door_tag, kind, swing, x0, y0, x1, y1")
+                .eq("document_id", document_id).eq("kind_by_hand", True)
+                .execute().data)
+        if not rows:
+            return []
+        pages = {s["id"]: s["page"] for s in
+                 db.table("sheets").select("id, page")
+                 .eq("document_id", document_id).execute().data}
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        log.info("db: no hand-set door types read (%s)", exc)
+        return []
+    return [{"page": pages.get(r["sheet_id"]), "door_tag": r.get("door_tag"),
+             "kind": r.get("kind"), "swing": r.get("swing"),
+             "cx": ((r["x0"] or 0) + (r["x1"] or 0)) / 2,
+             "cy": ((r["y0"] or 0) + (r["y1"] or 0)) / 2} for r in rows]
+
+
+def _keep_types(rows: list[dict], typed: list[dict], page_of: dict[str, int]) -> None:
+    """Put a type a person set back on the same door in a rebuilt set of rows.
+
+    By number where the door has one; an unnumbered box by where it stands.
+    The type is what they said the door is, and a re-read does not get to
+    overrule it -- which is all the old habit of converting a retyped box to a
+    hand-placed one ever bought, at the cost of its tag position and arc.
+    """
+    if not typed:
+        return
+    by_tag = {t["door_tag"]: t for t in typed if t["door_tag"]}
+    loose = [t for t in typed if not t["door_tag"]]
+    for row in rows:
+        hit = by_tag.get(row.get("door_tag")) if row.get("door_tag") else None
+        if hit is None and not row.get("door_tag"):
+            cx, cy = (row["x0"] + row["x1"]) / 2, (row["y0"] + row["y1"]) / 2
+            hit = next((t for t in loose if t["page"] == page_of.get(row["sheet_id"])
+                        and abs(t["cx"] - cx) <= _SAME_DOOR
+                        and abs(t["cy"] - cy) <= _SAME_DOOR), None)
+        if hit is not None:
+            row["kind"] = hit["kind"]
+            row["swing"] = hit["swing"]
+            row["kind_by_hand"] = True
+    # One shape for every row of a bulk insert.
+    if any(r.get("kind_by_hand") for r in rows):
+        for row in rows:
+            row.setdefault("kind_by_hand", False)
+
+
+def _overlaps(a: dict, b: dict) -> bool:
+    return (a["page"] == b["page"] and a["x0"] < b["x1"] and b["x0"] < a["x1"]
+            and a["y0"] < b["y1"] and b["y0"] < a["y1"])
+
+
+def _record_unread(db, sheet_id: dict[int, str], unread, *,
+                   cleared: list[dict] | None = None) -> None:
+    """Put on each sheet the parts of it the vision pass did not read.
+
+    `cleared` are regions just read again: what was listed under them goes,
+    and whatever this pass could not read takes its place. Without `cleared`
+    the sheet's list is replaced outright -- a full pass rebuilt the sheet.
+
+    Its own call, and its failure is its own: before db/031_sheet_unread.sql
+    has been run the column does not exist, and that must not lose the doors.
+    """
+    fresh: dict[int, list[dict]] = {}
+    for u in unread or []:
+        fresh.setdefault(u.page, []).append(u.model_dump())
+    pages = set(fresh) | ({c["page"] for c in cleared} if cleared is not None
+                          else set(sheet_id))
+    try:
+        for page in pages:
+            if page not in sheet_id:
+                continue
+            listed = fresh.get(page, [])
+            if cleared is not None:
+                before = (db.table("sheets").select("unread")
+                          .eq("id", sheet_id[page]).execute().data)
+                kept = [u for u in ((before[0].get("unread") if before else None) or [])
+                        if not any(_overlaps(u, c) for c in cleared)]
+                listed = kept + listed
+            db.table("sheets").update({"unread": listed}).eq(
+                "id", sheet_id[page]).execute()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        log.warning("db: could not record the unread parts of the sheets "
+                    "(has db/031_sheet_unread.sql been run?): %s", exc)
+
+
 def save_reprocess(document_id: str, audit: PlanAudit, *,
                    pages: list[int] | None = None,
-                   doors: set[str] | None = None) -> dict[str, Any] | None:
+                   doors: set[str] | None = None,
+                   regions: list[dict] | None = None) -> dict[str, Any] | None:
     """Store a pass a person asked for, replacing only what it was asked about.
 
     `save_audit` rebuilds the whole document, which is right for a pass over
@@ -755,14 +934,30 @@ def save_reprocess(document_id: str, audit: PlanAudit, *,
                     "id", sheet_id[s.page]).execute()
 
         asked_sheets = {sheet_id[p] for p in pages if p in sheet_id} if pages else None
+        page_of = {v: k for k, v in sheet_id.items()}
+
+        def in_region(det: dict) -> bool:
+            # The rest of a sheet: only boxes inside the parts read again are
+            # replaced. Replacing the whole sheet would drop every door the
+            # first read found outside them.
+            if not regions:
+                return True
+            cx = ((det.get("x0") or 0) + (det.get("x1") or 0)) / 2
+            cy = ((det.get("y0") or 0) + (det.get("y1") or 0)) / 2
+            page = page_of.get(det["sheet_id"])
+            return any(r["page"] == page and r["x0"] <= cx <= r["x1"]
+                       and r["y0"] <= cy <= r["y1"] for r in regions)
 
         def covered(det: dict) -> bool:
             return ((asked_sheets is None or det["sheet_id"] in asked_sheets)
-                    and (not doors or det.get("door_tag") in doors))
+                    and (not doors or det.get("door_tag") in doors)
+                    and in_region(det))
 
-        current = (db.table("detections").select("id, sheet_id, door_tag, is_primary")
+        current = (db.table("detections")
+                   .select("id, sheet_id, door_tag, is_primary, x0, y0, x1, y1")
                    .eq("document_id", document_id).execute().data)
         replaced = [d["id"] for d in current if covered(d)]
+        typed = _types_by_hand(db, document_id)
         for start in range(0, len(replaced), _BATCH):
             db.table("detections").delete().in_(
                 "id", replaced[start:start + _BATCH]).execute()
@@ -800,11 +995,22 @@ def save_reprocess(document_id: str, audit: PlanAudit, *,
             db.table("detections").update({"is_primary": False}).in_(
                 "id", demote).execute()
 
+        _keep_types(rows, typed, page_of)
         _insert("detections", rows)
         written = {r["door_tag"] for r in rows if r["door_tag"]}
         _record_walls(db, document_id,
                       [d for d in audit.detected if d.tag in written])
         _record_pages(db, document_id, audit.pages)
+        # What was read again is no longer unread; what this pass could not
+        # read is. A whole sheet read again clears that sheet's list.
+        if regions:
+            cleared = regions
+        elif pages:
+            cleared = [{"page": p, "x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}
+                       for p in pages]
+        else:
+            cleared = []
+        _record_unread(db, sheet_id, audit.unread, cleared=cleared)
 
         log.info("db: reprocess replaced %d detection(s) with %d; %d left as "
                  "placed by hand, %d left out as removed by hand",

@@ -55,6 +55,9 @@ _STACK_X = 22.0
 _STACK_Y = 26.0
 # Why a candidate lost points for being a room's number.
 _ROOM = "sits under a room name"
+# Learning a page's door-tag mark: how many sure tags to read, and how many
+# must agree before it counts.
+_SHAPE_SAMPLES, _MIN_SHAPE_SAMPLES = 12, 3
 # A dimension string carries feet or inch marks.
 _DIMENSION = re.compile(r"[0-9]\s*['’\"]")
 
@@ -69,6 +72,8 @@ class Candidate:
     y1: float
     score: int = 0
     reasons: list[str] = field(default_factory=list)
+    # The printed size, kept to settle a tie -- see `_break_tie`.
+    size: float = 0.0
 
 
 @dataclass(slots=True)
@@ -102,12 +107,25 @@ def _tag_size(sheet_items: list[TextItem], tags: set[str]) -> float | None:
     Returns None when there is nothing to learn from, in which case no size
     filter is applied -- better several candidates than a filter built on a
     guess.
+
+    A number under a room name is the room's, and does not vote. Victoria's
+    second floor prints its room numbers at 12.5 pt under the room names and
+    its door tags at 9.6 pt; the rooms outnumbered the doors, the sheet
+    learned 12.5, and the filter then threw away every real door tag on it --
+    201, 202 and 203 were placed on MECHANICAL, OFFICES and ELECTRICAL ROOM.
     """
-    matched = [i.size for i in sheet_items if i.text.strip() in tags]
+    printed = [i for i in sheet_items if i.text.strip() in tags]
+    matched = [i.size for i in printed
+               if not _looks_like_a_room_number(i, sheet_items)]
     if len(matched) >= _MIN_SIZE_SAMPLES:
         # The mode, not the median: a handful of tag-shaped impostors at some
         # other size must not drag the answer between the two.
         return Counter(round(s, 1) for s in matched).most_common(1)[0][0]
+    if len(matched) < len(printed):
+        # Too few left once the rooms are out. The fallback below learns from
+        # whatever labels the sheet has -- here the room names, at the rooms'
+        # size -- so it would rebuild the very filter just avoided. No filter.
+        return None
 
     counts = Counter(i.text.strip() for i in sheet_items)
     sizes = [
@@ -122,17 +140,35 @@ def _tag_size(sheet_items: list[TextItem], tags: set[str]) -> float | None:
     return sizes[len(sizes) // 2]
 
 
-def _looks_like_a_room_number(item: TextItem, items: list[TextItem]) -> bool:
+def _is_a_sheet_reference(text: str, sheet_numbers: set[str] | None) -> bool:
+    """A sheet number, as a detail or finish callout prints it: `A-1.52`.
+
+    Written with a dot, or one of this set's own sheets -- so a room called
+    `WC-1` is still a room name.
+    """
+    if not SHEET_NUMBER.match(text):
+        return False
+    return "." in text or bool(sheet_numbers and text in sheet_numbers)
+
+
+def _looks_like_a_room_number(item: TextItem, items: list[TextItem],
+                              sheet_numbers: set[str] | None = None) -> bool:
     """Is this the number under a room name, rather than a door tag?
 
     Room labels are stacked -- the name, then the number directly beneath it,
     in the same column. Nothing else on a plan is laid out that way.
+
+    A sheet reference is not a room name. CHI prints the callout `A-1.52`
+    just above door tag 114, which then read as a room's number, tied with the
+    real room 114 under EXAM-5, and lost to it on page order.
     """
     for other in items:
         if other is item or not other.text.strip():
             continue
         text = other.text.strip()
         if not any(c.isalpha() for c in text) or len(text) < 3:
+            continue
+        if _is_a_sheet_reference(text, sheet_numbers):
             continue
         if (abs(other.cx - item.cx) <= _STACK_X
                 and 0 < item.y0 - other.y0 <= _STACK_Y):
@@ -187,6 +223,48 @@ def _company(item: TextItem, items: list[TextItem], tags: set[str]) -> tuple[int
     return score, reasons
 
 
+def _break_tie(doc: PdfDoc, tied: list[Candidate], tag_size: float | None,
+               usual_shape) -> Candidate | None:
+    """One of several printings that scored the same on a page, or None.
+
+    A score tie used to go to whichever printing came first on the page, and
+    that was the room number as often as the door. Two things the drawing
+    states settle most of them, asked in order and only while they single one
+    printing out:
+
+      size   the size this sheet sets its door tags in. Lightbridge's door 110
+             is 8.5 pt like every other tag; the room 110 under DAYCARE #11 is
+             9.0. The size filter lets both through -- it is a tolerance, not
+             an identity -- so they tied.
+      mark   the shape this sheet draws its door tags in. Grace prints 101A in
+             a circle at the door and again in a diamond by the storefront,
+             the same size; its door tags are circles.
+
+    Where neither singles one out, the tie stands and is reported.
+    """
+    if tag_size is not None:
+        same = [c for c in tied if abs(c.size - tag_size) < 0.05]
+        if len(same) == 1:
+            return same[0]
+        if same:
+            tied = same
+    shape = usual_shape()
+    if shape:
+        same = [c for c in tied if _mark_of(doc, c) == shape]
+        if len(same) == 1:
+            return same[0]
+    return None
+
+
+def _mark_of(doc: PdfDoc, c: Candidate) -> str:
+    """The shape drawn around a candidate, or "" if it cannot be read."""
+    try:
+        return wall_tags.enclosure_shape(doc, c.page, (c.x0 + c.x1) / 2,
+                                         (c.y0 + c.y1) / 2, c.y1 - c.y0)
+    except Exception:  # noqa: BLE001 - a mark we cannot read settles nothing
+        return ""
+
+
 def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
            avoid: dict[int, list[tuple[float, float, float, float]]] | None = None,
            size_filter: bool = True, shape: str = "",
@@ -232,6 +310,9 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
     the room number in the first place.
     """
     per_tag: dict[str, list[Candidate]] = defaultdict(list)
+    # Per page, the size its door tags are set in -- learned whether or not
+    # the size filter is on, because it also settles ties.
+    learned: dict[int, float | None] = {}
 
     for sheet in sheets:
         items = [i for i in doc.text_items(sheet.page - 1) if i.text.strip()]
@@ -253,7 +334,8 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
         # a caller who names the mark and forgets the other flag gets tags
         # rejected on a size that was never reliable, before the test they
         # actually asked for is ever reached.
-        size = _tag_size(items, tags) if (size_filter and not shape) else None
+        learned[sheet.page] = _tag_size(items, tags)
+        size = learned[sheet.page] if (size_filter and not shape) else None
         counts = Counter(i.text.strip() for i in items)
 
         for item in items:
@@ -268,11 +350,12 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
                 continue
 
             candidate = Candidate(sheet.page, sheet.number,
-                                  item.x0, item.y0, item.x1, item.y1)
+                                  item.x0, item.y0, item.x1, item.y1,
+                                  size=item.size)
             if counts[text] == 1:
                 candidate.score += 3
                 candidate.reasons.append("only occurrence on the sheet")
-            if _looks_like_a_room_number(item, items):
+            if _looks_like_a_room_number(item, items, sheet_numbers):
                 candidate.score -= 3
                 candidate.reasons.append(_ROOM)
             if _in_a_reference_bubble(item, items, sheet_numbers):
@@ -282,6 +365,22 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
             candidate.score += bonus
             candidate.reasons.extend(why)
             per_tag[text].append(candidate)
+
+    shapes: dict[int, str] = {}
+
+    def usual_shape(page: int) -> str:
+        """The mark this page draws its door tags in, learned from the numbers
+        printed once on it -- those are door tags beyond doubt. Only worked out
+        for a page that has a tie to settle: reading marks is not free."""
+        if page not in shapes:
+            sure = [c for cands in per_tag.values() for c in cands
+                    if c.page == page and "only occurrence on the sheet" in c.reasons]
+            seen = Counter(_mark_of(doc, c) for c in sure[:_SHAPE_SAMPLES])
+            seen.pop("", None)
+            best = seen.most_common(1)
+            shapes[page] = (best[0][0] if best and best[0][1] >= _MIN_SHAPE_SAMPLES
+                            else "")
+        return shapes[page]
 
     out: list[DoorSighting] = []
     for tag in sorted(tags):
@@ -300,11 +399,17 @@ def locate(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
 
         picked: list[Candidate] = []
         contested = False
-        for page_candidates in by_sheet.values():
+        for page, page_candidates in by_sheet.items():
             ranked = sorted(page_candidates, key=lambda c: -c.score)
-            picked.append(ranked[0])
             if len(ranked) > 1 and ranked[0].score == ranked[1].score:
-                contested = True
+                tied = [c for c in ranked if c.score == ranked[0].score]
+                winner = _break_tie(doc, tied, learned.get(page),
+                                    lambda p=page: usual_shape(p))
+                if winner is None:
+                    contested = True
+                else:
+                    ranked = [winner] + [c for c in ranked if c is not winner]
+            picked.append(ranked[0])
 
         # A tie between sheets goes to the one that is not a room number. On
         # one set the room 117, alone on its sheet, scored level with door 117

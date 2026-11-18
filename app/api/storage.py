@@ -43,7 +43,7 @@ from app.db.client import NoDatabase, client
 from app.ai.client import AiUnavailableError, AiUpstreamError
 from app.pipeline import NoRowsError, NoScheduleFoundError, extract
 from app.plan_pipeline import audit
-from app.schemas import DoorRow
+from app.schemas import DoorRow, UnreadRegion
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["storage"])
@@ -81,6 +81,9 @@ CorrectableField = Literal[
     "from_space", "to_space",
     "door_width", "door_height", "door_type", "door_material", "door_finish",
     "frame_material", "frame_finish",
+    # Columns a schedule may leave out: ESC prints no thickness, and a person
+    # pricing the door needs one.
+    "door_thickness", "frame_type",
     "threshold", "fire_rating", "hw_set", "comments",
     # Read off the plan's wall tags rather than the schedule, and wrong often
     # enough that correcting it is part of the workflow, not an exception.
@@ -373,7 +376,8 @@ def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
                      job_id: str | None = None, *, key: str | None = None,
                      detect: bool = False, budget_usd: float | None = None,
                      pages: list[int] | None = None,
-                     doors: set[str] | None = None) -> None:
+                     doors: set[str] | None = None,
+                     regions: list[dict] | None = None) -> None:
     """Locate the doors on the plans after the request has been answered, and
     record how it went on the plan job.
 
@@ -403,16 +407,36 @@ def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
         try:
             if owned is None:
                 owned = await asyncio.to_thread(files.fetch, key)
+            by_page: dict[int, list[tuple[float, float, float, float]]] = {}
+            for r in regions or []:
+                by_page.setdefault(r["page"], []).append(
+                    (r["x0"], r["y0"], r["x1"], r["y1"]))
             found = await in_worker(audit(owned, rows=rows, detect=detect,
                                           budget_usd=budget_usd,
                                           schedule_page=schedule_page,
-                                          pages=pages, doors=doors))
+                                          pages=pages, doors=doors,
+                                          regions=by_page or None))
             if pages or doors:
-                store.save_reprocess(document_id, found, pages=pages, doors=doors)
+                store.save_reprocess(document_id, found, pages=pages, doors=doors,
+                                     regions=regions)
             else:
                 store.save_audit(document_id, found)
             if job_id:
-                note = review.plans(len(found.located), found.door_count)
+                # The whole set's count is a whole-set question. A pass over
+                # chosen sheets or doors counts only those, and set against
+                # the full schedule read as a failure: Victoria's Read again of
+                # one sheet reported "3 of 40 doors were placed".
+                note = (None if (pages or doors)
+                        else review.plans(len(found.located), found.door_count))
+                if found.unread:
+                    # Said on the job, so the person waiting is told before
+                    # they open a sheet: part of it was not read, and the
+                    # sheet lists which part, to be read on its own.
+                    sheets = sorted({u.sheet or f"page {u.page}" for u in found.unread})
+                    left = (f"Part of {', '.join(sheets)} was not read; doors "
+                            "there may be missing. Read the rest of the sheet "
+                            "to finish it.")
+                    note = f"{note} {left}".strip() if note else left
                 store.finish_job(job_id, "ready", document_id=document_id,
                                  doors=len(found.located), message=note,
                                  needs_review=bool(note))
@@ -714,6 +738,121 @@ async def remove_document(
     log.info("db: deleted document %s (%s)", document_id, doc["filename"])
     return {"document_id": document_id, "deleted": True,
             "filename": doc["filename"], "file_removed": file_removed}
+
+
+def _doors_by_order(schedules: list[dict], doors: list[dict],
+                    schedule_id: str) -> list[dict] | None:
+    """A schedule's doors in a document saved before each door carried its own
+    schedule -- every door then points at the first table.
+
+    The doors were written in the tables' order, page first and the longer
+    table first on a page, each table's rows in a run of `row_count` row
+    numbers. That is only trusted where it adds up exactly and no two tables
+    could be taken for each other; otherwise None, and nothing is guessed."""
+    ordered = sorted(schedules, key=lambda s: (s["page"], -(s.get("row_count") or 0)))
+    keys = [(s["page"], s.get("row_count")) for s in ordered]
+    if len(set(keys)) != len(keys):
+        return None
+    total = sum(s.get("row_count") or 0 for s in ordered)
+    if not doors or total != max(d["row_index"] for d in doors) + 1:
+        return None
+    start = 0
+    for s in ordered:
+        end = start + (s.get("row_count") or 0)
+        if s["id"] == schedule_id:
+            return [d for d in doors if start <= d["row_index"] < end]
+        start = end
+    return None
+
+
+@router.delete("/documents/{document_id}/schedules/{schedule_id}")
+async def remove_schedule(document_id: str, schedule_id: str,
+                          _key: str = Depends(require_api_key)):
+    """Remove a table that was read as a door schedule and is not one.
+
+    Its doors go, and their boxes on the plans. Boxes a person placed are
+    theirs and stay; the response names their doors. The removal is
+    remembered, so reading the set again does not bring the table back --
+    DELETE .../removed-schedules forgets it.
+
+    Safari Kid's window schedule came back as twelve doors, SF 1 to SF 12.
+    Without this they could only be removed one by one, and a re-read put them
+    all back.
+    """
+    db = _db()
+    found = (db.table("schedules").select("*").eq("id", schedule_id)
+             .eq("document_id", document_id).execute().data)
+    if not found:
+        raise HTTPException(status_code=404, detail="No such schedule on this document.")
+    schedule = found[0]
+    schedules = (db.table("schedules").select("*")
+                 .eq("document_id", document_id).execute().data)
+    doors = (db.table("doors").select("id, door_tag, row_index, schedule_id, source")
+             .eq("document_id", document_id).execute().data)
+    from_schedules = [d for d in doors if d.get("source", "schedule") == "schedule"]
+
+    mine = [d for d in from_schedules if d.get("schedule_id") == schedule_id]
+    if len(schedules) > 1 and len({d.get("schedule_id") for d in from_schedules}) <= 1:
+        mine = _doors_by_order(schedules, from_schedules, schedule_id)
+        if mine is None:
+            raise HTTPException(
+                status_code=409,
+                detail="This set was read before its doors were tied to their own "
+                       "schedule, and they cannot be told apart. Read the schedule "
+                       "again, then remove the table.")
+
+    gone_ids = {d["id"] for d in mine}
+    still = {d["door_tag"] for d in doors if d["id"] not in gone_ids and d.get("door_tag")}
+    gone_tags = sorted({d["door_tag"] for d in mine if d.get("door_tag")} - still)
+
+    boxes = 0
+    hand_placed: list[str] = []
+    if gone_tags:
+        for start in range(0, len(gone_tags), 200):
+            chunk = gone_tags[start:start + 200]
+            done = (db.table("detections").delete().eq("document_id", document_id)
+                    .in_("door_tag", chunk).execute())
+            boxes += len(done.data or [])
+        hand_placed = sorted({m["door_tag"] for m in store.manual_detections(document_id)
+                              if m.get("door_tag") in set(gone_tags)})
+    ids = sorted(gone_ids)
+    for start in range(0, len(ids), 200):
+        db.table("doors").delete().in_("id", ids[start:start + 200]).execute()
+    db.table("schedules").delete().eq("id", schedule_id).execute()
+
+    remembered = True
+    try:
+        listed = store.removed_schedules(db, document_id)
+        listed.append({"page": schedule["page"], "title": schedule.get("title") or ""})
+        db.table("documents").update({"removed_schedules": listed}).eq(
+            "id", document_id).execute()
+    except Exception as exc:  # noqa: BLE001 - before db/034 has been run
+        remembered = False
+        log.warning("db: schedule removal not remembered (has db/034 been run?): %s", exc)
+
+    log.info("db: schedule %s removed from %s: %d doors, %d boxes",
+             schedule_id, document_id, len(mine), boxes)
+    return {"document_id": document_id, "schedule_id": schedule_id,
+            "page": schedule["page"], "title": schedule.get("title") or "",
+            "doors_removed": len(mine), "boxes_removed": boxes,
+            "hand_placed_kept": hand_placed,
+            "remembered": remembered}
+
+
+@router.delete("/documents/{document_id}/removed-schedules")
+async def forget_removed_schedules(document_id: str,
+                                   _key: str = Depends(require_api_key)):
+    """Forget every schedule removed from this set, so the next reading of it
+    keeps them all. Nothing comes back until the set is read again."""
+    db = _db()
+    listed = store.removed_schedules(db, document_id)
+    try:
+        db.table("documents").update({"removed_schedules": []}).eq(
+            "id", document_id).execute()
+    except Exception as exc:  # noqa: BLE001 - before db/034 has been run
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Removed schedules are not kept on this server yet.") from exc
+    return {"document_id": document_id, "cleared": len(listed)}
 
 
 @router.delete("/projects/{project_id}")
@@ -1037,6 +1176,7 @@ async def attach_plans(
             "sheets_scanned": len(result.floor_plans),
             "duration_ms": result.duration_ms,
             "stored": saved, "warnings": result.warnings,
+            "unread": [u.model_dump() for u in result.unread],
             "coverage_note": result.coverage_note}
 
 
@@ -1128,6 +1268,7 @@ async def audit_document(
             "sheets_scanned": len(result.floor_plans),
             "duration_ms": result.duration_ms,
             "stored": saved, "warnings": result.warnings,
+            "unread": [u.model_dump() for u in result.unread],
             "coverage_note": result.coverage_note}
 
 
@@ -1149,6 +1290,12 @@ class Reprocess(BaseModel):
         description="Door numbers to look for. Only these are replaced; every "
         "other door stays as it is. With `pages`, they are looked for on "
         "those sheets only.")
+    regions: list[UnreadRegion] = Field(
+        default_factory=list,
+        description="Parts of sheets to read, as a plan pass listed them under "
+        "`unread` -- the rest of a sheet it could not finish. Only these parts "
+        "are read, and only the doors inside them are replaced. Their sheets "
+        "are read even if `pages` does not name them.")
 
 
 @router.post("/documents/{document_id}/reprocess",
@@ -1170,7 +1317,13 @@ async def reprocess_document(
 
     Always a job: answers at once with a plan job id; poll GET /jobs/{job_id}.
     """
-    pages = sorted(set(body.pages))
+    regions = [r for r in body.regions
+               if 0 <= r.x0 < r.x1 <= 1 and 0 <= r.y0 < r.y1 <= 1]
+    if len(regions) != len(body.regions):
+        raise HTTPException(
+            status_code=422,
+            detail="A region is a rectangle inside its page, as fractions from 0 to 1.")
+    pages = sorted(set(body.pages) | {r.page for r in regions})
     doors = list(dict.fromkeys(t.strip() for t in body.doors if t and t.strip()))
     if not pages and not doors:
         raise HTTPException(status_code=422,
@@ -1243,7 +1396,8 @@ async def reprocess_document(
     job_id = _plan_job(found["project_id"], document_id, key)
     _plan_pass_later(document_id, None, rows, schedule_page, job_id, key=key,
                      detect=True, budget_usd=budget_usd,
-                     pages=pages or None, doors=set(doors) or None)
+                     pages=pages or None, doors=set(doors) or None,
+                     regions=[r.model_dump() for r in regions] or None)
     return JSONResponse(status_code=status.HTTP_202_ACCEPTED,
                         content={"job_id": job_id, "status": "reading",
                                  "pages": pages, "doors": doors})
@@ -1337,6 +1491,18 @@ def _as_detection(db, row: dict, *, converted: bool) -> dict:
         "is_primary": True,
         "also_on": [],
         "converted": converted,
+        "arc_kept": bool(row.get("radius")),
+    }
+
+
+def _as_derived(db, row: dict) -> dict:
+    """A detected box in the shape a read returns, for a PATCH that left it a
+    detected box -- page included, as `_as_detection` gives a placed one."""
+    sheet = (db.table("sheets").select("page").eq("id", row["sheet_id"]).execute())
+    return {
+        **row,
+        "page": sheet.data[0]["page"] if sheet.data else None,
+        "converted": False,
         "arc_kept": bool(row.get("radius")),
     }
 
@@ -1446,6 +1612,13 @@ async def place_detection(document_id: str, body: NewDetection,
             "sheet_id": body.sheet_id, "door_created": created_door}
 
 
+# Two page-fraction coordinates closer than this are the same place: about a
+# third of a point on a 36-inch sheet, far under anything a hand can drag.
+_SAME_SPOT = 1e-4
+# Where a door's number is printed, as stored beside the box.
+_TAG_FIELDS = ("tag_x0", "tag_y0", "tag_x1", "tag_y1", "tag_shape")
+
+
 @router.patch("/detections/{detection_id}")
 async def move_detection(detection_id: str, body: MoveDetection,
                          caller: Caller = Depends(require_caller)):
@@ -1457,10 +1630,19 @@ async def move_detection(detection_id: str, body: MoveDetection,
     calls -- delete the wrong one, place a right one -- with the user expected
     to know that a derived box cannot be moved.
 
-    So patching a derived box converts it: a hand-placed box is recorded at the
+    So moving a derived box converts it: a hand-placed box is recorded at the
     new position, the original is remembered as removed so the next audit does
     not put it back, and the derived row goes. One call, and the correction
-    survives every re-read.
+    survives every re-read. Its tag position goes with it -- the box says where
+    the door is, not where its number is printed -- and the new id is stable.
+
+    Only a move, a renumbering or a note converts. A type change (`kind`,
+    `swing`) updates the detected box in place: same id, source, tag position
+    and swing arc, and the type carried onto the same door by the next re-read.
+    Coordinates equal to the box's own, within `_SAME_SPOT`, are no move; a
+    patch that changes nothing returns the box as it is. Converting on every
+    patch is what turned 196 detected boxes into hand-placed ones that had not
+    moved, each losing its tag position.
 
     A measured box can be moved too. The arc it came from stays on the drawing
     and is not edited -- what moves is our claim about where the door is, which
@@ -1481,13 +1663,44 @@ async def move_detection(detection_id: str, body: MoveDetection,
                 .eq("id", detection_id).execute())
         return _as_detection(db, done.data[0], converted=False)
 
-    # Not a hand-placed box, so it is one we derived. Replace it.
+    # Not a hand-placed box, so it is one we derived.
     found = (db.table("detections").select("*")
              .eq("id", detection_id).execute())
     if not found.data:
         raise HTTPException(status_code=404, detail="No such detection.")
     det = found.data[0]
 
+    # Coordinates the same as the box's own are no move: page fractions
+    # come back from a browser rounded, so compared within a tolerance.
+    moved = any(k in patch and abs(patch[k] - (det.get(k) or 0.0)) > _SAME_SPOT
+                for k in ("x0", "y0", "x1", "y1"))
+    if not moved:
+        for k in ("x0", "y0", "x1", "y1"):
+            patch.pop(k, None)
+
+    if not moved and not patch:
+        # Nothing changed. Converting here is what turned 196 detected boxes
+        # into hand-placed ones that had not moved at all.
+        return _as_derived(db, det)
+
+    if not moved and set(patch) <= {"kind", "swing"}:
+        # A type change. It says what the door is, not where -- so the box,
+        # its id, its source, its tag position and its swing arc all stay.
+        # The flag carries the type across the next re-read, which rebuilds
+        # every detection: that, and only that, is what converting the box
+        # used to protect.
+        change = {**patch, "kind_by_hand": True}
+        try:
+            done = (db.table("detections").update(change)
+                    .eq("id", detection_id).execute())
+        except Exception as exc:  # noqa: BLE001 - before db/032 has been run
+            log.warning("db: kind_by_hand not stored (has db/032 been run?): %s", exc)
+            done = (db.table("detections").update(patch)
+                    .eq("id", detection_id).execute())
+        log.info("db: detection %s retyped in place", detection_id)
+        return _as_derived(db, done.data[0])
+
+    # A real move, a renumbering or a note: the box becomes a person's.
     sheet = (db.table("sheets").select("page")
              .eq("id", det["sheet_id"]).execute())
     page = sheet.data[0]["page"] if sheet.data else 0
@@ -1529,8 +1742,22 @@ async def move_detection(detection_id: str, body: MoveDetection,
             "radius": det["radius"], "start_deg": det.get("start_deg"),
             "end_deg": det.get("end_deg"), "from_measured": True,
         })
+    # Where the number is printed is not where the door is. Moving the box
+    # corrects the second and says nothing of the first, so the tag position
+    # goes with it -- unless the door was renumbered, when the printed number
+    # beside it is some other door's.
+    renumbered = patch.get("door_tag") not in (None, det.get("door_tag"))
+    tag = {} if renumbered else {k: det.get(k) for k in _TAG_FIELDS
+                                 if det.get(k) is not None}
     _ensure_door(db, det["org_id"], det["document_id"], row.get("door_tag"))
-    made = db.table("manual_detections").insert(row).execute()
+    try:
+        made = db.table("manual_detections").insert({**row, **tag}).execute()
+    except Exception as exc:  # noqa: BLE001 - before db/032 has been run
+        if not tag:
+            raise
+        log.warning("db: tag position not kept on the moved box "
+                    "(has db/032 been run?): %s", exc)
+        made = db.table("manual_detections").insert(row).execute()
     db.table("detections").delete().eq("id", detection_id).execute()
 
     log.info("db: detection %s moved by hand and recorded as replaced",

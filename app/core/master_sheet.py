@@ -62,6 +62,9 @@ _FROM_EXTRA: dict[str, tuple[str, ...]] = {
     "DOOR GUAGE": ("door_gauge",),
 }
 
+# Master-sheet columns that now have a field of their own.
+_OWN_FIELD = {"THICKNESS": "door_thickness", "FRAME ELEVATION TYPE": "frame_type"}
+
 _EXTERIOR = re.compile(r"\bEXT(ERIOR)?\b", re.I)
 # "2*3' - 0"" or "2 x 3'-0"" means a pair.
 _LEAF_COUNT = re.compile(r"^\s*(\d+)\s*[*x]\s*\d", re.I)
@@ -122,7 +125,10 @@ def master_row(row: DoorRow) -> dict[str, str]:
             out[column] = data[field]
 
     for column, keys in _FROM_EXTRA.items():
-        value = _first_extra(row, keys)
+        # Its own field first, where the schedule's heading was understood;
+        # the extra keys for rows read before it had one.
+        own = _OWN_FIELD.get(column)
+        value = (data.get(own) if own else "") or _first_extra(row, keys)
         if value:
             out[column] = value
 

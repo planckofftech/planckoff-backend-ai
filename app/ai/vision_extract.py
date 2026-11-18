@@ -49,6 +49,14 @@ _PRINTED_SHARE = 0.5
 _MODEL_SLACK = 0.10
 # Slack added around a located table, as a fraction of its own size.
 _BOX_PAD = 0.02
+# Reading a table again from a crop of the sheet (see `_read_closer`): how far
+# past the model's box to cut, as a fraction of the page -- its boxes are
+# rough, and one drawn tight cut off the heading rows -- how much more above
+# for the headings, the resolution, and the largest table worth cropping to.
+_CROP_PAD = 0.04
+_CROP_HEAD = 0.04
+_CROP_DPI = 200
+_CROP_MAX_AREA = 0.6
 
 # Ask for the sheet's OWN columns, not our field names. Forcing a fixed schema
 # made the model displace real values: on a sheet with THK / LOCK FUNCTION /
@@ -211,8 +219,11 @@ def _unconfirmed(items, rows: list[DoorRow]) -> list[str]:
     return warnings
 
 
-def _render_within_limit(doc: PdfDoc, page: int, dpi: int) -> bytes:
-    """The page as a PNG the provider will accept.
+def _render_within_limit(doc: PdfDoc, page: int, dpi: int,
+                         clip: tuple[float, float, float, float] | None = None
+                         ) -> bytes:
+    """The page -- or `clip` of it, in page points as displayed -- as a PNG
+    the provider will accept.
 
     A large sheet at full resolution is too big to send: one 69-sheet site set
     rendered past the 30 MB the provider takes, and the whole read failed on
@@ -221,7 +232,8 @@ def _render_within_limit(doc: PdfDoc, page: int, dpi: int) -> bytes:
     """
     png = b""
     for attempt in (dpi, *(d for d in _FALLBACK_DPI if d < dpi)):
-        png = doc.render_png(page - 1, dpi=attempt)
+        png = (doc.render_png(page - 1, dpi=attempt, clip=clip) if clip
+               else doc.render_png(page - 1, dpi=attempt))
         if len(png) <= _MAX_IMAGE_BYTES:
             if attempt != dpi:
                 log.info("ai_vision page=%s rendered at %s dpi to fit", page, attempt)
@@ -276,35 +288,9 @@ def _upstream_reason(exc: Exception) -> str:
     return f"{hint} [{exc}]" if hint else str(exc)
 
 
-@dataclass(slots=True)
-class VisionTable:
-    """One door schedule read off a sheet image."""
-    title: str
-    headers: list[str]
-    rows: list[DoorRow]
-    box: TableBox | None
-    warnings: list[str] = field(default_factory=list)
-
-
-async def read_tables(doc: PdfDoc, page: int) -> list[VisionTable]:
-    """Render one page and ask the model for every door schedule on it.
-
-    Each table comes back with its own rows and its own box, so a sheet with
-    three schedules is three tables, each outlined where it sits -- not one
-    table in one box around all three.
-    """
-    settings = get_settings()
-    try:
-        client = get_client()
-    except AiUnavailableError as exc:
-        log.info("vision read skipped: %s", exc)
-        return []
-
-    png = _render_within_limit(doc, page, settings.ai_render_dpi)
+async def _ask(client, settings, png: bytes) -> list:
+    """One image to the model, its tables parsed -- [] if it gave none."""
     data_url = "data:image/png;base64," + base64.b64encode(png).decode()
-    log.info("ai_vision page=%s dpi=%s png_kb=%.0f",
-             page, settings.ai_render_dpi, len(png) / 1024)
-
     # The provider intermittently answers 200 with an empty completion -- zero
     # tokens, no content. That is not an HTTP error, so the SDK's own retries
     # never see it, and one bad draw was turning a readable sheet into "no door
@@ -343,6 +329,96 @@ async def read_tables(doc: PdfDoc, page: int) -> list[VisionTable]:
             break
         if attempt <= _EMPTY_RETRIES:
             log.warning("ai_vision returned nothing usable, retrying (%s)", attempt)
+    return parsed
+
+
+def _crop_of(box: tuple[float, float, float, float]
+             ) -> tuple[float, float, float, float] | None:
+    """The part of the page to read a table from: its box, widened -- more
+    above, where the headings are -- as fractions of the page. None for a box
+    that already covers most of the sheet, where a crop gains nothing."""
+    x0, y0, x1, y1 = box
+    if (x1 - x0) * (y1 - y0) > _CROP_MAX_AREA:
+        return None
+    return (max(0.0, x0 - _CROP_PAD), max(0.0, y0 - _CROP_PAD - _CROP_HEAD),
+            min(1.0, x1 + _CROP_PAD), min(1.0, y1 + _CROP_PAD))
+
+
+async def _read_closer(doc: PdfDoc, page: int, client, settings,
+                       parsed: list) -> list:
+    """Each table read again from a crop of the page around it.
+
+    The whole sheet is one image, and the provider shrinks an image before
+    the model sees it: a 42 x 30 inch sheet sent at 200 dpi came back as
+    about 650 prompt tokens, one tile's worth. A schedule that is a fifth of
+    the sheet is then a few pixels a letter. Christian Brothers' DR. # was
+    read as DR. TYP., the type column's heading, and the two collided: all ten
+    door numbers were lost. DISD's 56-row table came back with its columns
+    shifted one place, door numbers under ROOM NO. and leaf counts under DOOR
+    NO. Read from a crop of the table alone, both came back as printed.
+
+    The first reading stays where the crop does no better: where the model
+    gave no box, where the box is most of the sheet, and where the crop's
+    reading holds fewer door rows than the first.
+    """
+    width, height = doc.page_size(page - 1)
+    out = []
+    for table in parsed:
+        title, headers, raw_rows, box, warnings = table
+        crop = _crop_of(box) if box else None
+        if crop is None:
+            out.append(table)
+            continue
+        cx0, cy0, cx1, cy1 = crop
+        png = _render_within_limit(
+            doc, page, _CROP_DPI,
+            clip=(cx0 * width, cy0 * height, cx1 * width, cy1 * height))
+        log.info("ai_vision page=%s reading a table again from a crop "
+                 "(%.0f%% of the sheet)", page, 100 * (cx1 - cx0) * (cy1 - cy0))
+        closer = await _ask(client, settings, png)
+        best = max(closer, key=lambda t: len(t[2]), default=None)
+        if best is None or len(best[2]) < len(raw_rows):
+            out.append(table)
+            continue
+        b_title, b_headers, b_rows, b_box, b_warnings = best
+        # The crop's own box is a fraction of the crop; the page's is wanted.
+        if b_box:
+            bx0, by0, bx1, by1 = b_box
+            b_box = (cx0 + bx0 * (cx1 - cx0), cy0 + by0 * (cy1 - cy0),
+                     cx0 + bx1 * (cx1 - cx0), cy0 + by1 * (cy1 - cy0))
+        out.append((b_title or title, b_headers, b_rows, b_box or box, b_warnings))
+    return out
+
+
+@dataclass(slots=True)
+class VisionTable:
+    """One door schedule read off a sheet image."""
+    title: str
+    headers: list[str]
+    rows: list[DoorRow]
+    box: TableBox | None
+    warnings: list[str] = field(default_factory=list)
+
+
+async def read_tables(doc: PdfDoc, page: int) -> list[VisionTable]:
+    """Render one page and ask the model for every door schedule on it.
+
+    Each table comes back with its own rows and its own box, so a sheet with
+    three schedules is three tables, each outlined where it sits -- not one
+    table in one box around all three.
+    """
+    settings = get_settings()
+    try:
+        client = get_client()
+    except AiUnavailableError as exc:
+        log.info("vision read skipped: %s", exc)
+        return []
+
+    png = _render_within_limit(doc, page, settings.ai_render_dpi)
+    log.info("ai_vision page=%s dpi=%s png_kb=%.0f",
+             page, settings.ai_render_dpi, len(png) / 1024)
+    parsed = await _ask(client, settings, png)
+    parsed = await _read_closer(doc, page, client, settings, parsed)
 
     # On a page whose door numbers are printed as text, what the model read
     # can be checked against what is printed. Asked for every schedule on one
@@ -444,6 +520,11 @@ async def rows_from_table(headers: list[str], raw_rows: list[list[str]]
     if mapped != before:
         claimed = headers[mapped.index("door_tag")]
         unmapped = [h for h in unmapped if h != claimed]
+    # The same check of headings against values the text read makes. Without
+    # it a SIZE column holding 3'-0" X 7'-0" -- Kraus prints width and height
+    # together -- left every door's width and height empty when read off an
+    # image, and full when read as text.
+    mapped, size_col = header_mapper.settle_with_values(mapped, headers, columns)
 
     rows: list[DoorRow] = []
     for cells in raw_rows:
@@ -460,6 +541,11 @@ async def rows_from_table(headers: list[str], raw_rows: list[list[str]]
                 values[field] = text
             else:
                 extra[header_mapper.extra_key(headers[idx], idx)] = text
+        if size_col is not None and size_col < len(cells):
+            pair = header_mapper.size_pair(str(cells[size_col] or ""))
+            for field, part in zip(("door_width", "door_height"), pair or ()):
+                if not values.get(field):
+                    values[field] = part
         if values or extra:
             rows.append(DoorRow(**values, extra=extra))
 

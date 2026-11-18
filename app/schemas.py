@@ -20,8 +20,10 @@ CANONICAL_FIELDS = (
     "door_width",
     "door_height",
     "door_type",
+    "door_thickness",
     "door_material",
     "door_finish",
+    "frame_type",
     "frame_material",
     "frame_finish",
     "threshold",
@@ -38,8 +40,13 @@ class DoorRow(BaseModel):
     door_width: str = ""
     door_height: str = ""
     door_type: str = ""
+    door_thickness: str = Field(
+        "", description="As printed -- 1 3/4\". DOOR THICKNESS, THK, SIZE THK.")
     door_material: str = ""
     door_finish: str = ""
+    frame_type: str = Field(
+        "", description="The frame's elevation or type as printed -- A, F1, "
+        "HM-1. FRAME TYPE, FRAME ELEVATION, RAIL/FRAME TYPE.")
     frame_material: str = ""
     frame_finish: str = ""
     threshold: str = ""
@@ -377,6 +384,23 @@ class DetectedDoorOut(BaseModel):
     )
 
 
+class UnreadRegion(BaseModel):
+    """Part of a sheet the vision pass was asked to read and did not.
+
+    Recorded rather than warned about, because a warning cannot be acted on:
+    send it back as one of `regions` in POST /documents/{id}/reprocess and only
+    that part is read, and only the doors found inside it are replaced.
+    """
+
+    page: int
+    sheet: str = ""
+    x0: float = Field(description="Left edge, as a fraction of the page width")
+    y0: float = Field(description="Top edge, as a fraction of the page height")
+    x1: float = Field(description="Right edge, as a fraction of the page width")
+    y1: float = Field(description="Bottom edge, as a fraction of the page height")
+    reason: str = Field("", description="Why it was not read, in plain words")
+
+
 class ScanCost(BaseModel):
     """What the detection pass spent, reported per run rather than discovered
     on an invoice."""
@@ -420,6 +444,12 @@ class PlanAudit(BaseModel):
     )
     scan_cost: ScanCost | None = Field(
         None, description="What the detection pass spent, if it ran"
+    )
+    unread: list[UnreadRegion] = Field(
+        default_factory=list,
+        description="Parts of the sheets the vision pass was asked to read and "
+        "did not. Empty when everything asked for was read. Each can be sent "
+        "back to /reprocess as a region to read just that part.",
     )
 
 

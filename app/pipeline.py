@@ -8,6 +8,7 @@ all-tiers-failed state is an error.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,7 @@ from pathlib import Path
 from app.ai import spend
 from app.ai.client import AiUnavailableError, AiUpstreamError
 from app.config import get_settings
-from app.core import header_mapper, page_finder, schedule_judge
+from app.core import extractor, header_mapper, page_finder, schedule_judge
 from app.core.extractor import (PageExtraction, extract_page, extract_pages,
                                 is_other_schedule)
 from app.core.pdf_doc import PdfDoc
@@ -256,7 +257,13 @@ def _index_door_pages(doc: PdfDoc) -> tuple[dict[int, str], list[str]]:
 
         # Reading every page's title block is slow and is what the cover
         # index saves; the bookmarks cost nothing and are read either way.
-        sheets = (plan_index.from_bookmarks(doc) if entries
+        #
+        # Saved only where the index pointed somewhere. One that names no door
+        # or schedules sheet at all may not be the index: on Cachet it was the
+        # room finish schedule -- rooms A101 ENTRY to A139, numbered like
+        # sheets -- and trusting it skipped the title blocks, where A0.14
+        # SCHEDULES, a scan holding the only door schedule, was named.
+        sheets = (plan_index.from_bookmarks(doc) if entries and wanted
                   else plan_index.index_sheets(doc))
         for page, level in schedule_judge.door_sheet_pages(sheets).items():
             if pages.get(page) != schedule_judge.NAMED:
@@ -417,6 +424,7 @@ def _ai_result(tables: list[ScheduleTable], pages_scanned: int, started: float,
     schedule table" -- the door sheet is filled from the tables.
     """
     tables = _drop_attached(tables, warnings)
+    _one_row_per_door(tables, warnings)
     rows = [r for t in tables for r in t.rows]
     widest = max(tables, key=lambda t: t.row_count)
     duration = int((time.perf_counter() - started) * 1000)
@@ -574,6 +582,21 @@ def _drop_attached(tables: list[ScheduleTable], warnings: list[str]) -> list[Sch
     return [t for t in tables if all(t is not d for d in dropped)]
 
 
+def _one_row_per_door(tables: list[ScheduleTable], warnings: list[str]) -> None:
+    """Split every row that lists several doors -- see extractor.listed_tags.
+    In place, keeping each table's count true to its rows."""
+    for table in tables:
+        rows, split = extractor.one_row_per_door(table.rows)
+        if not split:
+            continue
+        table.rows, table.row_count = rows, len(rows)
+        warnings.append(
+            f"{len(split)} row(s) of {table.title or 'the door schedule'} "
+            f"(page {table.page}) list several doors -- "
+            + "; ".join(split)
+            + " -- and each door is listed on its own with that row's details.")
+
+
 def _levels_from_titles(tables: list[ScheduleTable]) -> None:
     """Name each table's doors by what its caption says and the others do not.
 
@@ -599,7 +622,10 @@ def _levels_from_titles(tables: list[ScheduleTable]) -> None:
     titled = [t for t in tables if t.title.strip()]
     if len(titled) < 2:
         return
-    titles = [t.title.strip() for t in titled]
+    # Spacing is not a difference: Safari heads its two schedules "DOOR
+    # SCHEDULE" and "DOOR  SCHEDULE", and the second space made "SCHEDULE"
+    # the level of every door in the first.
+    titles = [re.sub(r"\s+", " ", t.title.strip()) for t in titled]
     if len(set(titles)) < 2:
         return
     shared = 0
@@ -633,7 +659,7 @@ def _levels_from_titles(tables: list[ScheduleTable]) -> None:
         cut = max(opening[:shared - 1].rfind(c) for c in " _-:")
         shared = cut + 1 if cut >= 0 else 0
 
-    names = [t.title.strip()[shared:].strip(" _-:") for t in titled]
+    names = [t[shared:].strip(" _-:") for t in titles]
     # A caption with nothing left once the shared opening is removed is the
     # same schedule carried on, not a part of the building: one set heads its
     # pages "DOOR SCHEDULE" and "DOOR SCHEDULE CONTINUE.", which would divide
@@ -812,6 +838,7 @@ async def _extract(source: bytes | str | Path, *, allow_ai: bool = True,
                     tables += await _fallback_read(
                         doc, unread_sheets, warnings, door_pages) or []
             tables = _drop_attached(tables, warnings)
+            _one_row_per_door(tables, warnings)
             _levels_from_titles(tables)
             # Every door on the sheet, not the biggest table's doors.
             #

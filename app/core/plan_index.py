@@ -184,7 +184,10 @@ _SHARES_THE_SHEET = ("CEILING", "RCP")
 # "A.121 Floor Plan and Reflected Ceiling Plan" came back as
 # "DRAWING NUMBER: A.121 Plans 01 Scole: 1/4"=1'0"".
 _NOT_A_TITLE = ("KEYNOTE", "LEGEND", "SYMBOLS", "GENERAL NOTES", "NOTES:",
-                "DRAWING NUMBER", "DRAWING NO", "SCALE", "SCOLE")
+                "DRAWING NUMBER", "DRAWING NO", "SCALE", "SCOLE",
+                # A title block's own labels. Kraus prints "Sheet Name" as text
+                # beside a title that is part of the picture.
+                "SHEET NAME", "SHEET TITLE", "SHEET NO", "JOB NO")
 # Below this many usable outline entries the outline is a cover-page list, not
 # a per-sheet index, and reading the pages is the honest fallback.
 _MIN_BOOKMARKS = 5
@@ -444,6 +447,20 @@ def _largest_spans(doc: PdfDoc, page: int) -> list[str]:
     return out
 
 
+# Below this many text spans, a page that carries a picture is a scan with a
+# title block's worth of text on it -- the same line the audit draws for a
+# page too bare to read.
+_THIN_TEXT = 60
+
+
+def _thin_scan(doc: PdfDoc, page: int) -> bool:
+    try:
+        return (doc.span_count(page - 1) < _THIN_TEXT
+                and doc.has_raster(page - 1))
+    except Exception:  # noqa: BLE001 - a page we cannot judge is read as text
+        return False
+
+
 def sheet_of(doc: PdfDoc, page: int) -> PlanSheet:
     """The sheet number and title of one page.
 
@@ -452,15 +469,30 @@ def sheet_of(doc: PdfDoc, page: int) -> PlanSheet:
     """
     spans = _largest_spans(doc, page)
     number = next((s for s in spans if SHEET_NUMBER.match(s)), "")
+    if not number and _thin_scan(doc, page):
+        # A scan laid over a title-block template: the template's labels are
+        # text -- "Sheet Name", "Sheet No.", "Job No." -- and everything they
+        # label is in the picture. Kraus's door schedule sheet is A3.00 FINISH
+        # PLAN / SCHEDULES, and was read as a sheet with no number titled
+        # "Sheet Name", so nothing pointed at it and the model was shown two
+        # detail sheets instead.
+        # Word by word: read off an image, the number arrives on one line with
+        # whatever stands beside it -- "A3.00 2025-05", the job number.
+        read = _ocr_title_block(doc, page)[:_TITLE_SPANS]
+        found = next((w for s in read for w in s.split() if SHEET_NUMBER.match(w)), "")
+        if found:
+            spans, number = read, found
     # A block of notes about the plan is not the plan. On a set with no
     # bookmarks the title is whatever is set largest, and one sheet prints
     # "CONSTRUCTION PLAN KEYNOTES" at 25 pt in the corner while the drawing's
     # own caption, "CONSTRUCTION PLAN", sits under the plan at 19 pt. Taking
     # the bigger one called a floor plan a keynote list, and the sheet holding
     # every door in the project was never looked at.
+    # Whole words: Kraus's engineer is in PLANO, Texas, and the block naming
+    # them was taken for the title of its door schedule sheet.
     title = next(
         (s for s in spans
-         if (any(word in s.upper() for word in _PLAN_WORDS)
+         if (any(_says(s.upper(), word) for word in _PLAN_WORDS)
              or "SCHEDULE" in s.upper())
          and not any(word in s.upper() for word in _NOT_A_TITLE)),
         "",
@@ -468,16 +500,22 @@ def sheet_of(doc: PdfDoc, page: int) -> PlanSheet:
     if not title:
         # Not every sheet is a plan or a schedule. Take the largest span that is
         # not the sheet number itself, so a details sheet still gets a name.
-        title = next((s for s in spans if s != number and len(s) > 4), "")
+        title = next((s for s in spans if s != number and len(s) > 4
+                      and not any(word in s.upper() for word in _NOT_A_TITLE)), "")
     return PlanSheet(page=page, number=number, title=title)
 
 
 # A bookmark reads "A2.10 - LEVEL 1 PLAN OVERALL", sometimes with a sequence
 # number in front: "067 A-610 - DOOR SCHEDULE".
+#
+# Or with nothing but a space: Safari Kid's outline is "A104 REFERENCE PLAN",
+# "A105 DIMENSION PLAN". Requiring a dash rejected every entry, the title
+# blocks were read instead, and they name only the project -- all 68 sheets
+# came back "SAFARI KID", so the two plans could not be told apart.
 _BOOKMARK = re.compile(
     r"^(?:\d+\s+)?"
     r"(?P<number>[A-Z]{1,3}[-.]?\d{1,3}(?:[.\-]\d{1,3})?[A-Za-z]?)"
-    r"\s*[-–—:]\s*(?P<title>.+)$",
+    r"(?:\s*[-–—:]\s*|\s+)(?P<title>.+)$",
     re.IGNORECASE,
 )
 
@@ -630,7 +668,11 @@ def door_plans(doc: PdfDoc, sheets: list[PlanSheet], tags: set[str],
             continue
         found.append((sheet, {i.text.strip() for i in items}))
 
-    found.sort(key=lambda f: -len(f[1]))
+    # Most doors first. On a tie a reference plan goes last: Safari Kid draws
+    # all 41 doors on both A104 REFERENCE PLAN and A105 DIMENSION PLAN, the
+    # lower page used to win, and the doors belong on the dimension plan. Only
+    # a tie -- a reference plan carrying doors no other sheet has still leads.
+    found.sort(key=lambda f: (-len(f[1]), _says(f[0].title.upper(), "REFERENCE")))
     floor = max(_MIN_NEW_DOORS, int(len(tags) * _NEW_DOOR_SHARE))
     # New within its own phase. A renovation draws the same floor once per
     # phase, so phase III repeats door numbers phases I and II already showed
@@ -694,11 +736,27 @@ _OTHER_PROJECTION = ("ELEVATION", "SECTION", "DETAIL")
 # The ceiling, which repeats every door number for its lights and is never
 # where a door is drawn -- unless it shares the sheet with the floor plan.
 _CEILING = ("REFLECTED CEILING", "CEILING PLAN", "RCP")
+# A map of the set, not a drawing to count from. CHI's A-1.20 "FLOOR AND RCP
+# INDEX" draws the whole floor with its room names and room numbers -- 112,
+# 115 -- and no door tags at all, so every number matched there was a room.
+# It outranked the phase plans that carry the real tags and took 112 and 115
+# off A-1.22.
+_INDEX = ("INDEX", "KEY PLAN")
 
 
 def _not_a_plan(title: str) -> bool:
     """Does the title plainly name a drawing that is not a floor plan?"""
     title = (title or "").upper()
+    if any(_says(title, word) for word in _INDEX):
+        return True
+    # The floor redrawn for another trade. It prints the same door numbers as
+    # the floor plan, so it competes with it for every door and wins some: on
+    # CHI, once the index sheet was out, A-1.38 EQUIPMENT PLAN took 101, 108,
+    # 112, 115 and 130A off the phase plan the tester placed them on. The
+    # title rule has always said this; the door-number pass did not ask it.
+    if _SAYS_PLAN.search(title) and not _is_the_floor(title) \
+            and any(_says(title, word) for word in _ANOTHER_SUBJECT):
+        return True
     if any(_says(title, word) for word in _OTHER_PROJECTION) \
             and not _SAYS_PLAN.search(title):
         return True

@@ -16,6 +16,12 @@ from app.schemas import CANONICAL_FIELDS
 HEADER_ALIASES: list[tuple[str, list[str]]] = [
     ("frame_material", ["FRAME MATERIAL", "FRAME MATL", "FRM MATERIAL", "FRAME MAT"]),
     ("frame_finish", ["FRAME FINISH", "FRM FINISH", "FRAME FIN"]),
+    # Before door_type, whose bare TYPE would take "FRAME TYPE" otherwise. The
+    # frame's elevation is its type: AT&T heads it FRAME ELEVATION beside a
+    # DOOR ELEVATION that holds the door's. "FR TYPE" is here, exactly, because
+    # FR alone meant fire rating and once took a frame type for it.
+    ("frame_type", ["FRAME TYPE", "FRAME ELEVATION", "FRAME ELEV", "FRM TYPE",
+                    "FR TYPE", "FRAME TYP"]),
     # NUMBER is as common as NO. and was missing: two real schedules headed
     # their door column that way, and both fell through to guessing the tag
     # from the data. On one of them the guess failed and every row came back
@@ -38,25 +44,33 @@ HEADER_ALIASES: list[tuple[str, list[str]]] = [
     # the door's own number.
     ("from_space", ["FROM", "FROM ROOM", "FROM SPACE",
                     "DOOR LOCATION", "LOCATION", "ROOM NAME", "ROOM",
-                    "SPACE"]),
+                    "SPACE", "RM NAME", "RM"]),
     ("to_space", ["TO", "TO ROOM", "TO SPACE"]),
     # "PANEL WIDTH" first: sheets that group columns under DOOR and FRAME print
     # a bare "WIDTH" under FRAME, and matching that would report the frame's
     # width as the door's.
     ("door_width", ["PANEL WIDTH", "LEAF WIDTH", "DOOR WIDTH", "WIDTH", "W", "WD"]),
     ("door_height", ["PANEL HEIGHT", "LEAF HEIGHT", "DOOR HEIGHT", "HEIGHT", "HT", "H"]),
-    ("door_type", ["PANEL TYPE", "LEAF TYPE", "DOOR TYPE", "DR TYPE", "TYPE"]),
+    # A door's elevation is its type: the letter of the elevation drawing it is
+    # built to -- F, F2, AL2. AT&T and The Cannon head it ELEVATION.
+    ("door_type", ["PANEL TYPE", "LEAF TYPE", "DOOR TYPE", "DR TYPE", "TYPE",
+                   "DOOR ELEVATION", "DOOR ELEV", "DR ELEV", "ELEVATION", "ELEV"]),
+    ("door_thickness", ["DOOR THICKNESS", "DOOR THK", "PANEL THICKNESS",
+                        "LEAF THICKNESS", "THICKNESS", "THK", "DR THK"]),
     # PANEL / LEAF qualify the door leaf, exactly as FRAME qualifies the frame.
+    # MAT alone is a material: Victoria prints MAT for the door and again for
+    # the frame, and the repeat goes to the frame (see _DOOR_TO_FRAME).
     ("door_material", ["PANEL MATERIAL", "PANEL MATL", "PANEL MAT L",
                        "LEAF MATERIAL", "DOOR MATERIAL", "DR MATERIAL",
-                       "MATERIAL", "MATL", "MAT L"]),
+                       "MATERIAL", "MATL", "MAT L", "DOOR MAT", "DR MAT", "MAT"]),
     ("door_finish", ["FINISH", "DOOR FINISH", "FIN"]),
     ("threshold", ["THRESHOLD", "THRESH"]),
     ("fire_rating", ["F.R", "F_R", "FR", "RATING", "FIRE RATING", "LABEL",
                      "FIRE RTG"]),
     ("hw_set", ["HW", "HDW", "HDWE", "HW SET", "HARDWARE", "HARDWARE SET",
                 "HARDWARE GROUP", "HDW SET", "HDWE SET", "HW GROUP"]),
-    ("comments", ["COMMENTS", "REMARKS", "NOTES", "COMMENT"]),
+    # NOTE for "NOTE/REMARKS" (The Cannon), which only the prefix pass sees.
+    ("comments", ["COMMENTS", "REMARKS", "NOTES", "COMMENT", "NOTE"]),
 ]
 
 # Periods are dropped, not kept: sheets abbreviate with them -- DR. TYPE, NO.,
@@ -87,8 +101,15 @@ _SAFE_MID_HEADING = frozenset({
     # as "l ROOM", another's as "DOOR LOCATION FIRST FLOOR".
     "LOCATION", "ROOM",
 })
-# Which door field a repeated heading hands over to the frame.
-_DOOR_TO_FRAME = {"door_material": "frame_material", "door_finish": "frame_finish"}
+# Fields that hold a room's name, never its number -- and how a heading says
+# it holds a number: ROOM NO., ROOM NUMBER, ROOM #.
+_NAMES_NOT_NUMBERS = frozenset({"from_space", "to_space"})
+_NUMBERED = re.compile(r"\b(?:NO|NUMBER|NUM)$|#$")
+# Which door field a repeated heading hands over to the frame. TYPE too: CHI
+# prints TYPE / MATL for the door and again for the frame, and the frame's type
+# sat in extra once the frame had a field for it.
+_DOOR_TO_FRAME = {"door_material": "frame_material", "door_finish": "frame_finish",
+                  "door_type": "frame_type"}
 _MAX_TAG_LEN = 10
 _MIN_TAG_ROWS = 3
 _MIN_TAG_UNIQUENESS = 0.9
@@ -97,6 +118,29 @@ _MIN_TAG_UNIQUENESS = 0.9
 def normalize(header: str) -> str:
     text = _PUNCT.sub(" ", header.upper())
     return re.sub(r"\s+", " ", text).strip()
+
+
+# Words a stacked heading puts over a group of columns that say nothing about
+# any one of them: ESC's DOOR DESIGN / FRAME DESIGN, DISD's DOOR INFORMATION.
+# "DOOR DESIGN MATERIAL" is the door's material; with the band in the way no
+# alias matched it, and six of ESC's thirteen columns went to extra.
+_GROUP_WORDS = frozenset({"DESIGN", "INFORMATION", "INFO", "DATA"})
+# Words that make a thickness something other than the door's.
+_NOT_THE_DOORS = ("FRAME", "WALL", "JAMB", "GLASS", "GLAZING", "LITE")
+
+
+def without_group(text: str) -> str:
+    """A normalized heading without its group words, and without the word
+    the group repeated: "DOOR DESIGN DOOR TYPE" -> "DOOR TYPE"."""
+    words = [w for w in text.split() if w not in _GROUP_WORDS]
+    out = [w for i, w in enumerate(words) if i == 0 or w != words[i - 1]]
+    return " ".join(out)
+
+
+def squeezed(text: str) -> str:
+    """No spaces at all: a PDF that sets its heading letter by letter arrives
+    as "FRAME ELEV ATIO N", which is FRAME ELEVATION with the gaps in it."""
+    return text.replace(" ", "")
 
 
 # Aliases go through the same normalizer as the headers they are matched
@@ -119,6 +163,8 @@ def map_headers(headers: list[str],
     every firm names columns differently, and no fixed list survives that.
     """
     normalized = [normalize(h) for h in headers]
+    # Each heading as printed and without its group band -- see without_group.
+    plain = [without_group(t) for t in normalized]
     mapped: list[str | None] = [None] * len(headers)
     claimed: set[str] = set()
 
@@ -150,16 +196,28 @@ def map_headers(headers: list[str],
             for idx, text in enumerate(normalized):
                 if mapped[idx] is not None or not text:
                     continue
-                if mode == "exact":
-                    hit = text in aliases
+                bare = plain[idx]
+                if field == "door_thickness" and any(
+                        _says_word(text, w) for w in _NOT_THE_DOORS):
+                    # A wall's or a lite's thickness is not the door's.
+                    hit = False
+                elif field in _NAMES_NOT_NUMBERS and _NUMBERED.search(text):
+                    # "DOOR LOCATION INFORMATION ROOM NO." starts like a
+                    # location and holds the room's number. DISD prints the
+                    # room name beside it, which is the location -- and which
+                    # this column, claiming the field first, sent to extra.
+                    hit = False
+                elif mode == "exact":
+                    hit = (text in aliases or bare in aliases
+                           or squeezed(text) in {squeezed(a) for a in aliases})
                 elif mode == "prefix":
                     # Two-letter aliases match exactly or not at all: FR meant
                     # fire rating, so "FR. TYPE" -- a frame type -- was being
                     # read as the fire rating on every row.
                     hit = any(
                         len(a) >= _MIN_PREFIX_ALIAS
-                        and (text.startswith(a + " ") or a.startswith(text + " "))
-                        for a in aliases
+                        and (t.startswith(a + " ") or a.startswith(t + " "))
+                        for a in aliases for t in {text, bare}
                     )
                 elif mode == "leaf":
                     leaf = text.rsplit(" ", 1)[-1] if " " in text else ""
@@ -173,8 +231,8 @@ def map_headers(headers: list[str],
                     hit = any(
                         len(a) >= _MIN_PREFIX_ALIAS
                         and (" " in a or a in _SAFE_MID_HEADING)
-                        and f" {a} " in f" {text} "
-                        for a in aliases
+                        and f" {a} " in f" {t} "
+                        for a in aliases for t in {text, bare}
                     )
                 if hit:
                     mapped[idx] = field
@@ -215,6 +273,10 @@ def map_headers(headers: list[str],
 
     unmapped = [headers[i] for i, f in enumerate(mapped) if f is None and headers[i]]
     return mapped, unmapped
+
+
+def _says_word(text: str, word: str) -> bool:
+    return f" {word} " in f" {text} "
 
 
 def extra_key(header: str, index: int) -> str:

@@ -42,6 +42,7 @@ from app.schemas import (
     PlanAudit,
     ScanCost,
     SheetRef,
+    UnreadRegion,
     UnscheduledDoorOut,
 )
 
@@ -72,6 +73,9 @@ _DRY_RUN: ContextVar[bool] = ContextVar("plan_audit_dry_run", default=False)
 # Below this share of the schedule shown on the sheets found by door number,
 # the sheets named as floor plans are searched as well.
 _FEW_SHOWN = 0.5
+# Floor plans that are pictures, read whole by the vision pass when the text
+# placed too few doors -- see `audit`. More can be asked for by name.
+_MAX_PICTURE_PLANS = 1
 # Below this many pieces of text, a page's drawing cannot be read as text. A
 # sheet whose lettering was drawn as lines keeps only its title block: 20 to 58
 # pieces on every plan of one such set, where vector sheets in the other sets
@@ -652,8 +656,10 @@ def _group_by_door(doors: list[DetectedDoorOut]) -> None:
 
 
 async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
-                  budget_usd: float, names: dict[int, str],
-                  every_sheet: bool = False
+                  budget_usd: float | None, names: dict[int, str],
+                  every_sheet: bool = False, sweep=(),
+                  regions: dict[int, list[tuple[float, float, float, float]]] | None = None,
+                  unread: list[UnreadRegion] | None = None
                   ) -> tuple[list[DetectedDoorOut], ScanCost, list[str]]:
     """Find the doors as shapes, and match each to the schedule door beside it.
 
@@ -711,6 +717,13 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
     # second vote.
     chosen, skipped = ((list(plans), []) if every_sheet
                        else _sheets_worth_scanning(plans, tags_on))
+    # Floor plans that are pictures, read whole. Nothing on them can be found
+    # by number, so the election above never sees them -- see `audit`.
+    have = {s.page for s in chosen}
+    swept = [s for s in sweep if s.page not in have]
+    chosen = sorted(chosen + swept, key=lambda s: s.page)
+    swept_names = {s.number or f"p{s.page}" for s in swept}
+    skipped = [s for s in skipped if s not in swept_names]
     scanned_tags = {t for s in chosen for t in tags_on.get(s.page, set())}
     if skipped and not chosen:
         # Not "the same rooms as a sheet being scanned": none is being scanned.
@@ -743,19 +756,15 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
             + " -- printed only on a sheet that is not being scanned."
         )
 
+    # Measure every sheet before photographing any. The zoom is chosen to put
+    # a door near 160 px, and that needs to know how big a door is *here*:
+    # assuming 36 pt everywhere put an AT&T door -- drawn at 1/16" scale,
+    # 27 pt wide -- at about 120 px, in the range where the model starts
+    # missing them. This costs nothing; it reads arcs already in the file.
+    prepared = []
     for sheet in chosen:
-        # The ceiling is for the whole request, not for one sheet. The previous
-        # per-sheet cap never fired: a five-sheet project could spend five
-        # times it and stay silent, which is how two projects cost $6 against a
-        # stated $0.70.
         width, height = doc.page_size(sheet.page - 1)
         known = by_page.get(sheet.page, [])
-
-        # Measure the sheet before photographing it. The zoom is chosen to put
-        # a door near 160 px, and that needs to know how big a door is *here*:
-        # assuming 36 pt everywhere put an AT&T door -- drawn at 1/16" scale,
-        # 27 pt wide -- at about 120 px, in the range where the model starts
-        # missing them. This costs nothing; it reads arcs already in the file.
         radius = swing_finder.calibrate(
             doc, sheet.page, [(x * width, y * height) for x, y in known])
         # The fitted radius IS the door's width: a swing arc is struck from the
@@ -769,19 +778,54 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
             log.info("plan_scan page %s: doors measure %.0f pt across, so the "
                      "sheet is rendered for that rather than the assumed %.0f",
                      sheet.page, door_pt, _BASE_DOOR_PT)
+        # Where a person sent back part of a sheet, only that part.
+        area = [(r[0] * width, r[1] * height, r[2] * width, r[3] * height)
+                for r in (regions or {}).get(sheet.page, [])] or None
+        prepared.append((sheet, width, height, known, radius, door_pt,
+                         per_foot, area))
 
+    # The limit is the work. Every sheet chosen is priced before a tile is
+    # sent, and the pass may spend that plus headroom -- so a sheet the pass
+    # chose is read whole. A fixed $1.50 stopped passes part-way: one scanned
+    # floor plan alone is about $1.60, and the doors on the part not read were
+    # missing with no way to read just that part. A limit named on the request
+    # still holds; the settings' maximum is a backstop against a loop bug.
+    settings = get_settings()
+    planned = 0.0
+    for sheet, _w, _h, known, _r, door_pt, _pf, area in prepared:
+        plan = await scan_sheet(doc, sheet.page, known, door_pt=door_pt,
+                                spans=spans, dry_run=True, regions=area)
+        planned += plan.predicted_usd
+    if budget_usd is None:
+        budget_usd = min(planned * settings.detect_headroom,
+                         settings.detect_max_usd)
+    log.info("plan_scan: %d sheet(s) priced at $%.2f; this pass may spend $%.2f",
+             len(prepared), planned, budget_usd)
+
+    for sheet, width, height, known, radius, door_pt, per_foot, area in prepared:
         report = await scan_sheet(doc, sheet.page, known,
                                   door_pt=door_pt,
                                   spans=spans, dry_run=cost.dry_run, cache=cache,
                                   budget_usd=budget_usd,
-                                  spent_usd=cost.estimated_usd)
+                                  spent_usd=cost.estimated_usd,
+                                  regions=area)
         cost.sheets += 1
         cost.predicted_usd += report.predicted_usd
         cost.tiles_planned += report.tiles_planned
         cost.tiles_sent += report.tiles_sent
         cost.prompt_tokens += report.prompt_tokens
         cost.completion_tokens += report.completion_tokens
+        # The running total, so the next sheet's limit counts what this one
+        # spent -- the limit is for the request, not for each sheet.
+        cost.estimated_usd = pricing.cost_usd(cost.model, cost.prompt_tokens,
+                                              cost.completion_tokens)
         warnings.extend(report.warnings)
+        if unread is not None:
+            unread.extend(
+                UnreadRegion(page=sheet.page, sheet=sheet.number,
+                             x0=t[0] / width, y0=t[1] / height,
+                             x1=t[2] / width, y1=t[3] / height, reason=why)
+                for t, why in report.unread)
 
         # Measure every shape first, and only then decide which door it is.
         #
@@ -919,12 +963,12 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
     cost.estimated_usd = round(
         pricing.cost_usd(cost.model, cost.prompt_tokens, cost.completion_tokens), 4)
     cost.predicted_usd = round(cost.predicted_usd, 4)
-    if cost.tiles_sent < cost.tiles_planned and not cost.dry_run:
+    if unread and not cost.dry_run:
+        sheets_left = sorted({u.sheet or f"p{u.page}" for u in unread})
         warnings.append(
-            f"Only {cost.tiles_sent} of {cost.tiles_planned} tiles were read "
-            f"before the ${budget_usd:.2f} ceiling. Doors on the parts not "
-            f"read will be missing. Raise DETECT_BUDGET_USD to scan it all."
-        )
+            f"{len(unread)} part(s) of {', '.join(sheets_left)} were not read, "
+            "so doors there may be missing. They are listed as unread and can be "
+            "read on their own.")
     return found, cost, warnings
 
 
@@ -946,6 +990,22 @@ def _name_doors(doors: list[DetectedDoorOut], read: list[str], sightings,
                         d.location.x1 * width, d.location.y1 * height)
         for d in doors
     ]
+    if not tags:
+        # A picture: no number on this sheet is text, so nothing can be
+        # checked against where it is printed, and the matching below -- which
+        # uses the model's reading only to break a tie -- names nothing. On
+        # Caliber's A1.0 it found 60 doors and numbered none of them. Here the
+        # reading is all there is: taken where it is a scheduled door and the
+        # model gave that number to this shape alone. Two shapes claiming one
+        # number both stay blank -- a blank can be checked; a confident wrong
+        # number looks exactly like a right one.
+        said = [(r or "").strip() for r in read]
+        counts = Counter(t for t in said if t)
+        for index, tag in enumerate(said):
+            if tag in by_tag and counts[tag] == 1 and index < len(doors):
+                doors[index].tag = tag
+                doors[index].schedule = by_tag.get(tag, {})
+        return
     for index, tag in door_match.assign(boxes, read, tags).items():
         doors[index].tag = tag
         doors[index].schedule = by_tag.get(tag, {})
@@ -1084,6 +1144,37 @@ def _name_walls(doc, plans, detected) -> None:
         log.warning("plan_audit: wall types skipped (%s)", exc)
 
 
+_NOT_FOUND = "These doors are scheduled but were not found on any floor plan: "
+
+
+def _found_by_shape(result, detected: list[DetectedDoorOut]) -> None:
+    """Take the doors the vision pass found off the not-found list.
+
+    That list is made from door numbers printed as text, before the vision
+    pass runs. On a picture plan nothing is text, so it named every door --
+    while the pass, a moment later, found and numbered 14 of Caliber's 26 on
+    A1.0. Telling a person a door is missing when its box is on the sheet is
+    how a report stops being believed.
+    """
+    seen = {d.tag for d in detected if d.tag}
+    if not seen:
+        return
+    result.missing_from_plans = [s for s in result.missing_from_plans
+                                 if s.tag not in seen]
+    left = [s.tag for s in result.missing_from_plans]
+    result.warnings = [w for w in result.warnings if not w.startswith(_NOT_FOUND)]
+    if left:
+        result.warnings.append(_NOT_FOUND + ", ".join(left))
+
+
+def _inside(location, regions: dict[int, list[tuple[float, float, float, float]]]
+            ) -> bool:
+    """Does this box's centre fall in one of the parts of its sheet named?"""
+    cx, cy = (location.x0 + location.x1) / 2, (location.y0 + location.y1) / 2
+    return any(r[0] <= cx <= r[2] and r[1] <= cy <= r[3]
+               for r in regions.get(location.page, []))
+
+
 def _unreadable(doc: PdfDoc, page: int) -> bool:
     """Is this page's drawing too bare of text for anything but the vision
     model? A page that cannot be read at all is not called unreadable."""
@@ -1113,7 +1204,9 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
                 schedule_page: int = 0,
                 tag_shape: str = "",
                 pages: list[int] | None = None,
-                doors: set[str] | None = None) -> PlanAudit:
+                doors: set[str] | None = None,
+                regions: dict[int, list[tuple[float, float, float, float]]] | None = None
+                ) -> PlanAudit:
     """PDF in, reconciliation out. Stateless.
 
     `rows` is a schedule that has already been read. Pass it and this does not
@@ -1144,6 +1237,11 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
     `pages` are the sheets to look on, read whole and in place of the ones the
     set's own door numbers would pick; `doors` are the numbers to look for, and
     only those come back. Either, or both -- "door 117, on A-112".
+
+    `regions` are parts of those sheets -- page to rectangles, as page
+    fractions -- usually the `unread` a pass reported. Only they are read, and
+    only doors inside them come back, so finishing a sheet never doubles a
+    door already found beside the part left over.
     """
     started = time.perf_counter()
     _DRY_RUN.set(dry_run)
@@ -1163,6 +1261,15 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         tags = {r.door_tag for r in rows if r.door_tag}
         if doors:
             tags &= doors
+        # Floor plans that are pictures: titled as plans, too bare of text for
+        # any door number on them to be read. Kept apart because searching them
+        # by number finds nothing -- and searching a sheet whose lettering is
+        # linework took one set from two minutes to fifteen -- but read whole
+        # by the vision pass when the text found too few doors. Caliber's plans
+        # are all like this, and the only sheet that printed door numbers as
+        # text was a code sheet with two of them: no pass, paid or not, ever
+        # looked at its floor plans.
+        pictures: list = []
         if pages:
             # Where a person said to look. Named by the index where it knows
             # the page, so the sheet still carries its number and title.
@@ -1175,6 +1282,8 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             plans = plan_index.door_plans(doc, sheets, tags,
                                           {best_page} if best_page else set())
             titled = plan_index.floor_plans(sheets)
+            pictures = [s for s in titled
+                        if not s.is_enlargement and _unreadable(doc, s.page)]
             if not plans:
                 plans = titled
             elif len(plan_index.shown_on(doc, plans, tags)) < len(tags) * _FEW_SHOWN:
@@ -1238,9 +1347,24 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         # coordinate system, and a plan with nothing found on it is exactly the
         # one somebody will want to look at.
         sized |= {s.page for s in searched}
+        # The picture plans are read only where the text left most doors
+        # unplaced. Where the text placed them, a picture plan is a scanned
+        # copy of a sheet already read, and reading it is money for nothing.
+        # Only the likeliest, because a picture is read whole: Caliber has six,
+        # and all six came to 369 tiles and a predicted $9.71 against a $1.50
+        # ceiling. A sheet titled as the floor plan first, then page order --
+        # the main plan comes before the enlargements and the plan details.
+        in_plans = {s.page for s in plans}
+        sweep = ([s for s in pictures if s.page not in in_plans]
+                 if detect and len(result.found) < len(tags) * _FEW_SHOWN
+                 else [])
+        sweep = sorted(sweep, key=lambda s: (not plan_index._is_the_floor(s.title.upper()),
+                                             s.page))[:_MAX_PICTURE_PLANS]
+        sized |= {s.page for s in sweep}
         sizes = {p: doc.page_size(p - 1) for p in sized}
 
         detected: list[DetectedDoorOut] = []
+        unread: list[UnreadRegion] = []
         scan_cost = None
         if detect:
             ceiling = (budget_usd if budget_usd is not None
@@ -1248,11 +1372,27 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             detected, scan_cost, scan_warnings = await _detect(
                 doc, plans, sightings, rows, sizes, ceiling,
                 {s.page: s.number or f"p{s.page}" for s in sheets},
-                every_sheet=bool(pages))
+                every_sheet=bool(pages), sweep=sweep,
+                regions=regions, unread=unread)
+            # The paid pass adds to the free one; it does not replace it. Each
+            # door the vision pass did not find as a shape keeps the box the
+            # free pass measured from its tag. Without this, Read again on
+            # Victoria stored 3 boxes where the free pass had placed all 40,
+            # and every door the model missed lost its place on the plan.
+            found_by_shape = {d.tag for d in detected if d.tag}
+            detected += [d for d in _measure_from_tags(doc, plans, sightings, rows,
+                                                       sizes, tag_shape)
+                         if d.tag and d.tag not in found_by_shape]
+            plans = sorted(plans + sweep, key=lambda s: s.page)
             if doors:
                 # The model reads the whole sheet; only the doors asked about
                 # are an answer to this request.
                 detected = [d for d in detected if d.tag in tags]
+            if regions:
+                # Tiles reach past the part asked for; what lies past it was
+                # found on the first read and is not this request's answer.
+                detected = [d for d in detected if _inside(d.location, regions)]
+            _found_by_shape(result, detected)
             result.warnings.extend(scan_warnings)
             unlabelled = [d for d in detected if not d.tag]
             if unlabelled:
@@ -1282,6 +1422,11 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         for sighting in sightings:
             for c in sighting.candidates:
                 tags_on.setdefault(c.page, set()).add(sighting.tag)
+        # And where the vision pass found them: a picture plan has no door
+        # number as text, and is still the sheet its doors are on.
+        for door in detected:
+            if door.tag:
+                tags_on.setdefault(door.location.page, set()).add(door.tag)
 
         # Which wall each door sits in, read off the drawing's own tags. The
         # wall itself is never identified: the legend says which symbols this
@@ -1329,4 +1474,5 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         coverage_note=_COVERAGE_NOTE if not detect else _DETECT_NOTE,
         detected=detected,
         scan_cost=scan_cost,
+        unread=unread,
     )
