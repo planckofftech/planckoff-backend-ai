@@ -36,17 +36,32 @@ class Settings(BaseSettings):
     # AI fallback (Phase 4). Absent key => the AI tier is skipped, not an error.
     openrouter_api_key: Credential = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    ai_model: str = "google/gemini-2.5-flash"
+    # Reading a scanned door schedule. Measured 18 November 2026 on the four
+    # scanned schedules of the tester sheet (DISD, Christian Brothers, Kraus,
+    # Cachet): gemini-3.8-flash read every door of all four. gemini-2.5-flash,
+    # the model before it, read none of Kraus's 11 on one run and DISD's B125B
+    # as B119B; gpt-6-luna listed ten hardware lines on Cachet as doors.
+    ai_model: str = "google/gemini-3.8-flash"
     # Detecting doors on a plan is a different job from transcribing a table,
     # and the best model for it is an open question -- kept separate so it can
     # be changed on the evidence of scripts/door_bakeoff.py without disturbing
     # the schedule tier. Empty means "use ai_model".
-    ai_detect_model: str = "google/gemini-2.5-pro"
+    #
+    # Measured 18 November 2026 (door_bakeoff, Austin OBGYN A2.1, 36 known
+    # doors, 160 px a door): gpt-6.1-terra 36/36, 2 unexplained, boxes 1 pt off,
+    # $0.08 -- against gemini-2.5-pro 34/36, 23 unexplained, 23 pt off, $0.38.
+    # On Caliber's scanned floor plan it numbered 16 of 26 doors for $0.25,
+    # where gemini-2.5-pro numbered 14 for $0.88.
+    ai_detect_model: str = "openai/gpt-6.1-terra"
     # Reading prices from the manufacturers' books, and naming a maker from a
     # schedule's code. Its own setting so models can be tried on price pages
     # (AI-Model-Choice-and-Costs) without moving the other tiers. Empty means
     # "use ai_model".
-    ai_price_model: str = ""
+    #
+    # Held at the model it was chosen on when the schedule reader moved: the
+    # price engine was measured on gemini-2.5-flash, and changing it is its
+    # own decision, made on price pages.
+    ai_price_model: str = "google/gemini-2.5-flash"
     # The second model every price is read with. Two models have to read the
     # same price before it shows as agreed (app/price_book/ai_check.py). Must
     # differ from the first to be worth anything; empty turns the second read
@@ -62,17 +77,26 @@ class Settings(BaseSettings):
     # at 80 px recall was 78%% and boxes landed in open rooms; at 160 px it
     # was 94%% and they landed on the doors. The cost is more tiles.
     ai_door_pixels: int = 160
-    # Hard ceiling on one plan-audit request, in USD. Deliberately near the
-    # cost of a single project rather than generous: a run that needs more
-    # should say so and stop, not decide for itself. Two projects once cost $6
-    # against a stated $0.70 because the only cap was per sheet.
-    detect_budget_usd: float = 1.50
+    # The vision pass's spending limit is worked out per request, from the
+    # work it was asked to do: every chosen sheet is measured and priced before
+    # a tile is sent, and the pass may spend that price times
+    # `detect_headroom`. A fixed $1.50 used to stop passes part-way -- one
+    # scanned floor plan alone needs about $1.60 -- and the doors on the part
+    # left over were simply missing, with no way to read just that part.
+    detect_headroom: float = 1.5
+    # The most one request may spend however much it was asked to do -- a
+    # backstop against a loop bug, not a cost control. A pass that reaches it
+    # records the parts it did not read, sheet and region, so they can be read
+    # on their own (POST /documents/{id}/reprocess with `regions`).
+    detect_max_usd: float = 20.0
+    # Set to fix the limit instead of working it out -- the old behaviour.
+    # Unset by default.
+    detect_budget_usd: float | None = None
     # Most tiles one sheet may be cut into. A backstop against a loop bug, not
-    # a cost control -- `detect_budget_usd` is the cost control. It matters on
-    # a big building drawn small: a 1/16" warehouse plan needs about 90 tiles
-    # to show every door at a readable size, so at 40 the sheet is read in
-    # part and the rest is reported unread. Raise it and the budget together.
-    max_tiles_per_sheet: int = 40
+    # a cost control: the largest real sheet measured needs about 90 (a 1/16"
+    # warehouse plan), and at the old 40 every bigger sheet was read in part.
+    # Tiles past it are recorded as unread, never dropped quietly.
+    max_tiles_per_sheet: int = 250
 
     # Supabase. Absent settings mean the service runs exactly as it did before
     # -- nothing is stored and nothing fails. A takeoff is still returned to the

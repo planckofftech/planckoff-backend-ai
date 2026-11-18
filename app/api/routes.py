@@ -313,9 +313,10 @@ async def plan_audit(
     ),
     budget_usd: float | None = Query(
         None, gt=0,
-        description="Ceiling for this request in USD. The scan stops when it "
-        "is reached and says how much of the drawing it did not read. "
-        "Defaults to DETECT_BUDGET_USD.",
+        description="Ceiling for this request in USD. Left out, the limit is "
+        "worked out from the sheets chosen -- priced before anything is sent -- "
+        "so they are read whole. Whatever a limit stops is listed under "
+        "`unread`, to be read on its own.",
     ),
     tag_shape: str = Query(
         "",

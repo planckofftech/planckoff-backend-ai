@@ -74,8 +74,9 @@ _WALL_DOORS = 4.0
 # lets it climb into the wall-type details stacked above the plan. A single
 # bounded reach has neither failure.
 _WALL_REACH_DOORS = 6.0
-# Hard ceiling per request. A loop bug must not be able to run up a bill.
-MAX_TILES = 40
+# Most tiles one sheet may use, where the settings do not say. A loop bug must
+# not be able to run up a bill -- and what it holds back is recorded as unread.
+MAX_TILES = 250
 # The longest answer one tile may give, thinking included. Left unset, the
 # provider reserves the model's whole 65,536 against the balance before every
 # call, and a nearly spent account refused a tile that would have cost cents.
@@ -203,6 +204,10 @@ class ScanReport:
     completion_tokens: int = 0
     predicted_usd: float = 0.0
     warnings: list[str] = field(default_factory=list)
+    # Tiles asked for and not read, in page points, each with why -- so the
+    # caller can name the part of the sheet and have it read later.
+    unread: list[tuple[tuple[float, float, float, float], str]] = field(
+        default_factory=list)
 
     @property
     def estimated_usd(self) -> float:
@@ -424,7 +429,9 @@ async def scan_sheet(doc: PdfDoc, page: int,
                      budget_usd: float | None = None,
                      focus_only: bool = False,
                      spent_usd: float = 0.0,
-                     cache: dict[str, list[dict]] | None = None) -> ScanReport:
+                     cache: dict[str, list[dict]] | None = None,
+                     regions: list[tuple[float, float, float, float]] | None = None
+                     ) -> ScanReport:
     """Look at one plan sheet and report the doors on it.
 
     `known` is the tag positions already located on this sheet, as page
@@ -465,13 +472,24 @@ async def scan_sheet(doc: PdfDoc, page: int,
                  if any(t[0] <= sx <= t[2] and t[1] <= sy <= t[3]
                         for sx, sy in spots)]
 
+    if regions:
+        # The rest of a sheet a person sent back -- only the tiles that touch
+        # the parts named. Same tiling as the first read, so the same tiles.
+        tiles = [t for t in tiles
+                 if any(t[0] < r[2] and r[0] < t[2] and t[1] < r[3] and r[1] < t[3]
+                        for r in regions)]
+
     report.tiles_planned = len(tiles)
 
     if len(tiles) > max_tiles:
+        # A backstop against a runaway loop, not a cost control -- so what it
+        # holds back is recorded, part by part, and can be read on its own.
+        reason = (f"the sheet needs {len(tiles)} tiles and one sheet may use "
+                  f"{max_tiles}")
+        report.unread.extend((t, reason) for t in tiles[max_tiles:])
         report.warnings.append(
-            f"page {page}: {len(tiles)} tiles needed but the cap is {max_tiles}; "
-            f"scanning the first {max_tiles} only -- part of this sheet was not read"
-        )
+            f"page {page}: {len(tiles)} tiles needed, {max_tiles} read -- the "
+            "rest of this sheet is listed as unread and can be read on its own")
         tiles = tiles[:max_tiles]
 
     log.info("plan_scan page=%s region=%.0fx%.0fpt tiles=%d dpi=%d ask=%s dry_run=%s",
@@ -490,13 +508,15 @@ async def scan_sheet(doc: PdfDoc, page: int,
         report.warnings.append(f"door detection skipped: {exc}")
         return report
 
-    for tile in tiles:
+    failed_in_a_row = 0
+    for index, tile in enumerate(tiles):
         if budget_usd is not None and spent_usd + report.estimated_usd >= budget_usd:
+            reason = f"the ${budget_usd:.2f} limit for this request was reached"
+            report.unread.extend((t, reason) for t in tiles[index:])
             report.warnings.append(
                 f"page {page}: stopped at {report.tiles_sent} of {len(tiles)} "
-                f"tiles -- the ${budget_usd:.2f} ceiling for this request was "
-                f"reached. Part of this sheet was not looked at."
-            )
+                f"tiles -- {reason}. The rest of this sheet is listed as unread "
+                "and can be read on its own.")
             log.warning("plan_scan hit the budget ceiling on page %s", page)
             break
 
@@ -506,23 +526,51 @@ async def scan_sheet(doc: PdfDoc, page: int,
             found = cache[key]
         else:
             data_url = "data:image/png;base64," + base64.b64encode(png).decode()
-            try:
-                response = await client.chat.completions.create(
-                    model=chosen,
-                    temperature=0,
-                    max_tokens=_MAX_OUTPUT_TOKENS,
-                    response_format={"type": "json_object"},
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    }],
-                )
-            except Exception as exc:  # noqa: BLE001 - surface the upstream reason
+            response, error = None, None
+            # Once more before giving a tile up: the provider drops the odd
+            # call, and one dropped call used to fail the whole pass -- every
+            # sheet, every tile already paid for.
+            for _attempt in range(2):
+                try:
+                    response = await client.chat.completions.create(
+                        model=chosen,
+                        temperature=0,
+                        max_tokens=_MAX_OUTPUT_TOKENS,
+                        response_format={"type": "json_object"},
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": data_url}},
+                            ],
+                        }],
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 - surface the upstream reason
+                    error = exc
+            if response is None:
                 from app.ai.vision_extract import _upstream_reason
-                raise AiUpstreamError(_upstream_reason(exc)) from exc
+                reason = _upstream_reason(error)
+                failed_in_a_row += 1
+                if report.tiles_sent == 0 and spent_usd == 0 and index == 0:
+                    # Nothing has been read at all -- a bad key, no credit.
+                    # That is the request failing, and is reported as such.
+                    raise AiUpstreamError(reason) from error
+                # Two tiles running is the provider refusing, not a dropped
+                # call: stop asking, and name everything not read.
+                rest = tiles[index:] if failed_in_a_row >= 2 else [tile]
+                report.unread.extend((t, f"the model could not be reached: {reason}")
+                                     for t in rest)
+                log.warning("plan_scan page %s: %d tile(s) not read: %s",
+                            page, len(rest), reason)
+                if failed_in_a_row >= 2:
+                    report.warnings.append(
+                        f"page {page}: the model stopped answering after "
+                        f"{report.tiles_sent} of {len(tiles)} tiles. The rest of "
+                        "this sheet is listed as unread and can be read on its own.")
+                    break
+                continue
+            failed_in_a_row = 0
 
             report.tiles_sent += 1
             usage = getattr(response, "usage", None)

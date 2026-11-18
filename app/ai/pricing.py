@@ -61,6 +61,13 @@ _PRICES: dict[str, tuple[float, float]] = {
     "openai/gpt-6.1-sol": (2.00, 10.00),
     "anthropic/claude-opus-5.5": (4.00, 20.00),
     "anthropic/claude-fable-5.1": (10.00, 50.00),
+    # Vision candidates for the scanned-schedule reader and the plan scan
+    # (OpenRouter list prices on 18 November 2026).
+    "google/gemini-4-hydrogen": (1.50, 7.50),
+    "google/gemini-4-carbon": (2.00, 10.00),
+    "google/gemini-3.7-flash": (0.75, 3.75),
+    "openai/gpt-6.2-sol": (2.00, 10.00),
+    "qwen/qwen4-max": (1.42, 4.27),
 }
 # An unknown model is priced at the dearest rate on the list, never the
 # cheapest. Guessing low is how a bill becomes a surprise.
@@ -89,6 +96,10 @@ def cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
 USD_PER_TILE = {
     "google/gemini-2.5-pro": 0.039,
     "google/gemini-2.5-flash": 0.010,
+    # Measured 18 November 2026: Austin OBGYN A2.1, 16 tiles at 160 px a door.
+    "openai/gpt-6.1-terra": 0.0052,
+    "google/gemini-4-hydrogen": 0.0223,
+    "google/gemini-3.8-flash": 0.0163,
 }
 _DEFAULT_PER_TILE = 0.05
 
