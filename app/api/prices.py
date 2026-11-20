@@ -14,7 +14,7 @@ from dataclasses import asdict
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.api.deps import require_api_key
 from app.db.client import NoDatabase
@@ -50,44 +50,60 @@ class PriceItem(BaseModel):
 
 class PriceRequest(BaseModel):
     items: list[PriceItem] = Field(max_length=_MAX_ITEMS)
+    project_id: str | None = Field(None, max_length=100,
+                                   description="The project being priced: its own prices answer first, and a "
+                                               "master price it takes is copied into it as its own")
 
 
-def _price_all(items: list[PriceItem]) -> list[dict[str, Any]]:
+def _price_all(items: list[PriceItem], project_id: str | None) -> list[dict[str, Any]]:
     books = store.mapped_books()
     codes = store.maker_codes()
     written = [makers.Written(i.id, i.manufacturer, i.model_number, i.finish, i.size, i.description,
                               i.name) for i in items]
     maker_of = {n: manufacturer_of(w.manufacturer, set(books), codes) for n, w in enumerate(written)}
-    stored: dict[str, dict[str, dict]] = {}
+    own: dict[str, dict[str, dict]] = {}
+    master: dict[str, dict[str, dict]] = {}
     for maker in {m for m in maker_of.values() if m}:
-        keys = ["|".join(w.product()) for n, w in enumerate(written) if maker_of[n] == maker]
-        stored[maker] = store.ai_prices_for(maker, sorted(set(keys)))
+        keys = sorted({"|".join(w.product()) for n, w in enumerate(written) if maker_of[n] == maker})
+        master[maker] = store.master_for(maker, keys)
+        own[maker] = store.project_prices_for(project_id, maker, keys) if project_id else {}
+        if project_id:
+            # A master price the project does not have yet becomes the project's
+            # own copy, so a later change to the master does not move its bid.
+            taken = [m for k, m in master[maker].items() if k not in own[maker]]
+            if taken:
+                store.take_from_master(project_id, taken)
+                own[maker] = store.project_prices_for(project_id, maker, keys)
     out = []
     for n, (item, w) in enumerate(zip(items, written)):
         maker = maker_of[n]
         if maker is None:
-            q = {"status": "book_not_loaded", "ai_price_id": None, "manufacturer": item.manufacturer,
-                 "list_price": None,
+            q = {"status": "book_not_loaded", "ai_price_id": None, "project_price_id": None, "master_id": None,
+                 "source": None, "master_price": None, "master_changed": False,
+                 "manufacturer": item.manufacturer, "list_price": None,
                  "extended_price": None, "parts": [], "options": [], "book": "", "effective_date": None,
                  "model": item.model_number or item.description, "finish": item.finish, "size": item.size,
                  "reasons": [f"No price book for '{item.manufacturer}' has been loaded"]}
         else:
-            q = ai_pricing.as_quote(maker, w, item.quantity, stored[maker].get("|".join(w.product())))
+            key = "|".join(w.product())
+            q = ai_pricing.as_quote(maker, w, item.quantity, own[maker].get(key), master[maker].get(key))
         out.append({"id": item.id, **q})
     return out
 
 
 @router.post("/prices")
 async def price_items(body: PriceRequest) -> dict[str, Any]:
-    """List price for each item, from the prices read by AI.
+    """List price for each item: the lookup, which costs nothing.
 
-    The same answer shape as before pricing moved to AI: `priced` is a price a
-    person confirmed, `needs_review` one two models agreed on and nobody has
-    confirmed yet (or one the AI could not settle), `not_found` a product not
-    priced with AI yet -- run POST /price-books/ai-price for it.
+    With `project_id`, the project's own price answers first (`source` "ai":
+    read by AI for it, or "master": taken from the master before); a product
+    the project has none for takes the master's confirmed price, copied into
+    the project as its own. Without it, the master answers alone and nothing is
+    stored. `priced` is a confirmed price, `needs_review` the project's AI price
+    nobody has confirmed yet, `not_found` no price in the project or the master.
     """
     try:
-        priced = await asyncio.to_thread(_price_all, body.items)
+        priced = await asyncio.to_thread(_price_all, body.items, body.project_id)
     except NoDatabase as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"No database configured: {exc}") from exc
@@ -128,7 +144,7 @@ def _search(manufacturer: str, q: str, limit: int) -> dict[str, Any]:
         return {"manufacturer": maker, "query": {"model": query.key, "finish": query.finish,
                                                  "size": list(query.size) if query.size else None},
                 "results": [], "more": False}
-    found = [ai_pricing.as_suggestion(r) for r in store.settled_ai_prices(maker, query.key, limit + 1)]
+    found = [ai_pricing.as_suggestion(r) for r in store.search_master(maker, query.key, limit + 1)]
     return {
         "manufacturer": maker,
         "query": {"model": query.key, "finish": query.finish,
@@ -352,9 +368,12 @@ async def find_pages(body: FindPagesRequest) -> dict[str, Any]:
 
 class AiPriceRequest(BaseModel):
     items: list[PriceItem] = Field(max_length=_MAX_ITEMS)
-    project_id: str | None = Field(None, max_length=100)
-    reuse_verified: bool = Field(True, description="Take a product a person has verified from the "
-                                                   "table instead of reading it again")
+    project_id: str = Field(..., min_length=1, max_length=100,
+                            description="The project the prices are stored for, as its own")
+    reuse_confirmed: bool = Field(True, validation_alias=AliasChoices("reuse_confirmed", "reuse_verified"),
+                                  description="Take a product this project already confirmed instead of "
+                                              "reading it again. False prices it afresh; the new answer "
+                                              "then waits for a person to confirm it again")
     engine: Literal["pipeline", "agent"] | None = Field(
         None, description="pipeline: step A finds pages, step B reads them. agent: an agent searches "
                           "the whole book and builds the price part by part, a second model checks "
@@ -366,12 +385,13 @@ _RUNS: set[asyncio.Task] = set()
 
 
 async def _run(run_id: str, items: list[makers.Written], reuse: bool,
-               project_id: str | None, engine: str) -> None:
+               project_id: str, engine: str) -> None:
     settings = get_settings()
     calls = call_log.start()
     price_project = agent_pricing.price_project if engine == "agent" else ai_pricing.price_project
     try:
-        result = await price_project(items, run_id, settings.ai_price, settings.ai_price_check_model, reuse)
+        result = await price_project(items, run_id, settings.ai_price, settings.ai_price_check_model,
+                                     project_id, reuse)
     except Exception as exc:  # noqa: BLE001 - a failed run is reported on the run
         log.exception("AI price run %s failed", run_id)
         await asyncio.to_thread(store.finish_run, run_id, None, f"{type(exc).__name__}: {exc}")
@@ -389,8 +409,10 @@ async def _run(run_id: str, items: list[makers.Written], reuse: bool,
 async def start_ai_price(body: AiPriceRequest) -> dict[str, Any]:
     """Price items with AI, in the background. Poll GET /price-books/ai-price/{run_id}.
 
-    Every distinct product is read by two models from the pages of its maker's
-    books, checked, and stored with its verdict. Quantity is ignored.
+    Every distinct product is read from the pages of its maker's books,
+    checked, and stored with its verdict as the project's own price. The
+    master is not consulted -- a run is a fresh reading of the book, and is
+    paid for; the free route is POST /prices. Quantity is ignored.
     """
     if not get_settings().ai_enabled:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -406,7 +428,7 @@ async def start_ai_price(body: AiPriceRequest) -> dict[str, Any]:
     except NoDatabase as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"No database configured: {exc}") from exc
-    task = asyncio.create_task(_run(run_id, items, body.reuse_verified, body.project_id, engine))
+    task = asyncio.create_task(_run(run_id, items, body.reuse_confirmed, body.project_id, engine))
     _RUNS.add(task)
     task.add_done_callback(_RUNS.discard)
     return {"run_id": run_id, "status": "running", "items": len(items), "engine": engine}
@@ -440,52 +462,207 @@ class ConfirmBody(BaseModel):
     note: str = Field("", max_length=300)
 
 
+def _no_db(exc: NoDatabase) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                         detail=f"No database configured: {exc}")
+
+
 @router.post("/price-books/ai-prices/{price_id}/confirm")
 async def confirm_ai_price(price_id: str, body: ConfirmBody) -> dict[str, Any]:
-    """A person settles an AI price: it becomes verified and is reused from then on.
+    """A person confirms a project's price; it becomes the master's price too.
 
-    With no `list_price`, the agreed price is confirmed as it is. A price that
-    was not agreed needs the person's `list_price` -- one of the answers shown,
-    or what they read off the page themselves.
+    `price_id` is the project price's id (`project_price_id`, also sent as
+    `ai_price_id`). With no `list_price`, the agreed price is confirmed as it
+    is. A price that was not agreed needs the person's `list_price` -- one of
+    the answers shown, or what they read off the page themselves. Confirming
+    again with another price corrects it, in the project and in the master.
+
+    The master keeps the latest confirmation of a product, whichever project
+    it came from; `previous_master_price` is what it held before (null when
+    it had none), and every confirmation stays in the master's history.
     """
     try:
-        row = await asyncio.to_thread(store.ai_price, price_id)
+        row = await asyncio.to_thread(store.project_price, price_id)
         if row is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such AI price")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such project price")
         price = body.list_price if body.list_price is not None else row["list_price"]
         if price is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                                 detail="This price was not agreed; send the list_price to confirm")
-        return await asyncio.to_thread(store.confirm_ai_price, price_id, float(price), body.note,
+        done = await asyncio.to_thread(store.confirm_project_price, price_id, float(price), body.note,
                                        ai_pricing.parts_for(row, float(price)))
     except NoDatabase as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail=f"No database configured: {exc}") from exc
+        raise _no_db(exc) from exc
+    if not done:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such project price")
+    project = done["project_price"]
+    return {**project, "verified": True, "master": done["master"],
+            "previous_master_price": done.get("previous_price")}
+
+
+def _master_search(manufacturer: str, q: str, limit: int) -> tuple[str, list[dict[str, Any]]]:
+    maker = manufacturer_of(manufacturer, set(store.mapped_books()), store.maker_codes())
+    if maker is None:
+        raise LookupError(manufacturer)
+    return maker, store.search_master(maker, makers.match_key(q), limit)
+
+
+@router.get("/price-books/master")
+async def list_master(
+    manufacturer: str = Query(..., description="Full name (Hager) or schedule code (HA)"),
+    q: str = Query("", max_length=100, description="The start of the model"),
+    limit: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """The master: every product's latest confirmed price, shared by every project."""
+    try:
+        maker, rows = await asyncio.to_thread(_master_search, manufacturer, q, limit)
+    except LookupError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"No price book for '{manufacturer}' has been loaded")
+    except NoDatabase as exc:
+        raise _no_db(exc) from exc
+    return {"manufacturer": maker, "results": rows}
 
 
 @router.get("/price-books/ai-prices")
 async def list_ai_prices(
     manufacturer: str = Query(..., description="Full name (Hager) or schedule code (HA)"),
     q: str = Query("", max_length=100, description="The start of the model"),
-    verified: bool = Query(True, description="Only prices a person has confirmed"),
+    verified: bool = Query(True, description="Ignored: the master holds confirmed prices only"),
     limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
-    """AI prices of a maker's products, for suggestions on a new project."""
-    def _find():
-        maker = manufacturer_of(manufacturer, set(store.mapped_books()), store.maker_codes())
-        if maker is None:
-            raise LookupError(manufacturer)
-        return maker, store.search_ai_prices(maker, makers.match_key(q), verified, limit)
+    """Old name of GET /price-books/master, kept until the frontend moves."""
+    return await list_master(manufacturer, q, limit)
+
+
+@router.get("/price-books/master/{master_id}")
+async def master_detail(master_id: str) -> dict[str, Any]:
+    """A master price and its history: who confirmed what, and the price before."""
+    try:
+        row = await asyncio.to_thread(store.master_price, master_id)
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such master price")
+        history = await asyncio.to_thread(store.master_history, row["manufacturer"], row["product_key"])
+    except NoDatabase as exc:
+        raise _no_db(exc) from exc
+    return {**row, "history": history}
+
+
+class MasterEditBody(BaseModel):
+    list_price: float = Field(..., gt=0)
+    note: str = Field(..., min_length=1, max_length=300, description="Why it was changed")
+
+
+@router.put("/price-books/master/{master_id}")
+async def edit_master(master_id: str, body: MasterEditBody) -> dict[str, Any]:
+    """Correct a master price (an admin action). Projects keep their own copies;
+    the change is kept in the history with the price before."""
+    try:
+        done = await asyncio.to_thread(store.edit_master, master_id, body.list_price, body.note)
+    except NoDatabase as exc:
+        raise _no_db(exc) from exc
+    if not done:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such master price")
+    return {**done["master"], "previous_price": done.get("previous_price")}
+
+
+@router.delete("/price-books/master/{master_id}")
+async def remove_master(master_id: str,
+                        note: str = Query(..., min_length=1, max_length=300,
+                                          description="Why it was removed")) -> dict[str, Any]:
+    """Remove a master price (an admin action). Projects keep their own copies;
+    the removal is kept in the history."""
+    try:
+        done = await asyncio.to_thread(store.remove_master, master_id, note)
+    except NoDatabase as exc:
+        raise _no_db(exc) from exc
+    if not done:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such master price")
+    return {"removed": done["removed"]}
+
+
+# --------------------------------------------------------------------------- #
+# a project's own prices
+# --------------------------------------------------------------------------- #
+
+def _with_master(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each project price beside the master's price of the same product now."""
+    keys: dict[str, set[str]] = {}
+    for r in rows:
+        keys.setdefault(r["manufacturer"], set()).add(r["product_key"])
+    master = {m: store.master_for(m, sorted(k)) for m, k in keys.items()}
+    out = []
+    for r in rows:
+        m = master[r["manufacturer"]].get(r["product_key"])
+        mp = float(m["list_price"]) if m else None
+        changed = bool(r["confirmed"] and mp is not None and r["list_price"] is not None
+                       and abs(mp - float(r["list_price"])) >= 0.005)
+        out.append({**r, "master_price": mp, "master_id": r.get("master_id") or (m["id"] if m else None),
+                    "master_changed": changed})
+    return out
+
+
+@router.get("/projects/{project_id}/prices")
+async def project_price_list(project_id: str) -> dict[str, Any]:
+    """Every price this project holds, each with the master's price beside it.
+
+    `master_changed` is true when the project confirmed a price and the master
+    has another one now (another project confirmed later, or an admin edited
+    it). The project's price stands until a person takes the master's
+    (POST .../use-master).
+    """
+    try:
+        rows = await asyncio.to_thread(lambda: _with_master(store.project_prices(project_id)))
+    except NoDatabase as exc:
+        raise _no_db(exc) from exc
+    counts = {"confirmed": sum(1 for r in rows if r["confirmed"]),
+              "unconfirmed": sum(1 for r in rows if not r["confirmed"]),
+              "master_changed": sum(1 for r in rows if r["master_changed"])}
+    return {"project_id": project_id, "items": rows, "counts": counts}
+
+
+@router.post("/projects/{project_id}/prices/{price_id}/use-master")
+async def use_master_price(project_id: str, price_id: str) -> dict[str, Any]:
+    """Set this project's price to the master's price as it stands now."""
+    def _use() -> dict[str, Any]:
+        row = store.project_price(price_id)
+        if row is None or row["project_id"] != project_id:
+            raise LookupError("No such project price")
+        found = store.master_for(row["manufacturer"], [row["product_key"]]).get(row["product_key"])
+        if found is None:
+            raise ValueError("The master has no price for this product")
+        return store.use_master(price_id, found)
 
     try:
-        maker, rows = await asyncio.to_thread(_find)
-    except LookupError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f"No price book for '{manufacturer}' has been loaded")
+        return await asyncio.to_thread(_use)
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except NoDatabase as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail=f"No database configured: {exc}") from exc
-    return {"manufacturer": maker, "results": rows}
+        raise _no_db(exc) from exc
+
+
+@router.delete("/projects/{project_id}/prices/{price_id}")
+async def delete_project_price(project_id: str, price_id: str) -> dict[str, Any]:
+    """Delete one of this project's prices. The master is not touched."""
+    try:
+        deleted = await asyncio.to_thread(store.delete_project_price, project_id, price_id)
+    except NoDatabase as exc:
+        raise _no_db(exc) from exc
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such project price")
+    return {"deleted": price_id}
+
+
+@router.delete("/projects/{project_id}/prices")
+async def delete_project_prices(project_id: str) -> dict[str, Any]:
+    """Delete every price of this project. The master is not touched."""
+    try:
+        n = await asyncio.to_thread(store.delete_project_prices, project_id)
+    except NoDatabase as exc:
+        raise _no_db(exc) from exc
+    return {"project_id": project_id, "deleted": n}
 
 
 class CodeBody(BaseModel):

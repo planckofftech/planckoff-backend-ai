@@ -34,6 +34,13 @@ HEADER_WORDS = (
     # set heads its columns SELF CLOSER, DOOR OPENER and CARD READER, ticking
     # each with an X, and carried no other word this list knew.
     "CLOSER", "OPENER", "CARD READER",
+    # Big Spring heads its schedule Door Number / Description / Tag / Function
+    # / Leaf Count / Width / Height / Comments, sideways. Only WIDTH, HEIGHT
+    # and COMMENTS were known -- three words and none a door's -- so the sheet
+    # the index named as the schedules sheet gave its room finish schedule
+    # instead, and the set read as having no door schedule. "DOOR NO" is not
+    # inside "DOOR NUMBER", and a leaf is a door's.
+    "DOOR NUMBER", "LEAF",
 )
 
 # Word characters for splitting a heading. Apostrophes are separators so that
@@ -164,6 +171,8 @@ _DOOR_MARKERS = frozenset({
     # "door". Without it the sheet scored eight header words and was still
     # refused, and the set returned nothing at all.
     "CLOSER", "OPENER",
+    # Both name a door outright -- see HEADER_WORDS.
+    "DOOR NUMBER", "LEAF",
 })
 
 

@@ -428,6 +428,19 @@ def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
                 # one sheet reported "3 of 40 doors were placed".
                 note = (None if (pages or doors)
                         else review.plans(len(found.located), found.door_count))
+                if (pages or doors) and not found.detected:
+                    # A reprocess that found nothing finished as "ready" with
+                    # no word, and the screen said the sheet was updated.
+                    # Caliber's Read again of A0.2 -- a code sheet -- ran for
+                    # 24 minutes and came back empty without saying so.
+                    if pages:
+                        where = ", ".join(s.number or f"page {s.page}"
+                                          for s in found.floor_plans
+                                          if s.page in pages) or "these sheets"
+                        note = (f"No doors were found on {where}. Choose the "
+                                "floor plan sheets to read.")
+                    else:
+                        note = "The doors asked about were not found on the plans."
                 if found.unread:
                     # Said on the job, so the person waiting is told before
                     # they open a sheet: part of it was not read, and the

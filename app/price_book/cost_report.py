@@ -1,7 +1,8 @@
 """The figures in the AI pricing cost and accuracy report, from what was stored.
 
-Inputs are rows as Supabase holds them -- ai_price_calls, ai_prices,
-ai_price_runs -- so the report is reproducible from the database alone. Each
+Inputs are rows as Supabase holds them -- ai_price_calls, project_prices
+(`verified` set from `confirmed`), ai_price_runs -- so the report is
+reproducible from the database alone. Each
 sheet is (header, rows). scripts/ai_price_report.py writes them to xlsx.
 
 Two figures are shares, said here so nobody reads them as measured per item:
