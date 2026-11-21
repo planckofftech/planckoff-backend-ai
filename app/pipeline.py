@@ -242,11 +242,22 @@ def _index_door_pages(doc: PdfDoc) -> tuple[dict[int, str], list[str]]:
     pages: dict[int, str] = {}
     missing: list[str] = []
     try:
+        def door_entries(listed):
+            return [e for e in listed
+                    if schedule_judge.says_door_schedule(e.title)
+                    or schedule_judge.is_schedules_sheet(e.number, e.title)]
+
         entries = drawing_index.read_entries(doc)
-        wanted = [e for e in entries
-                  if schedule_judge.says_door_schedule(e.title)
-                  or schedule_judge.is_schedules_sheet(e.number, e.title)]
-        drawing_index.locate(doc, entries, wanted)
+        wanted = door_entries(entries)
+        start = 1
+        if not wanted:
+            # The first index may be another volume's -- a civil set bound in
+            # front of the architect's. See drawing_index.volume_indexes.
+            for first, later in drawing_index.volume_indexes(doc):
+                if door_entries(later):
+                    entries, wanted, start = later, door_entries(later), first
+                    break
+        drawing_index.locate(doc, entries, wanted, start=start)
         for e in wanted:
             named = schedule_judge.says_door_schedule(e.title)
             if e.page:

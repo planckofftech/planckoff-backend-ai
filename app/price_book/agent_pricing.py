@@ -19,7 +19,7 @@ The second engine beside ai_pricing (step A and step B). Per distinct product:
       unsure      no full price, a price not printed on its page, or the book
                   says the code cannot be ordered as written
 
-A product a person verified is reused, as in ai_pricing. Products run a few at
+A product this project already confirmed is reused, as in ai_pricing. Products run a few at
 a time, and each item's progress -- queued, the step its agent is on, its
 answer -- is written as it moves, so the frontend shows rows as they finish.
 """
@@ -93,9 +93,9 @@ def judge(priced: pricing_agent.Priced, checked: checker_agent.Checked,
     return Judged("options", None, options, priced.needs_from_person[:3])
 
 
-def _row(maker: str, product: page_finder.Product, priced: pricing_agent.Priced,
+def _row(project_id: str, maker: str, product: page_finder.Product, priced: pricing_agent.Priced,
          checked: checker_agent.Checked, judged: Judged, run_id: str | None) -> dict[str, Any]:
-    """The ai_prices row: each option is one answer, the checker's word another."""
+    """The project_prices row: each option is one answer, the checker's word another."""
     model = priced.outcome.model if priced.outcome else ""
     answers = [{"model": model, "label": o.label, "status": o.read.status, "total": o.total,
                 "printed": o.printed, "problems": o.problems, "note": o.label,
@@ -110,7 +110,7 @@ def _row(maker: str, product: page_finder.Product, priced: pricing_agent.Priced,
     agreed = judged.options[0] if judged.verdict == "agreed" else None
     opened = priced.outcome.pages if priced.outcome else []
     return {
-        "manufacturer": maker, "product_key": product.product_key,
+        "project_id": project_id, "manufacturer": maker, "product_key": product.product_key,
         "match_key": product.product_key.split("|")[0], "model": product.model,
         "finish": product.finish, "size": product.size, "name": product.name,
         "description": product.description, "verdict": judged.verdict,
@@ -152,8 +152,10 @@ def _step(turn: agent.Turn) -> str:
 
 
 async def price_project(items: list[Written], run_id: str | None, model: str, check_model: str,
-                        reuse_verified: bool = True) -> dict:
-    """Price every item with the agents and store each product's verdict."""
+                        project_id: str, reuse_confirmed: bool = True) -> dict:
+    """Price every item with the agents and store each product's verdict as the
+    project's own price. As in ai_pricing: the master is not consulted, and a
+    product this project confirmed is reused unless `reuse_confirmed` is false."""
     from app.price_book import makers, store
 
     groups = makers.group(items)
@@ -205,8 +207,9 @@ async def price_project(items: list[Written], run_id: str | None, model: str, ch
                 if checked.outcome:
                     outcomes.append(checked.outcome)
                 judged = await asyncio.to_thread(judge, priced, checked, pages)
-                row = await asyncio.to_thread(store.save_ai_price,
-                                              _row(maker, product, priced, checked, judged, run_id))
+                row = await asyncio.to_thread(store.save_project_price,
+                                              _row(project_id, maker, product, priced, checked, judged, run_id),
+                                              reuse_confirmed)
                 answer = {"status": judged.verdict, "manufacturer": maker, **_public(row),
                           "reasons": judged.reasons, "notes": priced.notes,
                           "needs": priced.needs_from_person, "orderable": priced.orderable}
@@ -226,13 +229,13 @@ async def price_project(items: list[Written], run_id: str | None, model: str, ch
     jobs = []
     for maker, its in per_maker.items():
         products = page_finder.products(its)
-        known = await asyncio.to_thread(store.ai_prices_for, maker, [p.product_key for p in products]) \
-            if reuse_verified else {}
+        known = await asyncio.to_thread(store.project_prices_for, project_id, maker,
+                                        [p.product_key for p in products]) if reuse_confirmed else {}
         todo = []
         for p in products:
             row = known.get(p.product_key)
-            if row and row["verified"]:
-                answer = {"status": "verified", "manufacturer": maker, **_public(row)}
+            if row and row["confirmed"]:
+                answer = {"status": "confirmed", "manufacturer": maker, **_public(row)}
                 for item_id in p.item_ids:
                     answers[item_id] = answer
                 await progress(p.item_ids, "done", answer=answer)

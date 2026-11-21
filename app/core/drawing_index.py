@@ -64,6 +64,8 @@ _CLIP_HEIGHT = 0.60
 # The title starts right after the number: no further away than this many
 # times the number's own height. Further is another column of the sheet.
 _TITLE_REACH = 12.0
+# Two words of one title are this close, in multiples of the text's height.
+_WORD_GAP = 1.5
 # A title is words. A date, an issue mark, a revision number is not.
 _TITLE = re.compile(r"[A-Za-z]{3}")
 # A page's own sheet number is set near the largest size on the page; a
@@ -76,6 +78,10 @@ _NEAR = 12
 # where the list says the sheet is, and this many reads per document in all.
 _OCR_NEAR = 2
 _OCR_BUDGET = 12
+# Later volumes bound into one upload: how many to look for an index at, and
+# how many of each one's first pages may hold it.
+_MAX_VOLUMES = 3
+_VOLUME_COVER_PAGES = 2
 
 
 @dataclass(slots=True)
@@ -108,6 +114,48 @@ def read_entries(doc: PdfDoc) -> list[IndexEntry]:
         if entries:
             return entries
     return []
+
+
+def volume_indexes(doc: PdfDoc) -> list[tuple[int, list[IndexEntry]]]:
+    """The index at the front of each later volume, with the page it is on.
+
+    One upload is often several volumes bound together, and each opens with
+    its own index. Mavano's 84 pages are a civil set of 24 sheets and then the
+    architect's 60: the civil cover lists C0.01 to C5.01 and nothing else, and
+    the architect's cover -- page 25, its list drawn as outlines -- is where
+    "A6.0 DOOR & WINDOW SCHEDULES" is named. Reading only the first index
+    found, the set read as having no door schedule.
+
+    A volume starts where the sheet size changes: two firms rarely export at
+    the same size. Not where the text stops -- tried, and a civil set's sparse
+    sheets each looked like a new volume; Big Spring spent 505 s reading them
+    as images for nothing. Only the first few starts, the first two pages of
+    each, and a page is read as an image only when it has no text layer, as
+    on the first index search: Mavano's architect cover carries 34 text items.
+    """
+    starts: list[int] = []
+    previous = None
+    for index in range(doc.page_count):
+        try:
+            size = tuple(round(v) for v in doc.page_size(index))
+        except Exception:  # noqa: BLE001 - an unreadable page starts nothing
+            continue
+        if previous is not None and index >= _SEARCH_PAGES and size != previous:
+            starts.append(index + 1)
+        previous = size
+        if len(starts) >= _MAX_VOLUMES:
+            break
+
+    found: list[tuple[int, list[IndexEntry]]] = []
+    for start in starts:
+        for page in range(start, min(start + _VOLUME_COVER_PAGES, doc.page_count + 1)):
+            items = doc.text_items(page - 1)
+            entries = _entries_from(items) or (
+                _entries_by_ocr(doc, page) if len(items) < _TEXT_LAYER else [])
+            if entries:
+                found.append((start, entries))
+                break
+    return found
 
 
 def _entries_by_ocr(doc: PdfDoc, page: int) -> list[IndexEntry]:
@@ -178,12 +226,28 @@ def _entry(number, items) -> IndexEntry | None:
               if i is not number
               and abs(i.cy - number.cy) <= height * 0.6
               and 0 <= i.x0 - number.x1 <= height * _TITLE_REACH]
-    for item in sorted(beside, key=lambda i: i.x0):
+    ordered = sorted(beside, key=lambda i: i.x0)
+    for item in ordered:
         text = item.text.strip()
         if _NUMBER.match(text):
             return None
         if _TITLE.search(text):
-            return IndexEntry(number.text.strip(), re.sub(r"\s+", " ", text))
+            # The rest of the title, word by word. Recognised text comes back a
+            # word at a time: Mavano's "A6.0 DOOR & WINDOW SCHEDULES" read as
+            # "A6.0 DOOR", which names no schedule. A word belongs to the title
+            # while it follows at word spacing; the issue marks stand apart.
+            words, last = [text], item
+            line = sorted((i for i in items if i is not item
+                           and abs(i.cy - number.cy) <= height * 0.6
+                           and i.x0 > item.x0), key=lambda i: i.x0)
+            for nxt in line:
+                if (nxt.x0 - last.x1 > height * _WORD_GAP
+                        or _NUMBER.match(nxt.text.strip())):
+                    break
+                words.append(nxt.text.strip())
+                last = nxt
+            return IndexEntry(number.text.strip(),
+                              re.sub(r"\s+", " ", " ".join(words)))
     return None
 
 
@@ -235,12 +299,15 @@ def sheet_number_of(doc: PdfDoc, page: int, *, ocr: bool = True) -> str:
 
 
 def locate(doc: PdfDoc, entries: list[IndexEntry],
-           wanted: list[IndexEntry] | None = None) -> list[IndexEntry]:
+           wanted: list[IndexEntry] | None = None, *,
+           start: int = 1) -> list[IndexEntry]:
     """Put `wanted` entries (default: all) on their pages, by title block.
 
     The list's own order is the first guess -- the k-th sheet listed is near
     page k, give or take the cover sheets -- so a sheet is usually confirmed in
-    one or two reads, and only a sheet out of order costs a search.
+    one or two reads, and only a sheet out of order costs a search. `start` is
+    the page the list's first sheet is on: 1 for a set's own cover, the
+    volume's first page for an index found further in (see `volume_indexes`).
 
     Reading a title block as an image costs seconds a page, so it is spent
     only where the list says the sheet should be -- a few pages either side --
@@ -268,7 +335,7 @@ def locate(doc: PdfDoc, entries: list[IndexEntry],
 
     for entry in (wanted if wanted is not None else entries):
         target = _normal(entry.number)
-        guess = order.get(target, 0) + 1 + offset
+        guess = order.get(target, 0) + start + offset
         near = [guess + d for step in range(_NEAR + 1) for d in ((step, -step) if step else (0,))]
         pages = [p for p in near if 1 <= p <= doc.page_count]
         pages += [p for p in range(1, doc.page_count + 1) if p not in pages]
@@ -276,7 +343,7 @@ def locate(doc: PdfDoc, entries: list[IndexEntry],
             if number_on(page, abs(page - guess) <= _OCR_NEAR) == target:
                 entry.page = page
                 # Sheets after this one are shifted by the same amount.
-                offset = page - (order.get(target, 0) + 1)
+                offset = page - (order.get(target, 0) + start)
                 break
 
     # A sheet drawn as a picture has no number to read, and without OCR none

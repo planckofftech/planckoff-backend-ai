@@ -89,6 +89,7 @@ BOOKS: dict[str, tuple[str, tuple[Reader, ...]]] = {
     "1768868169086-PBB_Price_Book_2026.pdf": ("PBB", _TABLE),
     "PDQ_2026_Price_Book.pdf": ("PDQ", _TABLE),
     "markar_and_pemko_price_book.pdf": ("Pemko", _TABLE),
+    "Pamex-2025-PriceList-effective-09-29-2025.pdf": ("Pamex", _TABLE),
     "Republic_Price_Book_163021.pdf": ("Republic", _TABLE),
     "rockwood_price_book___accessories_2026 (1).pdf": ("Rockwood", _TABLE),
     "rockwood_price_book___architectural_series_2026 (1).pdf": ("Rockwood", _TABLE),

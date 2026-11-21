@@ -56,7 +56,7 @@ async def price_maker(maker: str, books: list[page_finder.Book], items: list[Wri
 
 
 # --------------------------------------------------------------------------- #
-# a project's items: every maker, stored, verified prices reused
+# a project's items: every maker, stored as the project's own prices
 # --------------------------------------------------------------------------- #
 
 def _answer(c: ai_check.Checked) -> dict:
@@ -66,11 +66,11 @@ def _answer(c: ai_check.Checked) -> dict:
             "parts": [{**asdict(p), "extended": p.extended} for p in r.parts]}
 
 
-def _row(maker: str, product: page_finder.Product, found: page_finder.Found,
+def _row(project_id: str, maker: str, product: page_finder.Product, found: page_finder.Found,
          judged: ai_check.Judged, run_id: str | None) -> dict:
     agreed = next((a for a in judged.answers if a.priced), None) if judged.verdict == "agreed" else None
     return {
-        "manufacturer": maker, "product_key": product.product_key,
+        "project_id": project_id, "manufacturer": maker, "product_key": product.product_key,
         "match_key": product.product_key.split("|")[0], "model": product.model,
         "finish": product.finish, "size": product.size, "name": product.name,
         "description": product.description, "verdict": judged.verdict,
@@ -84,12 +84,15 @@ def _row(maker: str, product: page_finder.Product, found: page_finder.Found,
 
 
 async def price_project(items: list[Written], run_id: str | None, model: str, check_model: str,
-                        reuse_verified: bool = True) -> dict:
-    """Price every item with AI, maker by maker, and store each product's verdict.
+                        project_id: str, reuse_confirmed: bool = True) -> dict:
+    """Price every item with AI, maker by maker, and store each product's
+    verdict as the project's own price.
 
-    A product a person has already verified is not read again: it comes back
-    from the table as `verified`. Items whose maker has no loaded or mapped
-    book come back as `not_looked_up`, with the reason.
+    The master is not consulted: pricing with AI reads the book afresh, and the
+    master's prices are what lookup (POST /prices) is for. A product this
+    project already confirmed is not read again unless `reuse_confirmed` is
+    false: it comes back as `confirmed`. Items whose maker has no loaded or
+    mapped book come back as `not_looked_up`, with the reason.
     """
     from app.price_book import makers, store
 
@@ -118,14 +121,14 @@ async def price_project(items: list[Written], run_id: str | None, model: str, ch
     spent: list[dict] = []
     for maker, its in per_maker.items():
         products = page_finder.products(its)
-        known = await asyncio.to_thread(store.ai_prices_for, maker, [p.product_key for p in products]) \
-            if reuse_verified else {}
-        todo = [i for i in its if "|".join(i.product()) not in known or not known["|".join(i.product())]["verified"]]
+        known = await asyncio.to_thread(store.project_prices_for, project_id, maker,
+                                        [p.product_key for p in products]) if reuse_confirmed else {}
+        todo = [i for i in its if "|".join(i.product()) not in known or not known["|".join(i.product())]["confirmed"]]
         for p in products:
             row = known.get(p.product_key)
-            if row and row["verified"]:
+            if row and row["confirmed"]:
                 for item_id in p.item_ids:
-                    answers[item_id] = {"status": "verified", "manufacturer": maker, **_public(row)}
+                    answers[item_id] = {"status": "confirmed", "manufacturer": maker, **_public(row)}
         if not todo:
             continue
         maps = await asyncio.to_thread(store.book_maps, books[maker])
@@ -139,7 +142,8 @@ async def price_project(items: list[Written], run_id: str | None, model: str, ch
         found_by_key = {f.product.key: f for f in priced.found}
         for j in priced.judged:
             f = found_by_key[j.key]
-            row = await asyncio.to_thread(store.save_ai_price, _row(maker, f.product, f, j, run_id))
+            row = await asyncio.to_thread(store.save_project_price,
+                                          _row(project_id, maker, f.product, f, j, run_id), reuse_confirmed)
             for item_id in f.product.item_ids:
                 answers[item_id] = {"status": j.verdict, "manufacturer": maker, **_public(row)}
         for f in priced.found:
@@ -156,10 +160,16 @@ async def price_project(items: list[Written], run_id: str | None, model: str, ch
 
 
 def _public(row: dict) -> dict:
-    """What an item answer shows of a stored AI price."""
-    return {"ai_price_id": row.get("id"),
-            **{k: row.get(k) for k in ("list_price", "verdict", "verified", "parts", "answers",
-                                       "pages", "verified_note")}}
+    """What an item answer shows of a project's stored price.
+
+    `ai_price_id` is the project price's id, what confirm takes; kept under its
+    old name beside `project_price_id`. `verified` is the old name of `confirmed`.
+    """
+    return {"ai_price_id": row.get("id"), "project_price_id": row.get("id"),
+            "master_id": row.get("master_id"), "source": row.get("source", "ai"),
+            "confirmed": bool(row.get("confirmed")), "verified": bool(row.get("confirmed")),
+            "confirmed_note": row.get("confirmed_note", ""),
+            **{k: row.get(k) for k in ("list_price", "verdict", "parts", "answers", "pages")}}
 
 
 # --------------------------------------------------------------------------- #
@@ -230,24 +240,36 @@ def parts_for(row: dict, price: float) -> list[dict] | None:
     return None
 
 
-def as_quote(maker: str, item: Written, quantity: float, row: dict | None) -> dict:
-    """An item's stored AI price in the shape POST /prices has always answered.
+def as_quote(maker: str, item: Written, quantity: float, row: dict | None,
+             master: dict | None = None) -> dict:
+    """An item's price in the shape POST /prices has always answered.
 
-    priced        a person confirmed it
-    needs_review  two models agreed on it, nobody has confirmed it yet: the
-                  price is given, with that said; or the AI could not settle
-                  it and a person has to (no price)
-    not_found     the product has not been priced with AI yet
+    `row` is the project's own price, `master` the master's price of the same
+    product. The project's own price answers when there is one; the master's
+    otherwise (a master price is always confirmed).
+
+    priced        a person confirmed it (on this project, or in the master)
+    needs_review  the project's AI price nobody has confirmed yet: two models
+                  agreed on it (the price is given, with that said), or the AI
+                  could not settle it and a person has to (no price)
+    not_found     no price for the project and none in the master
     """
-    # ai_price_id is what POST /price-books/ai-prices/{id}/confirm takes; null
-    # when the product has no stored AI price to confirm.
+    # ai_price_id / project_price_id is what POST /price-books/ai-prices/{id}/confirm
+    # takes; null when the project has no price of its own to confirm.
+    master_price = float(master["list_price"]) if master else None
     base = {"ai_price_id": row.get("id") if row else None,
+            "project_price_id": row.get("id") if row else None,
+            "master_id": master.get("id") if master else None,
+            "source": (row.get("source") or "ai") if row else ("master" if master else None),
+            "master_price": master_price, "master_changed": False,
             "manufacturer": maker, "model": item.model or item.description, "finish": item.finish,
             "size": item.size, "list_price": None, "extended_price": None, "parts": [],
             "reasons": [], "options": [], "book": "", "effective_date": None}
+    if row is None and master is not None:
+        row = {**master, "confirmed": True}
     if row is None:
         return {**base, "status": "not_found",
-                "reasons": ["Not priced yet: run AI pricing for this project (POST /price-books/ai-price)"]}
+                "reasons": ["No confirmed price yet: price it with AI on a project and confirm it"]}
     if row.get("list_price") is None:
         first = ("The code leaves a choice open; each option below was checked, a person picks one"
                  if row.get("verdict") == "options" else
@@ -261,19 +283,21 @@ def as_quote(maker: str, item: Written, quantity: float, row: dict | None) -> di
              for p in row.get("parts") or []]
     out = {**base, "list_price": price, "extended_price": round(price * quantity, 2), "parts": parts,
            "book": parts[0]["book"] if parts else ""}
-    if row.get("verified"):
-        return {**out, "status": "priced"}
+    if row.get("confirmed"):
+        # The project keeps its own copy; say so when the master has moved since.
+        changed = master_price is not None and abs(master_price - price) >= 0.005
+        return {**out, "status": "priced", "master_changed": changed}
     return {**out, "status": "needs_review",
             "reasons": ["Read by AI and agreed by two models; not yet confirmed by a person"]}
 
 
 def as_suggestion(row: dict) -> dict:
-    """A stored AI price in the shape GET /price-books/search has always answered."""
+    """A master price in the shape GET /price-books/search has always answered."""
     part = (row.get("parts") or [{}])[0]
     page = next((p for p in row.get("pages") or [] if p.get("pdf_page") == part.get("pdf_page")), {})
-    return {"ai_price_id": row.get("id"),
+    return {"ai_price_id": None, "master_id": row.get("id"),
             "model": row.get("model") or row.get("description", ""), "finish": row.get("finish", ""),
             "size": row.get("size", ""), "description": row.get("name") or row.get("description", ""),
             "list_price": float(row["list_price"]), "book": part.get("book", ""),
             "pdf_page": part.get("pdf_page"), "printed_page": page.get("printed_page", ""),
-            "effective_date": None, "verified": bool(row.get("verified"))}
+            "effective_date": None, "verified": True, "confirmed_at": row.get("confirmed_at")}

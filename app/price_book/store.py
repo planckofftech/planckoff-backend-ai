@@ -254,51 +254,137 @@ class DbSource:
 
 
 # --------------------------------------------------------------------------- #
-# prices read by AI, and the runs that read them
+# prices per project, the master every project shares, and the runs
+# (db/035_project_prices.sql)
 # --------------------------------------------------------------------------- #
 
-def ai_prices_for(manufacturer: str, product_keys: list[str]) -> dict[str, dict[str, Any]]:
-    """Stored AI prices of these products, by product key."""
+def project_prices_for(project_id: str, manufacturer: str,
+                       product_keys: list[str]) -> dict[str, dict[str, Any]]:
+    """A project's own prices of these products, by product key."""
     if not product_keys:
         return {}
-    got = (client().table("ai_prices").select("*").eq("manufacturer", manufacturer)
+    got = (client().table("project_prices").select("*").eq("project_id", project_id)
+           .eq("manufacturer", manufacturer).filter("product_key", "in", _any_of(product_keys))
+           .execute().data)
+    return {g["product_key"]: g for g in got}
+
+
+def save_project_price(row: dict[str, Any], keep_confirmed: bool = True) -> dict[str, Any]:
+    """Store what the AI read for a project's product.
+
+    A price the project confirmed is the person's word and is kept unless the
+    run was asked to price confirmed products again (`keep_confirmed` false):
+    then the fresh answer replaces it and the row is unconfirmed until a person
+    confirms it again. The master is never touched here.
+    """
+    db = client()
+    found = (db.table("project_prices").select("*").eq("project_id", row["project_id"])
+             .eq("manufacturer", row["manufacturer"]).eq("product_key", row["product_key"])
+             .execute().data)
+    if found and found[0]["confirmed"] and keep_confirmed:
+        return found[0]
+    now = datetime.now(timezone.utc).isoformat()
+    row = {**row, "source": "ai", "confirmed": False, "confirmed_note": "", "confirmed_at": None,
+           "master_id": None, "updated_at": now}
+    return (db.table("project_prices").upsert(row, on_conflict="project_id,manufacturer,product_key")
+            .execute().data[0])
+
+
+def project_price(price_id: str) -> dict[str, Any] | None:
+    got = client().table("project_prices").select("*").eq("id", price_id).execute().data
+    return got[0] if got else None
+
+
+def project_prices(project_id: str) -> list[dict[str, Any]]:
+    """Every price of a project, by maker and model."""
+    out, start = [], 0
+    while True:
+        got = (client().table("project_prices").select("*").eq("project_id", project_id)
+               .order("manufacturer").order("match_key").range(start, start + _PAGE - 1).execute().data)
+        out.extend(got)
+        if len(got) < _PAGE:
+            return out
+        start += _PAGE
+
+
+def take_from_master(project_id: str, masters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy master prices into a project as its own, confirmed. A product the
+    project already has a price for keeps it."""
+    if not masters:
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [{"project_id": project_id, "source": "master", "verdict": None,
+             **{k: m.get(k) for k in ("manufacturer", "product_key", "match_key", "model", "finish", "size",
+                                      "name", "description", "list_price", "parts", "pages")},
+             "confirmed": True, "confirmed_note": "Taken from the master price list",
+             "confirmed_at": now, "master_id": m["id"], "updated_at": now} for m in masters]
+    return (client().table("project_prices")
+            .upsert(rows, on_conflict="project_id,manufacturer,product_key", ignore_duplicates=True)
+            .execute().data)
+
+
+def use_master(price_id: str, master: dict[str, Any]) -> dict[str, Any]:
+    """Set a project's price to the master's price as it stands now."""
+    now = datetime.now(timezone.utc).isoformat()
+    return (client().table("project_prices").update({
+        "list_price": master["list_price"], "parts": master.get("parts") or [],
+        "pages": master.get("pages") or [], "confirmed": True,
+        "confirmed_note": "Updated to the master price", "confirmed_at": now,
+        "master_id": master["id"], "updated_at": now,
+    }).eq("id", price_id).execute().data[0])
+
+
+def delete_project_price(project_id: str, price_id: str) -> bool:
+    return bool(client().table("project_prices").delete().eq("project_id", project_id)
+                .eq("id", price_id).execute().data)
+
+
+def delete_project_prices(project_id: str) -> int:
+    return len(client().table("project_prices").delete().eq("project_id", project_id).execute().data)
+
+
+def confirm_project_price(price_id: str, list_price: float, note: str,
+                          parts: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """Confirm a project's price and make it the master's, in one transaction.
+
+    {project_price, master, previous_price}; None when there is no such price.
+    """
+    return client().rpc("confirm_project_price", {
+        "p_id": price_id, "p_price": list_price, "p_note": note, "p_parts": parts}).execute().data
+
+
+def master_for(manufacturer: str, product_keys: list[str]) -> dict[str, dict[str, Any]]:
+    """Master prices of these products, by product key."""
+    if not product_keys:
+        return {}
+    got = (client().table("price_master").select("*").eq("manufacturer", manufacturer)
            .filter("product_key", "in", _any_of(product_keys)).execute().data)
     return {g["product_key"]: g for g in got}
 
 
-def save_ai_price(row: dict[str, Any]) -> dict[str, Any]:
-    """Store a product's verdict, replacing an unverified one. A verified price
-    is a person's word and is not overwritten by a later run."""
-    db = client()
-    found = (db.table("ai_prices").select("*").eq("manufacturer", row["manufacturer"])
-             .eq("product_key", row["product_key"]).execute().data)
-    if found and found[0]["verified"]:
-        return found[0]
-    row = {**row, "updated_at": datetime.now(timezone.utc).isoformat()}
-    return db.table("ai_prices").upsert(row, on_conflict="manufacturer,product_key").execute().data[0]
+def search_master(manufacturer: str, prefix: str, limit: int) -> list[dict[str, Any]]:
+    return (client().table("price_master").select("*").eq("manufacturer", manufacturer)
+            .like("match_key", f"{prefix}%").order("match_key").limit(min(limit, _PAGE)).execute().data)
 
 
-def ai_price(price_id: str) -> dict[str, Any] | None:
-    got = client().table("ai_prices").select("*").eq("id", price_id).execute().data
+def master_price(master_id: str) -> dict[str, Any] | None:
+    got = client().table("price_master").select("*").eq("id", master_id).execute().data
     return got[0] if got else None
 
 
-def confirm_ai_price(price_id: str, list_price: float, note: str,
-                     parts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    change: dict[str, Any] = {} if parts is None else {"parts": parts}
-    return (client().table("ai_prices").update({
-        **change, "list_price": list_price, "verified": True, "verified_note": note,
-        "verified_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", price_id).execute().data[0])
+def master_history(manufacturer: str, product_key: str) -> list[dict[str, Any]]:
+    """Every confirmation, edit and removal of a product's master price, newest first."""
+    return (client().table("price_master_history").select("*").eq("manufacturer", manufacturer)
+            .eq("product_key", product_key).order("at", desc=True).limit(_PAGE).execute().data)
 
 
-def search_ai_prices(manufacturer: str, prefix: str, verified_only: bool, limit: int) -> list[dict[str, Any]]:
-    q = (client().table("ai_prices").select("*").eq("manufacturer", manufacturer)
-         .like("match_key", f"{prefix}%"))
-    if verified_only:
-        q = q.eq("verified", True)
-    return q.order("match_key").limit(min(limit, _PAGE)).execute().data
+def edit_master(master_id: str, list_price: float, note: str) -> dict[str, Any] | None:
+    return client().rpc("edit_master_price", {"p_id": master_id, "p_price": list_price,
+                                              "p_note": note}).execute().data
+
+
+def remove_master(master_id: str, note: str) -> dict[str, Any] | None:
+    return client().rpc("remove_master_price", {"p_id": master_id, "p_note": note}).execute().data
 
 
 def start_run(items: list[dict[str, Any]], project_id: str | None) -> str:
@@ -347,13 +433,6 @@ def mapped_books() -> dict[str, list[str]]:
         if name in mapped:
             out.setdefault(maker, []).append(name)
     return out
-
-
-def settled_ai_prices(manufacturer: str, prefix: str, limit: int) -> list[dict[str, Any]]:
-    """AI prices with a price: agreed by two models, or confirmed by a person."""
-    return (client().table("ai_prices").select("*").eq("manufacturer", manufacturer)
-            .like("match_key", f"{prefix}%").not_.is_("list_price", "null")
-            .order("verified", desc=True).order("match_key").limit(min(limit, _PAGE)).execute().data)
 
 
 def guides(file_names: list[str]) -> dict[str, dict[str, Any]]:
