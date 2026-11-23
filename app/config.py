@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     # On Caliber's scanned floor plan it numbered 16 of 26 doors for $0.25,
     # where gemini-2.5-pro numbered 14 for $0.88.
     ai_detect_model: str = "openai/gpt-6.1-terra"
+    # The second model a plan sheet is read with when the first finds none of
+    # the sheet's scheduled doors on it, or under half of those printed there
+    # as text. The answer naming more scheduled doors is kept. Dearer per tile
+    # than the first, so it runs only on the sheets the first could not do.
+    # Empty turns it off.
+    ai_detect_fallback_model: str = "anthropic/claude-opus-5.5"
     # Reading prices from the manufacturers' books, and naming a maker from a
     # schedule's code. Its own setting so models can be tried on price pages
     # (AI-Model-Choice-and-Costs) without moving the other tiers. Empty means
@@ -138,6 +144,16 @@ class Settings(BaseSettings):
     # Page-finder thresholds. Fitted to one document -- see PLAN.md section 8.
     min_header_hits: int = 5
     min_tag_run: int = 8
+
+    # Watching the makers' websites for new price books (app/price_book/watch.py).
+    # The name the watcher gives itself: generic on purpose, nothing about the
+    # company or anyone in it.
+    price_watch_user_agent: str = "PriceBookWatch/1.0"
+    # Seconds between two calls to one site. Price books change a few times a
+    # year; there is no hurry worth being rude for.
+    price_watch_gap_s: float = 3.0
+    # A PDF over this is not downloaded. The largest book loaded is far under it.
+    price_watch_max_mb: float = 300.0
 
     log_level: str = "INFO"
 
