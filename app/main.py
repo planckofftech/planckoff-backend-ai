@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
+from app.api.price_watch import router as price_watch_router
 from app.api.prices import router as prices_router
 from app.api.routes import router
 from app.api.storage import router as storage_router
@@ -56,4 +57,6 @@ app.include_router(router)
 app.include_router(storage_router)
 # Hardware list prices. Reads only what scripts/load_price_book.py stored.
 app.include_router(prices_router)
+# Watching the makers' websites for new editions of those books.
+app.include_router(price_watch_router)
 

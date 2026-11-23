@@ -481,3 +481,105 @@ def run_items(run_id: str) -> list[dict[str, Any]]:
     """A run's items as they stand, in the order they were sent."""
     return (client().table("ai_price_run_items").select("item_id, position, status, step, answer, updated_at")
             .eq("run_id", run_id).order("position").execute().data)
+
+
+# --- watching the makers' websites (app/price_book/watch.py, db/036) ----------
+
+_SOURCE_FIELDS = ("manufacturer", "url", "kind", "link_pattern", "active", "verified", "note")
+
+
+def watch_sources() -> list[dict[str, Any]]:
+    """Every place a price book is looked for, by maker."""
+    return (client().table("price_book_sources").select("*")
+            .order("manufacturer").order("url").execute().data)
+
+
+def watch_source(source_id: str) -> dict[str, Any] | None:
+    got = client().table("price_book_sources").select("*").eq("id", source_id).execute().data
+    return got[0] if got else None
+
+
+def save_source(row: dict[str, Any], source_id: str | None = None) -> dict[str, Any]:
+    """Add a source, or change one. A maker and URL already listed is changed, not doubled."""
+    fields = {k: row[k] for k in _SOURCE_FIELDS if k in row}
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    db = client().table("price_book_sources")
+    if source_id:
+        got = db.update(fields).eq("id", source_id).execute().data
+        if not got:
+            raise KeyError(source_id)
+        return got[0]
+    return db.upsert(fields, on_conflict="manufacturer,url").execute().data[0]
+
+
+def delete_source(source_id: str) -> bool:
+    return bool(client().table("price_book_sources").delete().eq("id", source_id).execute().data)
+
+
+def source_checked(source_id: str, state: dict[str, Any], status: str, detail: str) -> None:
+    client().table("price_book_sources").update({
+        "state": state, "last_status": status, "last_detail": detail[:2000],
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", source_id).execute()
+
+
+def _all(query) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    while True:
+        got = query.range(len(out), len(out) + _PAGE - 1).execute().data
+        out += got
+        if len(got) < _PAGE:
+            return out
+
+
+def known_book_shas() -> set[str]:
+    """Every PDF already seen: a book mapped or loaded, and every file the watcher found before."""
+    db = client()
+    shas = {g["sha256"] for g in _all(db.table("price_book_pages").select("sha256").eq("pdf_page", 1))}
+    shas |= {g["sha256"] for g in _all(db.table("price_books").select("sha256"))}
+    shas |= {g["sha256"] for g in _all(db.table("price_book_updates").select("sha256"))}
+    return {s for s in shas if s}
+
+
+def add_update(row: dict[str, Any]) -> None:
+    """Record a book the watcher found. One file is recorded once, however it was reached."""
+    client().table("price_book_updates").upsert(row, on_conflict="sha256", ignore_duplicates=True).execute()
+
+
+def updates(status: str | None, limit: int) -> list[dict[str, Any]]:
+    query = client().table("price_book_updates").select("*").order("found_at", desc=True).limit(limit)
+    if status:
+        query = query.eq("status", status)
+    return query.execute().data
+
+
+def update_of(update_id: str) -> dict[str, Any] | None:
+    got = client().table("price_book_updates").select("*").eq("id", update_id).execute().data
+    return got[0] if got else None
+
+
+def decide_update(update_id: str, status: str, note: str) -> dict[str, Any] | None:
+    got = client().table("price_book_updates").update({
+        "status": status, "note": note, "decided_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", update_id).execute().data
+    return got[0] if got else None
+
+
+def start_watch_run() -> str:
+    return client().table("price_book_watch_runs").insert({}).execute().data[0]["id"]
+
+
+def finish_watch_run(run_id: str, summary: dict[str, Any] | None, error: str = "") -> None:
+    client().table("price_book_watch_runs").update({
+        "summary": summary, "error": error[:2000], "finished_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", run_id).execute()
+
+
+def watch_run(run_id: str) -> dict[str, Any] | None:
+    got = client().table("price_book_watch_runs").select("*").eq("id", run_id).execute().data
+    return got[0] if got else None
+
+
+def watch_runs(limit: int) -> list[dict[str, Any]]:
+    return (client().table("price_book_watch_runs").select("id, started_at, finished_at, error")
+            .order("started_at", desc=True).limit(limit).execute().data)
