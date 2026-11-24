@@ -26,8 +26,13 @@ HEADER_ALIASES: list[tuple[str, list[str]]] = [
     # their door column that way, and both fell through to guessing the tag
     # from the data. On one of them the guess failed and every row came back
     # with no door number at all.
+    # SYMBOL: MAVANO's A6.0 heads its door numbers -- printed in circles, 1 to 6
+    # -- SYMBOL. Missing it, the door column was a description headed only by
+    # its DOOR band, which the prefix rule took for DOOR NUMBER, and every
+    # door's "number" became "YKK AP INDUSTRIES 35D MEDIUM STILE DOOR".
     ("door_tag", ["#", "NO", "NO.", "NUMBER", "DOOR NUMBER", "MARK", "DOOR NO",
-                  "DOOR NO.", "DOOR #", "TAG", "DOOR MARK", "DR NO"]),
+                  "DOOR NO.", "DOOR #", "TAG", "DOOR MARK", "DR NO",
+                  "SYMBOL", "DOOR SYMBOL", "SYM"]),
     # A schedule names the room a door serves one of two ways. Some give both
     # sides -- FROM and TO -- and some give one, headed LOCATION or ROOM. The
     # single-column kind was unmapped entirely: six of twelve real sets print

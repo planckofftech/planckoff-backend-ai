@@ -82,6 +82,9 @@ MAX_TILES = 250
 # call, and a nearly spent account refused a tile that would have cost cents.
 # A tile lists a few dozen doors at most; this is several times that.
 _MAX_OUTPUT_TOKENS = 16000
+# A schedule longer than this is not listed in the prompt: the list would cost
+# more than it helps on every tile.
+_MAX_LISTED_NUMBERS = 300
 # A first guess at the box, sized from the schedule and centred on the point.
 # It is a placeholder: app/core/swing_finder.py replaces it with the measured
 # extent of the door's own arc wherever there is an arc to measure. It survives
@@ -129,14 +132,21 @@ _WHAT_A_DOOR_IS = (
     "door -- report it as overhead. Report it even if you are unsure which "
     "kind it is; say so with a lower confidence.\n\n"
     "Ignore windows, plumbing fixtures, furniture, casework, curved counters, "
-    "stairs, dimension lines and anything in a circle or hexagon (those are "
-    "reference bubbles, not doors).\n\n"
+    "stairs and dimension lines. A circle, hexagon or other small mark is "
+    "never itself a door -- though a door's number is often printed in one "
+    "beside it (see tag).\n\n"
 )
 
 _COMMON_FIELDS = (
     f"- type: one of {', '.join(_TYPES[:-1])}\n"
     "- swing: left, right, both, or none\n"
-    "- tag: the door number printed beside it, or \"\" if there is none\n"
+    "- tag: the door's number as printed beside it. It is often inside a "
+    "small mark -- circle, hexagon, diamond, square or ellipse. A mark split "
+    "by a line carries the door number in its TOP half and a hardware set "
+    "below it: report only the top. Never a room number (usually boxed under "
+    "a room name), a column grid bubble, or a detail or section reference "
+    "such as 1/A-8 or 3/A5.1. \"\" if no door number is printed for this "
+    "door\n"
     "- confidence: high, medium or low\n\n"
     "Report a door only where you can actually see one. If there are none, "
     "return an empty list.\n\n"
@@ -446,6 +456,15 @@ async def scan_sheet(doc: PdfDoc, page: int,
     settings = get_settings()
     chosen = model or settings.ai_detect_model
     prompt = _POINT_PROMPT if ask_for == "point" else _BOX_PROMPT
+    numbers = sorted(t for t in (spans or {}) if t)
+    if numbers and len(numbers) <= _MAX_LISTED_NUMBERS:
+        # The schedule's own numbers, so a door's tag is read as one of them
+        # rather than as "1/1", "11" or the detail callout beside it --
+        # Christian Brothers' 22 doors came back with none of 1 to 10. Read,
+        # never filled in: a door with no number printed still gets "".
+        prompt += ("\n\nThe door schedule for this set lists these door "
+                   "numbers: " + ", ".join(numbers) + ". A tag you report "
+                   "should be one of them, and only where it is printed.")
     door_px = door_px or settings.ai_door_pixels
     # getattr, not settings.max_tiles_per_sheet, so a server still holding an
     # older Settings falls back to the built-in cap instead of returning a 500.
