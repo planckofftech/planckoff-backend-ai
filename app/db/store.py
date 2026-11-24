@@ -196,15 +196,17 @@ _INTERRUPTED_READ = "Reading this drawing set was interrupted. Please upload it 
 
 
 def create_job(project_id: str, *, kind: str, source_key: str | None,
-               filename: str | None, document_id: str | None = None) -> str:
+               filename: str | None, document_id: str | None = None,
+               status: str = "reading") -> str:
     """Start a job and return its id.
 
     `kind` is read or reread for reading a set, plan for locating its doors on
     the plans. A plan job names its document from the start, so the document
-    can say how its plan pass is going.
+    can say how its plan pass is going. `status` is queued for a plan job that
+    waits its turn behind another on the same document (see `wait_turn`).
     """
     row = {"project_id": project_id, "kind": kind, "source_key": source_key,
-           "filename": filename, "status": "reading", "document_id": document_id}
+           "filename": filename, "status": status, "document_id": document_id}
     return client().table("reading_jobs").insert(row).execute().data[0]["id"]
 
 
@@ -240,7 +242,7 @@ def _as_seen(job: dict[str, Any]) -> dict[str, Any]:
     """
     from datetime import datetime, timezone
 
-    if job["status"] != "reading":
+    if job["status"] not in ("reading", "queued"):
         return job
     limit = PLAN_STALE_MINUTES if job.get("kind") == "plan" else JOB_STALE_MINUTES
     moved = datetime.fromisoformat(job["updated_at"].replace("Z", "+00:00"))
@@ -263,6 +265,70 @@ def latest_job(document_id: str, kind: str) -> dict[str, Any] | None:
              .eq("document_id", document_id).eq("kind", kind)
              .order("created_at", desc=True).limit(1).execute())
     return _as_seen(found.data[0]) if found.data else None
+
+
+# How often a queued plan job looks to see whether its turn has come.
+_TURN_POLL_S = 3.0
+
+
+def _ahead(job_id: str, document_id: str) -> bool:
+    """Is a plan job on this document, started before this one, still going?"""
+    db = client()
+    mine = db.table("reading_jobs").select("created_at").eq("id", job_id).execute().data
+    if not mine:
+        return False
+    others = (db.table("reading_jobs").select("*")
+              .eq("document_id", document_id).eq("kind", "plan")
+              .in_("status", ["queued", "reading"])
+              .lt("created_at", mine[0]["created_at"]).execute().data)
+    for job in others:
+        if _as_seen(job)["status"] in ("queued", "reading"):
+            return True
+    return False
+
+
+async def wait_turn(job_id: str | None, document_id: str) -> None:
+    """Wait until every plan job on this document started before this one has
+    finished, then mark this one reading.
+
+    Plan reads on one document replace each other's boxes, so they run one at
+    a time, in the order asked -- a second request is queued, never refused.
+    The order is kept in the jobs table, so it holds across server instances.
+    A job left behind by a stopped server stops counting once it is stale, so
+    a queue never waits on a dead job for ever.
+    """
+    import asyncio
+    from datetime import datetime, timezone
+
+    if not job_id:
+        return
+    last_touch = 0.0
+    waited = 0.0
+    while True:
+        try:
+            if not await asyncio.to_thread(_ahead, job_id, document_id):
+                break
+        except Exception as exc:  # noqa: BLE001 - a queue must not stop the read
+            log.warning("db: could not check the plan queue: %s", exc)
+            break
+        if waited - last_touch >= 60:
+            # Still waiting, not stuck: keep this job from looking stale.
+            last_touch = waited
+            try:
+                client().table("reading_jobs").update(
+                    {"updated_at": datetime.now(timezone.utc).isoformat()}
+                ).eq("id", job_id).execute()
+            except Exception:  # noqa: BLE001
+                pass
+        await asyncio.sleep(_TURN_POLL_S)
+        waited += _TURN_POLL_S
+    try:
+        client().table("reading_jobs").update(
+            {"status": "reading",
+             "updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", job_id).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("db: could not mark job %s reading: %s", job_id, exc)
 
 
 def stored_keys(project_id: str) -> list[str]:
@@ -736,8 +802,13 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
             return False
         org_id = document.data[0]["org_id"]
 
-        # Read before the wipe: the types people set, to put back below.
+        # Read before the wipe: the types people set, to put back below, and
+        # the boxes people had read by drawing around them, which this pass
+        # does not get to overrule (see app/db/areas.py).
+        from app.db import areas
+
         typed = _types_by_hand(db, document_id)
+        carry = areas.lift(db, document_id)
         db.table("detections").delete().eq("document_id", document_id).execute()
         db.table("sheets").delete().eq("document_id", document_id).execute()
 
@@ -775,6 +846,7 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
             seen.add(key)
             rows.append(_detection_row(org_id, document_id, sheet_id[page], door))
         _keep_types(rows, typed, {v: k for k, v in sheet_id.items()})
+        rows = areas.put_back(db, document_id, carry, rows, sheet_id)
         _insert("detections", rows)
         _record_walls(db, document_id, audit.detected)
         _record_pages(db, document_id, audit.pages)

@@ -18,7 +18,6 @@ from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
 
-from app.ai import pricing
 from app.config import get_settings
 from app.core import (
     table_locator,
@@ -73,6 +72,13 @@ _DRY_RUN: ContextVar[bool] = ContextVar("plan_audit_dry_run", default=False)
 # Below this share of the schedule shown on the sheets found by door number,
 # the sheets named as floor plans are searched as well.
 _FEW_SHOWN = 0.5
+# Fewer door numbers than this found as text on a sheet do not say where its
+# floor plan is or how big its doors are; the model is asked both
+# (app/ai/sheet_survey.py).
+_MIN_MARKS_TO_BOUND = 3
+# The door a printed scale is turned into points with, where the schedule
+# gives no widths: a 3'-0" leaf, the commonest there is.
+_ASSUMED_DOOR_FT = 3.0
 # Floor plans that are pictures, read whole by the vision pass when the text
 # placed too few doors -- see `audit`. More can be asked for by name.
 _MAX_PICTURE_PLANS = 1
@@ -677,6 +683,7 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
     comes from the schedule -- so a pair written "(2)3' - 0"" is drawn twice the
     width of a single.
     """
+    from app.ai.client import AiUpstreamError
     from app.ai.plan_scan import scan_sheet
 
     settings = get_settings()
@@ -756,6 +763,15 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
             + " -- printed only on a sheet that is not being scanned."
         )
 
+    # The second model, for a sheet the first could not read. Its own cache:
+    # the cache is keyed on the tile's picture alone, and sharing it would hand
+    # the second model the first one's answers.
+    fallback = (getattr(settings, "ai_detect_fallback_model", "") or "").strip()
+    if fallback == cost.model:
+        fallback = ""
+    fallback_cache: dict[str, list[dict]] = {}
+    models = [cost.model]
+
     # Measure every sheet before photographing any. The zoom is chosen to put
     # a door near 160 px, and that needs to know how big a door is *here*:
     # assuming 36 pt everywhere put an AT&T door -- drawn at 1/16" scale,
@@ -781,6 +797,24 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
         # Where a person sent back part of a sheet, only that part.
         area = [(r[0] * width, r[1] * height, r[2] * width, r[3] * height)
                 for r in (regions or {}).get(sheet.page, [])] or None
+
+        if len(known) < _MIN_MARKS_TO_BOUND and not cost.dry_run:
+            # Too few door numbers on this sheet are text to say where its plan
+            # is or how big its doors are -- a scan, or lettering drawn as
+            # lines. The model is asked both: where the floor plan is, and the
+            # scale printed for it. See app/ai/sheet_survey.py.
+            survey = await _survey(doc, sheet.page, [cost.model, fallback], cost, models)
+            if survey is not None:
+                drawn = survey.door_pt(median_ft or _ASSUMED_DOOR_FT)
+                if drawn and not radius:
+                    door_pt = drawn
+                    per_foot = survey.inches_per_foot * 72
+                    log.info("plan_scan page %s: printed at %s, so a door is "
+                             "drawn %.0f pt across", sheet.page, survey.scale, door_pt)
+                if survey.box and not area:
+                    # One or two stray numbers are not the plan; the plan is.
+                    known = []
+                    area = [survey.box]
         prepared.append((sheet, width, height, known, radius, door_pt,
                          per_foot, area))
 
@@ -791,6 +825,7 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
     # missing with no way to read just that part. A limit named on the request
     # still holds; the settings' maximum is a backstop against a loop bug.
     settings = get_settings()
+    budget_named = budget_usd is not None
     planned = 0.0
     for sheet, _w, _h, known, _r, door_pt, _pf, area in prepared:
         plan = await scan_sheet(doc, sheet.page, known, door_pt=door_pt,
@@ -802,6 +837,17 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
     log.info("plan_scan: %d sheet(s) priced at $%.2f; this pass may spend $%.2f",
              len(prepared), planned, budget_usd)
 
+    def tally(report) -> None:
+        cost.predicted_usd += report.predicted_usd
+        cost.tiles_planned += report.tiles_planned
+        cost.tiles_sent += report.tiles_sent
+        cost.prompt_tokens += report.prompt_tokens
+        cost.completion_tokens += report.completion_tokens
+        # Each report priced on the model it called; the running total, so the
+        # next sheet's limit counts what this one spent -- the limit is for the
+        # request, not for each sheet.
+        cost.estimated_usd += report.estimated_usd
+
     for sheet, width, height, known, radius, door_pt, per_foot, area in prepared:
         report = await scan_sheet(doc, sheet.page, known,
                                   door_pt=door_pt,
@@ -810,15 +856,62 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
                                   spent_usd=cost.estimated_usd,
                                   regions=area)
         cost.sheets += 1
-        cost.predicted_usd += report.predicted_usd
-        cost.tiles_planned += report.tiles_planned
-        cost.tiles_sent += report.tiles_sent
-        cost.prompt_tokens += report.prompt_tokens
-        cost.completion_tokens += report.completion_tokens
-        # The running total, so the next sheet's limit counts what this one
-        # spent -- the limit is for the request, not for each sheet.
-        cost.estimated_usd = pricing.cost_usd(cost.model, cost.prompt_tokens,
-                                              cost.completion_tokens)
+        tally(report)
+        confirmed, unverified = _shapes_on(
+            doc, sheet, width, height, radius, door_pt, per_foot, report,
+            sightings, spans, by_tag)
+        few_as_text = len(tags_on.get(sheet.page, set())) < _MIN_MARKS_TO_BOUND
+        if few_as_text and not cost.dry_run:
+            confirmed, unverified = await _number_doors(
+                doc, sheet.page, width, height, door_pt, confirmed + unverified,
+                by_tag, cost.model, cost, models)
+
+        # The first model named none of this sheet's scheduled doors, or under
+        # half of the ones printed on it as text: read it again with the second.
+        expected = len(tags_on.get(sheet.page, set()))
+        named = sum(1 for d in confirmed if d.tag)
+        if (fallback and not cost.dry_run
+                and (named == 0 or (expected and named < expected * _FEW_SHOWN))):
+            if not budget_named:
+                # The limit was worked out for the first model only. Widen it
+                # by this sheet at the second model's price, under the same
+                # backstop; a limit named on the request still holds.
+                extra = await scan_sheet(doc, sheet.page, known, door_pt=door_pt,
+                                         spans=spans, dry_run=True, regions=area,
+                                         model=fallback)
+                budget_usd = min(budget_usd + extra.predicted_usd * settings.detect_headroom,
+                                 settings.detect_max_usd)
+            log.info("plan_scan page %s: %s named %d of %d scheduled door(s); "
+                     "reading it again with %s", sheet.page, cost.model, named,
+                     expected, fallback)
+            try:
+                second = await scan_sheet(doc, sheet.page, known,
+                                          door_pt=door_pt, spans=spans,
+                                          cache=fallback_cache,
+                                          budget_usd=budget_usd,
+                                          spent_usd=cost.estimated_usd,
+                                          regions=area, model=fallback)
+            except AiUpstreamError as exc:
+                log.warning("plan_scan page %s: %s could not be reached: %s",
+                            sheet.page, fallback, exc)
+            else:
+                tally(second)
+                if fallback not in models:
+                    models.append(fallback)
+                again, again_unverified = _shapes_on(
+                    doc, sheet, width, height, radius, door_pt, per_foot, second,
+                    sightings, spans, by_tag)
+                if few_as_text:
+                    again, again_unverified = await _number_doors(
+                        doc, sheet.page, width, height, door_pt,
+                        again + again_unverified, by_tag, fallback, cost, models)
+                named_again = sum(1 for d in again if d.tag)
+                log.info("plan_scan page %s: %s named %d scheduled door(s), %s "
+                         "named %d", sheet.page, cost.model, named, fallback,
+                         named_again)
+                if (named_again, len(again)) > (named, len(confirmed)):
+                    report, confirmed, unverified = second, again, again_unverified
+
         warnings.extend(report.warnings)
         if unread is not None:
             unread.extend(
@@ -827,127 +920,6 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
                              x1=t[2] / width, y1=t[3] / height, reason=why)
                 for t, why in report.unread)
 
-        # Measure every shape first, and only then decide which door it is.
-        #
-        # The other way round -- label from the model's approximate point, then
-        # move the box onto the arc -- means the number and the rectangle can
-        # end up describing two different doors, which is exactly what showed
-        # up on screen: a box drawn on one door carrying its neighbour's
-        # number. Nothing is named here until its box has stopped moving.
-        # Every shape's swing settled together, so no two of them are handed
-        # the same arc -- see swing_finder.assign_swings. Doing it one at a
-        # time let a door's swing be taken by its neighbour, and twelve real
-        # doors on one sheet were then reported as not drawn.
-        rank = {"high": 3, "medium": 2, "low": 1, "": 0}
-        seen = sorted(report.doors, key=lambda d: -rank.get(d.confidence, 0))
-        arcs = swing_finder.assign_swings(
-            doc, sheet.page,
-            [(d.cx * width, d.cy * height) for d in seen],
-            expected_r=radius)
-
-        on_sheet: list[DetectedDoorOut] = []
-        read: list[str] = []  # what the model said each one's number was
-
-        for door, arc in zip(seen, arcs):
-            entry = DetectedDoorOut(
-                location=DoorLocation(page=door.page, sheet=sheet.number,
-                                      x0=door.x0, y0=door.y0,
-                                      x1=door.x1, y1=door.y1),
-                type=door.type, swing=door.swing, confidence=door.confidence,
-            )
-            if arc is not None:
-                # The drawing wins over the model, every time. This box is the
-                # measured extent of the arc and its leaf, not a rectangle
-                # guessed from an assumed size around an approximate point.
-                entry.location = DoorLocation(
-                    page=door.page, sheet=sheet.number,
-                    x0=arc.x0 / width, y0=arc.y0 / height,
-                    x1=arc.x1 / width, y1=arc.y1 / height)
-                entry.source = "geometry"
-                # An arc means it swings, whatever the model called it. This
-                # is not a preference, it is the drawing: a pocket door slides
-                # into the wall and a cased opening has no leaf, so neither can
-                # have a quarter-circle struck from a hinge.
-                #
-                # Measured on one sheet: 10 of 33 numbered doors came back
-                # "pocket", "sliding" or "opening, no door" while carrying a
-                # fitted arc at 26.9-27.4 pt against the sheet's own door
-                # radius of 27.0. Every one of them swings.
-                #
-                # How many leaves turn about the opening then says single or
-                # pair -- again counted off the ink, not guessed.
-                leaves = swing_finder.leaves_at(
-                    doc, sheet.page, door.cx * width, door.cy * height,
-                    expected_r=radius, door_pt=door_pt)
-                was = entry.type
-                entry.type = _kind(
-                    leaves, dimensions.parse_feet(
-                        (by_tag.get(door.tag.strip()) or {}).get(
-                            "door_width", "") if door.tag else ""),
-                    per_foot, radius or arc.radius)
-                if was != entry.type:
-                    log.info("plan_scan page %s: door %r called %r by the "
-                             "model, but the drawing has %d swing arc(s) -- "
-                             "recorded as %r", sheet.page, door.tag or "?",
-                             was, leaves, entry.type)
-                # The measurement itself, not just the box it implies. A box
-                # says "a door is about here"; this says which way it opens and
-                # how far, which is what makes it drawable as a door.
-                entry.arc = DoorSwing(
-                    hinge_x=arc.hinge_x, hinge_y=arc.hinge_y,
-                    radius=arc.radius, start_deg=arc.start_deg,
-                    end_deg=arc.end_deg, residual=arc.residual)
-                if per_foot:
-                    entry.measured_width = dimensions.feet_inches(arc.radius / per_foot)
-            else:
-                # No arc. That is not the same as no door: a pocket door, a
-                # slider, a barn door and a roll-up shutter are all drawn as a
-                # panel with no arc at all. One warehouse schedules two thirds
-                # of its doors as sectional overhead, and every one of them was
-                # coming back as "nothing confirms this".
-                #
-                # So look for the panel, sized from that door's own scheduled
-                # width -- an 8'-0" shutter is not the same length of line as a
-                # 3'-0" door, and a sheet carries both.
-                span = spans.get(door.tag.strip()) if door.tag else None
-                leaf_pt = (span * door_pt / _BASE_DOOR_PT) if span else door_pt
-                leaf = swing_finder.find_leaf(
-                    doc, sheet.page, door.cx * width, door.cy * height, leaf_pt)
-                if leaf is not None:
-                    entry.location = DoorLocation(
-                        page=door.page, sheet=sheet.number,
-                        x0=min(leaf.x0, leaf.x1) / width,
-                        y0=min(leaf.y0, leaf.y1) / height,
-                        x1=max(leaf.x0, leaf.x1) / width,
-                        y1=max(leaf.y0, leaf.y1) / height)
-                    entry.source = "geometry"
-                    if per_foot:
-                        entry.measured_width = dimensions.feet_inches(
-                            leaf.length / per_foot)
-                elif swing_finder.swings(door.type):
-                    # It was called a swinging door, and the drawing has
-                    # neither a swing nor a panel. Asserting a door here would
-                    # be inventing one.
-                    continue
-            on_sheet.append(entry)
-            read.append(door.tag)
-
-        _name_doors(on_sheet, read, sightings, sheet.page, width, height, by_tag)
-
-        # A shape with no measured arc AND no schedule number is the model's
-        # word and nothing else. Neither the drawing nor the schedule says a
-        # door is there, and there is no way to check it.
-        #
-        # Only the types that have no arc to find can reach this point --
-        # openings, pockets, sliders -- so the geometry gate never applied to
-        # them and they were drawn on the sheet as confidently as a measured
-        # door. On one real plan that put red boxes labelled "? opening" on
-        # walls and dimension lines and a "? pocket" on a structural column.
-        #
-        # A door that is not there is worse than a door we missed: it gets
-        # priced, and the estimator stops trusting the whole report. So these
-        # are counted and named, not shown.
-        confirmed, unverified = _confirmed(on_sheet)
         if unverified:
             kinds = sorted({d.type or "unknown" for d in unverified})
             warnings.append(
@@ -960,8 +932,8 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
 
     found = _one_per_door(found)
 
-    cost.estimated_usd = round(
-        pricing.cost_usd(cost.model, cost.prompt_tokens, cost.completion_tokens), 4)
+    cost.model = ", ".join(models)
+    cost.estimated_usd = round(cost.estimated_usd, 4)
     cost.predicted_usd = round(cost.predicted_usd, 4)
     if unread and not cost.dry_run:
         sheets_left = sorted({u.sheet or f"p{u.page}" for u in unread})
@@ -970,6 +942,192 @@ async def _detect(doc: PdfDoc, plans, sightings, rows, sizes,
             "so doors there may be missing. They are listed as unread and can be "
             "read on their own.")
     return found, cost, warnings
+
+
+async def _survey(doc: PdfDoc, page: int, models: list[str], cost: ScanCost,
+                  used: list[str]):
+    """Ask the detect model where this sheet's floor plan is and its scale,
+    then the fallback if the first could say neither. Its cost is the pass's."""
+    from app.ai.sheet_survey import survey_sheet
+
+    for model in [m for m in models if m]:
+        survey = await survey_sheet(doc, page, model)
+        cost.prompt_tokens += survey.prompt_tokens
+        cost.completion_tokens += survey.completion_tokens
+        cost.estimated_usd += survey.estimated_usd
+        if survey.prompt_tokens and model not in used:
+            used.append(model)
+        if survey.box or survey.inches_per_foot:
+            return survey
+    return None
+
+
+async def _number_doors(doc: PdfDoc, page: int, width: float, height: float,
+                        door_pt: float, doors: list[DetectedDoorOut],
+                        by_tag: dict, model: str, cost: ScanCost, used: list[str]
+                        ) -> tuple[list[DetectedDoorOut], list[DetectedDoorOut]]:
+    """Read the number of each door still without one, a door at a time, and
+    split them again into (shown, withheld). See app/ai/door_numbers.py.
+
+    The same terms as every other naming: a scheduled number, not already
+    given on this sheet, read for one door alone -- two doors read as the same
+    number both stay blank."""
+    from app.ai.door_numbers import read_numbers
+
+    blank = [d for d in doors if not d.tag]
+    taken = {d.tag for d in doors if d.tag}
+    numbers = sorted(t for t in by_tag if t and t not in taken)
+    if blank and numbers:
+        centres = [((d.location.x0 + d.location.x1) / 2 * width,
+                    (d.location.y0 + d.location.y1) / 2 * height) for d in blank]
+        tags, reading = await read_numbers(doc, page, centres, door_pt, numbers, model)
+        cost.prompt_tokens += reading.prompt_tokens
+        cost.completion_tokens += reading.completion_tokens
+        cost.estimated_usd += reading.estimated_usd
+        if reading.asked and model not in used:
+            used.append(model)
+        counts = Counter(t for t in tags if t)
+        for door, tag in zip(blank, tags):
+            if tag and counts[tag] == 1:
+                door.tag = tag
+                door.schedule = by_tag.get(tag, {})
+    return _confirmed(doors)
+
+
+def _shapes_on(doc: PdfDoc, sheet, width: float, height: float,
+               radius: float | None, door_pt: float, per_foot: float | None,
+               report, sightings, spans: dict, by_tag: dict
+               ) -> tuple[list[DetectedDoorOut], list[DetectedDoorOut]]:
+    """The doors one model's reading of a sheet comes to, measured against the
+    drawing and named from the schedule. Returns (shown, withheld)."""
+    # Measure every shape first, and only then decide which door it is.
+    #
+    # The other way round -- label from the model's approximate point, then
+    # move the box onto the arc -- means the number and the rectangle can
+    # end up describing two different doors, which is exactly what showed
+    # up on screen: a box drawn on one door carrying its neighbour's
+    # number. Nothing is named here until its box has stopped moving.
+    # Every shape's swing settled together, so no two of them are handed
+    # the same arc -- see swing_finder.assign_swings. Doing it one at a
+    # time let a door's swing be taken by its neighbour, and twelve real
+    # doors on one sheet were then reported as not drawn.
+    rank = {"high": 3, "medium": 2, "low": 1, "": 0}
+    seen = sorted(report.doors, key=lambda d: -rank.get(d.confidence, 0))
+    arcs = swing_finder.assign_swings(
+        doc, sheet.page,
+        [(d.cx * width, d.cy * height) for d in seen],
+        expected_r=radius)
+
+    on_sheet: list[DetectedDoorOut] = []
+    read: list[str] = []  # what the model said each one's number was
+
+    for door, arc in zip(seen, arcs):
+        entry = DetectedDoorOut(
+            location=DoorLocation(page=door.page, sheet=sheet.number,
+                                  x0=door.x0, y0=door.y0,
+                                  x1=door.x1, y1=door.y1),
+            type=door.type, swing=door.swing, confidence=door.confidence,
+        )
+        if arc is not None:
+            # The drawing wins over the model, every time. This box is the
+            # measured extent of the arc and its leaf, not a rectangle
+            # guessed from an assumed size around an approximate point.
+            entry.location = DoorLocation(
+                page=door.page, sheet=sheet.number,
+                x0=arc.x0 / width, y0=arc.y0 / height,
+                x1=arc.x1 / width, y1=arc.y1 / height)
+            entry.source = "geometry"
+            # An arc means it swings, whatever the model called it. This
+            # is not a preference, it is the drawing: a pocket door slides
+            # into the wall and a cased opening has no leaf, so neither can
+            # have a quarter-circle struck from a hinge.
+            #
+            # Measured on one sheet: 10 of 33 numbered doors came back
+            # "pocket", "sliding" or "opening, no door" while carrying a
+            # fitted arc at 26.9-27.4 pt against the sheet's own door
+            # radius of 27.0. Every one of them swings.
+            #
+            # How many leaves turn about the opening then says single or
+            # pair -- again counted off the ink, not guessed.
+            leaves = swing_finder.leaves_at(
+                doc, sheet.page, door.cx * width, door.cy * height,
+                expected_r=radius, door_pt=door_pt)
+            was = entry.type
+            entry.type = _kind(
+                leaves, dimensions.parse_feet(
+                    (by_tag.get(door.tag.strip()) or {}).get(
+                        "door_width", "") if door.tag else ""),
+                per_foot, radius or arc.radius)
+            if was != entry.type:
+                log.info("plan_scan page %s: door %r called %r by the "
+                         "model, but the drawing has %d swing arc(s) -- "
+                         "recorded as %r", sheet.page, door.tag or "?",
+                         was, leaves, entry.type)
+            # The measurement itself, not just the box it implies. A box
+            # says "a door is about here"; this says which way it opens and
+            # how far, which is what makes it drawable as a door.
+            entry.arc = DoorSwing(
+                hinge_x=arc.hinge_x, hinge_y=arc.hinge_y,
+                radius=arc.radius, start_deg=arc.start_deg,
+                end_deg=arc.end_deg, residual=arc.residual)
+            if per_foot:
+                entry.measured_width = dimensions.feet_inches(arc.radius / per_foot)
+        else:
+            # No arc. That is not the same as no door: a pocket door, a
+            # slider, a barn door and a roll-up shutter are all drawn as a
+            # panel with no arc at all. One warehouse schedules two thirds
+            # of its doors as sectional overhead, and every one of them was
+            # coming back as "nothing confirms this".
+            #
+            # So look for the panel, sized from that door's own scheduled
+            # width -- an 8'-0" shutter is not the same length of line as a
+            # 3'-0" door, and a sheet carries both.
+            span = spans.get(door.tag.strip()) if door.tag else None
+            leaf_pt = (span * door_pt / _BASE_DOOR_PT) if span else door_pt
+            leaf = swing_finder.find_leaf(
+                doc, sheet.page, door.cx * width, door.cy * height, leaf_pt)
+            if leaf is not None:
+                entry.location = DoorLocation(
+                    page=door.page, sheet=sheet.number,
+                    x0=min(leaf.x0, leaf.x1) / width,
+                    y0=min(leaf.y0, leaf.y1) / height,
+                    x1=max(leaf.x0, leaf.x1) / width,
+                    y1=max(leaf.y0, leaf.y1) / height)
+                entry.source = "geometry"
+                if per_foot:
+                    entry.measured_width = dimensions.feet_inches(
+                        leaf.length / per_foot)
+            elif swing_finder.swings(door.type) and radius:
+                # It was called a swinging door, and the drawing has
+                # neither a swing nor a panel. Asserting a door here would
+                # be inventing one.
+                #
+                # Only where the sheet draws door arcs at all. A scanned plan
+                # is a picture with no arc in it to find, and holding every
+                # door to one threw away all the model saw: the scan was paid
+                # for and came back empty. There the model's door stands, and
+                # `_confirmed` still shows it only if it carries a scheduled
+                # door's number.
+                continue
+        on_sheet.append(entry)
+        read.append(door.tag)
+
+    _name_doors(on_sheet, read, sightings, sheet.page, width, height, by_tag)
+
+    # A shape with no measured arc AND no schedule number is the model's
+    # word and nothing else. Neither the drawing nor the schedule says a
+    # door is there, and there is no way to check it.
+    #
+    # Only the types that have no arc to find can reach this point --
+    # openings, pockets, sliders -- so the geometry gate never applied to
+    # them and they were drawn on the sheet as confidently as a measured
+    # door. On one real plan that put red boxes labelled "? opening" on
+    # walls and dimension lines and a "? pocket" on a structural column.
+    #
+    # A door that is not there is worse than a door we missed: it gets
+    # priced, and the estimator stops trusting the whole report. So these
+    # are counted and named, not shown.
+    return _confirmed(on_sheet)
 
 
 def _name_doors(doors: list[DetectedDoorOut], read: list[str], sightings,
@@ -1006,9 +1164,28 @@ def _name_doors(doors: list[DetectedDoorOut], read: list[str], sightings,
                 doors[index].tag = tag
                 doors[index].schedule = by_tag.get(tag, {})
         return
-    for index, tag in door_match.assign(boxes, read, tags).items():
+    assigned = door_match.assign(boxes, read, tags)
+    for index, tag in assigned.items():
         doors[index].tag = tag
         doors[index].schedule = by_tag.get(tag, {})
+    if len(tags) >= _MIN_MARKS_TO_BOUND:
+        return
+    # One or two numbers on this sheet are text and the rest are not: the
+    # matching above can only name the doors beside those. Christian Brothers'
+    # A-2 prints one stray "1" as text, and 16 doors found on it were named
+    # nothing because of it -- the model's reading was never used, as it is on
+    # a sheet with no text at all. Use it for the rest, on the same terms: a
+    # scheduled number, not already given, read for this shape alone.
+    taken = set(assigned.values())
+    said = [(r or "").strip() for r in read]
+    counts = Counter(t for t in said if t)
+    for index, tag in enumerate(said):
+        if (index in assigned or index >= len(doors) or tag in taken
+                or tag not in by_tag or counts[tag] != 1):
+            continue
+        doors[index].tag = tag
+        doors[index].schedule = by_tag.get(tag, {})
+        taken.add(tag)
 
 
 def _confirmed(doors: list[DetectedDoorOut]

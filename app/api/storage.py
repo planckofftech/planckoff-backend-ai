@@ -405,6 +405,10 @@ def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
         nonlocal owned
         started = time.perf_counter()
         try:
+            # Plan reads on one document replace each other's boxes: one at
+            # a time, in the order asked.
+            await store.wait_turn(job_id, document_id)
+            started = time.perf_counter()
             if owned is None:
                 owned = await asyncio.to_thread(files.fetch, key)
             by_page: dict[int, list[tuple[float, float, float, float]]] = {}
@@ -1329,6 +1333,7 @@ async def reprocess_document(
     stays removed.
 
     Always a job: answers at once with a plan job id; poll GET /jobs/{job_id}.
+    Asked while another plan read on the set is running, it waits its turn.
     """
     regions = [r for r in body.regions
                if 0 <= r.x0 < r.x1 <= 1 and 0 <= r.y0 < r.y1 <= 1]
@@ -1394,13 +1399,6 @@ async def reprocess_document(
         raise HTTPException(
             status_code=422,
             detail=f"Not in this schedule: {', '.join(unknown)}.")
-
-    running = store.latest_job(document_id, "plan")
-    if running and running["status"] == "reading":
-        raise HTTPException(
-            status_code=409,
-            detail="The plans of this set are already being read. Try again "
-                   "when that has finished.")
 
     stored_pages = (db.table("schedules").select("page")
                     .eq("document_id", document_id).order("page").execute().data)
