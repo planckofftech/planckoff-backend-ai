@@ -16,6 +16,8 @@
 --     `replaced` is every detected box this read took away, kept whole so
 --     undo can put them back.
 --     status: queued | reading | ready | failed | undone
+--     `doors` are the door numbers chosen, or empty for every door in the
+--     boxes. With doors chosen, only those doors' boxes are replaced.
 --
 -- detections.area_id
 --     The area read a box came from. Such a box is a person's request, paid
@@ -54,3 +56,8 @@ alter table detections
 
 create index if not exists detections_by_area
     on detections (area_id) where area_id is not null;
+
+-- Added after the table was first written: safe to run this file again
+-- where it already ran.
+alter table area_reads
+    add column if not exists doors text[] not null default '{}';

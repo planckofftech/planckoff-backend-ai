@@ -45,9 +45,11 @@ def _box(row: dict) -> tuple[float, float, float, float]:
 # --------------------------------------------------------------------------- #
 
 def create(document_id: str, drawn: list[dict], *, created_by: str | None,
-           job_id: str | None) -> dict[str, Any]:
+           job_id: str | None, doors: list[str] | None = None) -> dict[str, Any]:
     row = {"document_id": document_id, "drawn": drawn, "status": "queued",
            "created_by": created_by, "job_id": job_id}
+    if doors:
+        row["doors"] = doors
     return client().table("area_reads").insert(row).execute().data[0]
 
 
@@ -90,13 +92,16 @@ def _active(db, document_id: str) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 def save(document_id: str, area_id: str, audit: PlanAudit,
-         plans: list[AreaPlan]) -> dict[str, Any] | None:
+         plans: list[AreaPlan], *, doors: list[str] | None = None
+         ) -> dict[str, Any] | None:
     """Store what an area read found, replacing only what answers the drawing.
 
-    Replaced: every detected box on those parts that answers the drawing, and
-    any other box of the same door on the same sheet (one row per door per
-    sheet). A box a person placed or removed by hand stands as it is.
+    Replaced: every detected box on those parts that answers the drawing --
+    only the chosen doors' boxes, where `doors` were chosen -- and any other
+    box of the same door on the same sheet (one row per door per sheet). A box
+    a person placed or removed by hand stands as it is.
     """
+    chosen = set(doors or [])
     try:
         db = client()
         document = (db.table("documents").select("id, org_id, project_id")
@@ -146,7 +151,8 @@ def save(document_id: str, area_id: str, audit: PlanAudit,
                    .eq("document_id", document_id).execute().data)
         new_tags = {(r["sheet_id"], r["door_tag"]) for r in rows if r["door_tag"]}
         replaced = [d for d in current
-                    if answers(page_of.get(d["sheet_id"], -1), _box(d), plans)
+                    if (answers(page_of.get(d["sheet_id"], -1), _box(d), plans)
+                        and (not chosen or d.get("door_tag") in chosen))
                     or (d.get("door_tag")
                         and (d["sheet_id"], d["door_tag"]) in new_tags)]
         gone = {d["id"] for d in replaced}
@@ -238,7 +244,9 @@ def lift(db, document_id: str) -> CarryOver:
     for r in rows:
         r["page"] = by_id.get(r["sheet_id"])
     rows = [r for r in rows if r["page"] is not None]
-    plans = [p for a in areas for p in _plans(a)]
+    # An area read of chosen doors owns those doors' boxes, which the door
+    # number already keeps; only a read of every door owns the whole area.
+    plans = [p for a in areas if not a.get("doors") for p in _plans(a)]
     return CarryOver(rows, plans, sheets)
 
 
