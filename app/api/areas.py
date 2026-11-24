@@ -43,6 +43,7 @@ _PAGES_PER_PASS = 10
 # What a person is told. What happened, never why.
 _FAILED = "Reading this area failed. Please try again."
 _NOTHING = "No doors were found in this area."
+_NOT_FOUND = "The doors chosen were not found in this area."
 
 
 class DrawnArea(BaseModel):
@@ -61,6 +62,11 @@ class AreaRequest(BaseModel):
         min_length=1,
         description="The boxes drawn. Several at once are read together; "
         "boxes that overlap or touch are read once.")
+    doors: list[str] = Field(
+        default_factory=list,
+        description="Door numbers to read in the boxes, from the schedule. "
+        "Left out, every door in them is read. Given, only those doors' boxes "
+        "in the area are replaced; every other box there stays.")
     budget_usd: float | None = Field(None, gt=0, description="Ceiling for this read")
 
 
@@ -117,6 +123,13 @@ async def read_areas(document_id: str, body: AreaRequest,
             status_code=422,
             detail="This set has no door schedule read yet. Read the schedule "
                    "first, then the doors on the plans.")
+    doors = list(dict.fromkeys(t.strip() for t in body.doors if t and t.strip()))
+    known = {r.door_tag for r in rows if r.door_tag}
+    unknown = [t for t in doors if t not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Not in this schedule: {', '.join(unknown)}.")
 
     drawn = [{"page": a.page, "box": list(normalise(a.x0, a.y0, a.x1, a.y1))}
              for a in body.areas]
@@ -129,7 +142,7 @@ async def read_areas(document_id: str, body: AreaRequest,
         log.warning("area job not recorded for %s: %s", document_id, exc)
     try:
         area = areas.create(document_id, drawn, created_by=caller.user_id,
-                            job_id=job_id)
+                            job_id=job_id, doors=doors)
     except Exception as exc:  # noqa: BLE001
         log.error("area read not recorded for %s: %s", document_id, exc)
         if job_id:
@@ -142,10 +155,11 @@ async def read_areas(document_id: str, body: AreaRequest,
                     .eq("document_id", document_id).order("page").execute().data)
     schedule_page = stored_pages[0]["page"] if stored_pages else 0
     _read_later(area["id"], document_id, key, rows, schedule_page, job_id,
-                drawn, body.budget_usd)
+                drawn, body.budget_usd, doors)
     return JSONResponse(status_code=status.HTTP_202_ACCEPTED,
                         content={"area_id": area["id"], "job_id": job_id,
-                                 "status": "queued", "drawn": drawn})
+                                 "status": "queued", "drawn": drawn,
+                                 "doors": doors})
 
 
 def _sizes(path, pages: list[int]) -> dict[int, tuple[float, float]]:
@@ -155,7 +169,7 @@ def _sizes(path, pages: list[int]) -> dict[int, tuple[float, float]]:
 
 def _read_later(area_id: str, document_id: str, key: str, rows, schedule_page: int,
                 job_id: str | None, drawn: list[dict],
-                budget_usd: float | None) -> None:
+                budget_usd: float | None, doors: list[str] | None = None) -> None:
     """Read the area after the request has been answered, and record how it
     went on the area and its job."""
 
@@ -204,21 +218,26 @@ def _read_later(area_id: str, document_id: str, key: str, rows, schedule_page: i
                 part = await in_worker(audit(path, rows=rows, detect=True,
                                              budget_usd=budget_usd,
                                              schedule_page=schedule_page,
-                                             pages=chunk, regions=regions))
+                                             pages=chunk, doors=set(doors or []) or None,
+                                             regions=regions))
                 result.floor_plans += part.floor_plans
                 result.detected += part.detected
                 result.unread += part.unread
 
+            if doors:
+                # Only the doors asked for are an answer to this request.
+                result.detected = [d for d in result.detected if d.tag in doors]
             result.detected = keep(result.detected, plans)
             if (areas.get(area_id) or {}).get("status") == "undone":
                 # Undone while it was being read: nothing to put on the sheet.
                 finish("undone", None, 0)
                 return
-            saved = areas.save(document_id, area_id, result, plans)
+            saved = areas.save(document_id, area_id, result, plans, doors=doors)
             if saved is None:
                 finish("failed", _FAILED, None)
                 return
-            note = None if result.detected else _NOTHING
+            note = None if result.detected else (
+                _NOT_FOUND if doors else _NOTHING)
             if result.unread:
                 left = ("Part of this area could not be read; doors there may "
                         "be missing. Draw around it again to finish it.")
