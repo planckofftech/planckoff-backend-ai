@@ -271,14 +271,15 @@ def latest_job(document_id: str, kind: str) -> dict[str, Any] | None:
 _TURN_POLL_S = 3.0
 
 
-def _ahead(job_id: str, document_id: str) -> bool:
-    """Is a plan job on this document, started before this one, still going?"""
+def _ahead(job_id: str, document_id: str, kind: str = "plan") -> bool:
+    """Is a job of this kind on this document, started before this one, still
+    going?"""
     db = client()
     mine = db.table("reading_jobs").select("created_at").eq("id", job_id).execute().data
     if not mine:
         return False
     others = (db.table("reading_jobs").select("*")
-              .eq("document_id", document_id).eq("kind", "plan")
+              .eq("document_id", document_id).eq("kind", kind)
               .in_("status", ["queued", "reading"])
               .lt("created_at", mine[0]["created_at"]).execute().data)
     for job in others:
@@ -287,9 +288,10 @@ def _ahead(job_id: str, document_id: str) -> bool:
     return False
 
 
-async def wait_turn(job_id: str | None, document_id: str) -> None:
-    """Wait until every plan job on this document started before this one has
-    finished, then mark this one reading.
+async def wait_turn(job_id: str | None, document_id: str, kind: str = "plan") -> None:
+    """Wait until every job of this kind on this document started before this
+    one has finished, then mark this one reading. Schedule area reads queue
+    the same way, among themselves (kind "schedule_area").
 
     Plan reads on one document replace each other's boxes, so they run one at
     a time, in the order asked -- a second request is queued, never refused.
@@ -306,7 +308,7 @@ async def wait_turn(job_id: str | None, document_id: str) -> None:
     waited = 0.0
     while True:
         try:
-            if not await asyncio.to_thread(_ahead, job_id, document_id):
+            if not await asyncio.to_thread(_ahead, job_id, document_id, kind):
                 break
         except Exception as exc:  # noqa: BLE001 - a queue must not stop the read
             log.warning("db: could not check the plan queue: %s", exc)
@@ -618,6 +620,11 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
             _insert("doors", restored)
             log.info("db: kept %d door(s) found on the drawing rather than in "
                      "the schedule", len(restored))
+
+        # Tables a person drew around and had read are their request, not a
+        # guess: the re-read above replaced every door, so put them back.
+        from app.db import schedule_areas
+        schedule_areas.reapply(document_id)
 
         if repeated:
             log.warning("db: %d door number(s) appear twice and were stored "
