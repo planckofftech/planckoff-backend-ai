@@ -68,7 +68,7 @@ def join(items: list[TextItem], tags: set[str]) -> list[TextItem]:
             x0=min(number.x0, best.x0), y0=number.y0,
             x1=max(number.x1, best.x1), y1=best.y1,
             text=text + best.text.strip(), size=number.size,
-            horizontal=number.horizontal))
+            horizontal=number.horizontal, font=number.font, color=number.color))
     if not joined:
         return items
     return [i for i in items if id(i) not in used] + joined

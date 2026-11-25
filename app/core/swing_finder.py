@@ -99,6 +99,20 @@ _LEAF_MATCH = 0.20
 # Two fitted hinges this close, in points, are the same arc found twice. Well
 # under the ~36 pt gap between neighbouring doors on a real plan.
 _HINGE_TOL = 3.0
+# Inside a group of touching lines that is not one arc as a whole, a run keeps
+# going while each line bends no more than this into the next. A door swing
+# flattened from one bezier bends 22.5 degrees a step; a leaf meets its arc,
+# and a jamb its wall, at a right angle.
+_RUN_TURN = 35.0
+# A leaf starts this close to the hinge, as a fraction of the radius (a door
+# drawn as a thin panel starts a panel's thickness off it), and points within
+# this many degrees of one end of the arc.
+_LEAF_AT_HINGE = 0.15
+_LEAF_ANGLE = 12.0
+# Degrees of a circle with ink on them at which an arc is a piece of a ring --
+# grid bubble, keynote, turning circle -- and not a swing. A swing inks 90, a
+# double-acting door 180, plus a few steps where walls cross the circle.
+_RING_MAX = 230.0
 
 
 @dataclass(slots=True)
@@ -154,10 +168,21 @@ def _fit_circle(points: list[tuple[float, float]]
     return cx, cy, radius, residual
 
 
+def _key(p: tuple[float, float]) -> tuple[int, int]:
+    return (round(p[0] / _JOIN_TOL), round(p[1] / _JOIN_TOL))
+
+
 def _chains(segments: list[tuple[float, float, float, float]]
             ) -> list[list[tuple[float, float]]]:
     """Group segments that touch end to end, and return each group's points."""
-    key = lambda p: (round(p[0] / _JOIN_TOL), round(p[1] / _JOIN_TOL))
+    return [sorted({p for i in group for p in ((segments[i][0], segments[i][1]),
+                                               (segments[i][2], segments[i][3]))})
+            for group in _groups(segments)]
+
+
+def _groups(segments: list[tuple[float, float, float, float]]) -> list[list[int]]:
+    """Segments that touch end to end, as groups of indices."""
+    key = _key
     touching: dict[tuple[int, int], list[int]] = defaultdict(list)
     ends = [((s[0], s[1]), (s[2], s[3])) for s in segments]
     for index, (a, b) in enumerate(ends):
@@ -165,7 +190,7 @@ def _chains(segments: list[tuple[float, float, float, float]]
         touching[key(b)].append(index)
 
     seen: set[int] = set()
-    out: list[list[tuple[float, float]]] = []
+    out: list[list[int]] = []
     for start in range(len(ends)):
         if start in seen:
             continue
@@ -181,8 +206,122 @@ def _chains(segments: list[tuple[float, float, float, float]]
                     if other not in seen:
                         stack.append(other)
         if len(group) >= _MIN_CHAIN:
-            out.append(sorted({p for i in group for p in ends[i]}))
+            out.append(group)
     return out
+
+
+def _curved_runs(segments: list[tuple[float, float, float, float]],
+                 group: list[int]) -> list[list[tuple[float, float]]]:
+    """The smooth runs inside a group that is not one arc as a whole.
+
+    A door swing is often drawn touching its own leaf and the jamb, so the
+    group it belongs to is arc + leaf + wall, and a circle fitted to all of it
+    fits nothing: on one set every door swing was lost that way, and the only
+    "arcs" left on the sheet were the rounded corners of a dashed line -- which
+    then set the sheet's door size. Cut the group where three lines meet or the
+    line turns sharply, and each smooth run is judged on its own.
+    """
+    ends = {i: ((segments[i][0], segments[i][1]), (segments[i][2], segments[i][3]))
+            for i in group}
+    at: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for i, (a, b) in ends.items():
+        at[_key(a)].append(i)
+        at[_key(b)].append(i)
+
+    def heading(i: int, start: tuple[float, float]) -> float:
+        a, b = ends[i]
+        if _key(a) != _key(start):
+            a, b = b, a
+        return math.atan2(b[1] - a[1], b[0] - a[0])
+
+    def other_end(i: int, p: tuple[float, float]) -> tuple[float, float]:
+        a, b = ends[i]
+        return b if _key(a) == _key(p) else a
+
+    def smooth(i: int, j: int, p: tuple[float, float]) -> bool:
+        """Do i (arriving at p) and j (leaving p) bend gently into each other?"""
+        arrive = heading(i, other_end(i, p))
+        leave = heading(j, p)
+        turn = abs((math.degrees(leave - arrive) + 180) % 360 - 180)
+        return turn <= _RUN_TURN
+
+    def onward(i: int, p: tuple[float, float]) -> int | None:
+        nxt = [j for j in at[_key(p)] if j != i]
+        if len(nxt) == 1 and len(at[_key(p)]) == 2 and smooth(i, nxt[0], p):
+            return nxt[0]
+        return None
+
+    used: set[int] = set()
+    runs: list[list[tuple[float, float]]] = []
+    for first in group:
+        if first in used:
+            continue
+        used.add(first)
+        a, b = ends[first]
+        path = [a, b]
+        for forward in (True, False):
+            i, p = first, (path[-1] if forward else path[0])
+            while True:
+                j = onward(i, p)
+                if j is None or j in used:
+                    break
+                used.add(j)
+                p = other_end(j, p)
+                if forward:
+                    path.append(p)
+                else:
+                    path.insert(0, p)
+                i = j
+        if len(path) >= _MIN_CHAIN + 1:
+            runs.append(path)
+    return runs
+
+
+def _has_leaf(segments: list[tuple[float, float, float, float]], arc: Swing) -> bool:
+    """Is the door drawn: a straight line from the hinge, about a leaf long,
+    pointing at one end of the arc?"""
+    r = arc.radius
+    near = max(r * _LEAF_AT_HINGE, 2.0)
+    for x0, y0, x1, y1 in segments:
+        for ax, ay, bx, by in ((x0, y0, x1, y1), (x1, y1, x0, y0)):
+            if math.hypot(ax - arc.hinge_x, ay - arc.hinge_y) > near:
+                continue
+            if not _LEAF_MIN * r <= math.hypot(bx - ax, by - ay) <= _LEAF_MAX * r:
+                continue
+            heading = math.degrees(math.atan2(by - ay, bx - ax))
+            if any(abs((heading - end + 180) % 360 - 180) <= _LEAF_ANGLE
+                   for end in (arc.start_deg, arc.end_deg)):
+                return True
+    return False
+
+
+def _ring_share(segments: list[tuple[float, float, float, float]], arc: Swing) -> float:
+    """Degrees of the arc's whole circle that carry ink, in 10-degree steps.
+
+    A door swing is a quarter turn struck from its hinge; nothing else is drawn
+    on the rest of that circle. A grid bubble, a keynote circle or a dashed
+    wheelchair turning circle is inked most of the way round, and a piece of
+    one passes every other test a swing has to pass.
+    """
+    r = arc.radius
+    tol = max(r * 0.03, 0.4)
+    step = max(r * 0.05, 0.5)
+    bins: set[int] = set()
+    for x0, y0, x1, y1 in segments:
+        d0 = math.hypot(x0 - arc.hinge_x, y0 - arc.hinge_y)
+        d1 = math.hypot(x1 - arc.hinge_x, y1 - arc.hinge_y)
+        if max(d0, d1) < r - tol:
+            continue  # wholly inside the circle
+        length = math.hypot(x1 - x0, y1 - y0)
+        if min(d0, d1) - length > r + tol:
+            continue  # wholly outside it
+        n = max(1, int(length / step))
+        for k in range(n + 1):
+            x, y = x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n
+            if abs(math.hypot(x - arc.hinge_x, y - arc.hinge_y) - r) <= tol:
+                angle = math.degrees(math.atan2(y - arc.hinge_y, x - arc.hinge_x))
+                bins.add(int((angle + 180) // 10) % 36)
+    return len(bins) * 10.0
 
 
 def _arc_from(points: list[tuple[float, float]], expected_r: float | None
@@ -199,8 +338,15 @@ def _arc_from(points: list[tuple[float, float]], expected_r: float | None
     if expected_r and abs(radius - expected_r) > expected_r * _RADIUS_TOLERANCE:
         return None
 
+    # The arc's extent is the circle less its widest empty stretch. Taking
+    # last-minus-first on raw angles broke for every swing that passes due
+    # left of its hinge, where the angle wraps from +180 to -180: a quarter
+    # turn read as 358 degrees and the door was thrown out.
     angles = sorted(math.degrees(math.atan2(y - cy, x - cx)) for x, y in points)
-    span = angles[-1] - angles[0]
+    gaps = [(angles[(i + 1) % len(angles)] - angles[i]) % 360 for i in range(len(angles))]
+    widest = max(range(len(gaps)), key=gaps.__getitem__)
+    span = 360 - gaps[widest]
+    start = angles[(widest + 1) % len(angles)]
     if not (_MIN_SPAN_DEG <= span <= _MAX_SPAN_DEG):
         return None
 
@@ -208,7 +354,9 @@ def _arc_from(points: list[tuple[float, float]], expected_r: float | None
     # so the hinge is part of the shape and the box has to include it.
     xs = [p[0] for p in points] + [cx]
     ys = [p[1] for p in points] + [cy]
-    return Swing(cx, cy, radius, angles[0], angles[-1], residual,
+    # start in [-180, 180); end = start + span, which passes 180 for a swing
+    # across due left.
+    return Swing(cx, cy, radius, start, start + span, residual,
                  min(xs), min(ys), max(xs), max(ys))
 
 
@@ -221,9 +369,28 @@ def arcs_near(doc: PdfDoc, page: int, x: float, y: float,
     segments = doc.segments(page - 1, within=window)
     if not segments:
         return []
-    return [arc for arc in (_arc_from(points, expected_r)
-                            for points in _chains(segments))
-            if arc is not None]
+    found: list[Swing] = []
+    for group in _groups(segments):
+        points = sorted({p for i in group for p in ((segments[i][0], segments[i][1]),
+                                                    (segments[i][2], segments[i][3]))})
+        arc = _arc_from(points, expected_r)
+        if arc is not None:
+            # A swing across due left of its hinge (end past 180) was never
+            # seen before the wrap was handled, and corner curves on a sheet
+            # with no measured door size come in with it. Like a run cut out
+            # of a group, it counts only with its leaf drawn.
+            if arc.end_deg <= 180 or _has_leaf(segments, arc):
+                found.append(arc)
+            continue
+        # A run cut out of a bigger group must also show its leaf. Smooth runs
+        # turn up in chair backs and fittings as well as in swings, and on one
+        # set they outvoted the doors and set the sheet's door size wrong. A
+        # swing has the door drawn from its hinge to the end of the arc.
+        for run in _curved_runs(segments, group):
+            arc = _arc_from(run, expected_r)
+            if arc is not None and _has_leaf(segments, arc):
+                found.append(arc)  # leaf required whether it wraps or not
+    return [arc for arc in found if _ring_share(segments, arc) < _RING_MAX]
 
 
 @dataclass(slots=True)

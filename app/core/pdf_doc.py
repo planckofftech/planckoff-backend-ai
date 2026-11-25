@@ -42,6 +42,12 @@ class TextItem:
     text: str
     size: float
     horizontal: bool
+    # How the text is set, as the PDF records it. A set prints its door
+    # numbers in one style and its room numbers in another, and these are two
+    # of the things that differ. Empty / -1 where the source has no such fact
+    # -- text read off an image, or an item built by hand.
+    font: str = ""
+    color: int = -1
 
     @property
     def cx(self) -> float:
@@ -145,7 +151,8 @@ def upright(items: list[TextItem]) -> list[TextItem]:
         if item.horizontal:
             continue
         out.append(TextItem(item.x0, item.y1 - (item.x1 - item.x0),
-                            item.x1, item.y1, item.text, item.size, True))
+                            item.x1, item.y1, item.text, item.size, True,
+                            item.font, item.color))
     return out
 
 
@@ -333,7 +340,8 @@ class PdfDoc:
                     seen.add(fingerprint)
                     items.append(
                         TextItem(rect.x0, rect.y0, rect.x1, rect.y1, text,
-                                 span.get("size", 0.0), horizontal)
+                                 span.get("size", 0.0), horizontal,
+                                 span.get("font", ""), span.get("color", -1))
                     )
         if len(self._text_cache) >= _TEXT_CACHE_PAGES:
             self._text_cache.pop(next(iter(self._text_cache)))
