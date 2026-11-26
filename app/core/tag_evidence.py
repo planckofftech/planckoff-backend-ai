@@ -1,8 +1,11 @@
-"""Tell a door's number from a room's, from how this set prints the two.
+﻿"""Tell a door's number from a room's, from how this set prints the two.
 
-SHADOW ONLY. Nothing in the pipeline calls this yet. It runs beside
-`door_locator.locate` so the two can be compared door by door before it is
-trusted with anything.
+Runs after `door_locator.locate` on a plan read of the whole set (see
+`apply`, called from `plan_pipeline.audit`, behind settings.room_tag_judge).
+It only ever overrules `locate` where `locate` picked a room label: there the
+pick moves to the door's own tag, or is left for a person to place. Where
+`locate` already sits on a door tag, its answer stands untouched -- measured
+on the testers' corrections, that rule broke no door that was right.
 
 Why it exists
 -------------
@@ -55,14 +58,18 @@ Nothing here logs a reason or a score.
 from __future__ import annotations
 
 import bisect
+import logging
 import math
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from app.core import stacked_tags, swing_finder, wall_tags
 from app.core.pdf_doc import PdfDoc, TextItem
 from app.core.plan_index import SHEET_NUMBER, PlanSheet
+
+log = logging.getLogger(__name__)
 
 # A leaf length to search with where the sheet's own could not be measured.
 _BASE_DOOR_PT = 36.0
@@ -224,6 +231,78 @@ def _labels_together(number: TextItem, word: TextItem) -> str:
     return ""
 
 
+# Words of one name: lines this close, edge to edge, in multiples of the
+# text's height, and words on one line this close.
+_NAME_LINE_GAP = 0.6
+_NAME_WORD_GAP = 1.0
+
+
+def _name_blocks(names: list[TextItem]) -> list[TextItem]:
+    """Words that make one room name -- stacked lines or words on a line set
+    close together, at one size -- joined into one name spanning them all."""
+    if len(names) < 2:
+        return names
+    parent = list(range(len(names)))
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    # Each word is tested only against the words in the cells around it. A
+    # scan down the sheet by height alone tested every word on a crowded
+    # sheet's line against every other: one set's plan read went from a minute
+    # to thirty-five.
+    # Sized to the usual word, not the largest: one title in huge letters must
+    # not make every cell the size of the sheet.
+    heights = sorted(_height(w) for w in names)
+    cell = max(4 * heights[len(heights) // 2], 1.0)
+    grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for i, w in enumerate(names):
+        for gx in range(int(w.x0 // cell), int(w.x1 // cell) + 1):
+            for gy in range(int(w.y0 // cell), int(w.y1 // cell) + 1):
+                grid[(gx, gy)].append(i)
+    for i, a in enumerate(names):
+        h = _height(a)
+        reach = h * (1 + _NAME_LINE_GAP + _NAME_WORD_GAP)
+        near: set[int] = set()
+        for gx in range(int((a.x0 - reach) // cell), int((a.x1 + reach) // cell) + 1):
+            for gy in range(int((a.y0 - reach) // cell), int((a.y1 + reach) // cell) + 1):
+                near.update(grid.get((gx, gy), ()))
+        for j in near:
+            if j <= i:
+                continue
+            # The upper of the two first, its size the measure, as a walk
+            # down the sheet meets them.
+            up, down = (names[j], a) if names[j].cy < a.cy else (a, names[j])
+            hu = _height(up)
+            if abs(_height(down) - hu) > 0.15 * hu:
+                continue
+            overlap_x = min(up.x1, down.x1) - max(up.x0, down.x0)
+            stacked = overlap_x > 0 and 0 <= down.y0 - up.y1 <= _NAME_LINE_GAP * hu
+            same_line = (abs(up.cy - down.cy) <= 0.3 * hu
+                         and min(abs(down.x0 - up.x1), abs(up.x0 - down.x1))
+                         <= _NAME_WORD_GAP * hu)
+            if stacked or same_line:
+                parent[root(j)] = root(i)
+    groups: dict[int, list[TextItem]] = defaultdict(list)
+    for i, w in enumerate(names):
+        groups[root(i)].append(w)
+    out = []
+    for words in groups.values():
+        if len(words) == 1:
+            out.append(words[0])
+            continue
+        words.sort(key=lambda w: (round(w.cy), w.x0))
+        first = words[0]
+        out.append(TextItem(min(w.x0 for w in words), min(w.y0 for w in words),
+                            max(w.x1 for w in words), max(w.y1 for w in words),
+                            " ".join(w.text.strip() for w in words), first.size,
+                            first.horizontal, first.font, first.color))
+    return out
+
+
 def paired_with_a_name(found: list[TextItem], numbers: list[TextItem],
                        names: list[TextItem]) -> dict[int, str]:
     """Which of `found` are a room's number, and how each stands against its
@@ -237,6 +316,11 @@ def paired_with_a_name(found: list[TextItem], numbers: list[TextItem],
     def gap(a: TextItem, b: TextItem) -> float:
         return math.hypot(a.cx - b.cx, a.cy - b.cy)
 
+    # A room's name printed over two lines is one name. Midkiff prints JANITOR
+    # over CLOSET over 122; taken word by word, CLOSET claimed 122 and JANITOR
+    # claimed the nearest number left -- door bubble 122A just above it -- and
+    # the door was called a room.
+    names = _name_blocks(names)
     # Names sorted by height on the sheet, so each number only tests the few
     # within label reach of it rather than every word on a crowded sheet.
     by_y = sorted(names, key=lambda w: w.cy)
@@ -312,12 +396,25 @@ def _leader_door(doc: PdfDoc, page: int, item: TextItem, mark_radius: float,
     return False
 
 
+class OutOfTime(Exception):
+    """The judge ran past its time on this set; today's answer stands."""
+
+
 def measure(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
             avoid: dict[int, list[tuple[float, float, float, float]]] | None = None,
-            sheet_numbers: set[str] | None = None) -> list[Printing]:
-    """Every printing of every scheduled number on these sheets, measured."""
+            sheet_numbers: set[str] | None = None,
+            deadline: float | None = None) -> list[Printing]:
+    """Every printing of every scheduled number on these sheets, measured.
+
+    `deadline` (time.monotonic) stops it part-way with OutOfTime: see `apply`.
+    """
+    def in_time() -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise OutOfTime
+
     out: list[Printing] = []
     for sheet in sheets:
+        in_time()
         items = [i for i in doc.text_items(sheet.page - 1) if i.text.strip()]
         blanked = (avoid or {}).get(sheet.page) or []
         if blanked:
@@ -346,6 +443,7 @@ def measure(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
         for group in (free, rooms):
             if not group:
                 continue
+            in_time()
             arcs = swing_finder.arcs_for_tags(doc, sheet.page,
                                               [(i.cx, i.cy) for i in group],
                                               expected_r=radius, door_pt=door_pt)
@@ -359,6 +457,7 @@ def measure(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
                 arc_of[id(item)] = arc
 
         for item in found:
+            in_time()
             mark = wall_tags.enclosure(doc, sheet.page, item.cx, item.cy, _height(item))
             p = Printing(tag=item.text.strip(), page=sheet.page,
                          sheet=sheet.number or f"p{sheet.page}", item=item,
@@ -544,3 +643,88 @@ def judge(printings: list[Printing], tags: set[str],
         else:
             out.append(Verdict(tag, "check", printings=mine, kept=kept))
     return habit, out
+
+
+# ----------------------------------------------------------------- applying --
+
+def apply(doc: PdfDoc, sightings: list, tags: set[str], sheets: list[PlanSheet],
+          avoid: dict[int, list[tuple[float, float, float, float]]] | None = None,
+          sheet_numbers: set[str] | None = None,
+          seconds: float | None = None) -> tuple[list, int]:
+    """`locate`'s sightings, with every pick that is a room label put right.
+
+    Per door, per sheet this judge measured:
+
+      kept      `locate` picked a door tag (or a printing this judge cannot
+                tell about): its candidate stands exactly as it was
+      moved     `locate` picked a room label and the door's own tag is there:
+                the candidate moves to the tag
+      dropped   `locate` picked a room label and no door tag can be told
+                apart: the candidate goes, and the door is reported as not
+                found on that sheet, for a person to place
+      added     `locate` found nothing on a sheet where the door's tag is
+
+    Sheets this judge did not measure keep `locate`'s candidates. Returns the
+    sightings and how many door-sheets were left for a person. Logs counts
+    only, never why.
+
+    `seconds` bounds the measuring. A sheet dense enough to take longer than
+    that is left exactly as `locate` read it: the judge can only skip its
+    improvement there, never make the answer worse.
+    """
+    from app.core.door_locator import Candidate, DoorSighting
+
+    started = time.monotonic()
+    try:
+        printings = measure(doc, tags, sheets, avoid, sheet_numbers,
+                            deadline=started + seconds if seconds else None)
+    except OutOfTime:
+        log.info("tag_evidence: stopped after %.0f s; the plan read's answer "
+                 "stands", time.monotonic() - started)
+        return sightings, 0
+    today: dict[str, dict[int, tuple[float, float]]] = {}
+    for s in sightings:
+        for c in s.candidates:
+            today.setdefault(s.tag, {}).setdefault(
+                c.page, ((c.x0 + c.x1) / 2, (c.y0 + c.y1) / 2))
+    habit, verdicts = judge(printings, tags, today)
+    if habit is None:
+        return sightings, 0
+    by_tag = {v.tag: v for v in verdicts}
+
+    out, moved, dropped, added = [], 0, 0, 0
+    for s in sightings:
+        v = by_tag.get(s.tag)
+        if v is None or v.status in ("defer", "not_found"):
+            out.append(s)
+            continue
+        judged = {p.page for p in v.printings}
+        pick_on = {p.page: p for p in v.picks}
+        candidates = []
+        for c in s.candidates:
+            if c.page in v.kept or c.page not in judged:
+                candidates.append(c)
+            elif c.page in pick_on:
+                p = pick_on.pop(c.page)
+                it = p.item
+                candidates.append(Candidate(c.page, c.sheet, it.x0, it.y0, it.x1, it.y1,
+                                            c.score, list(c.reasons), it.size))
+                if (it.x0, it.y0) != (c.x0, c.y0):
+                    moved += 1
+            else:
+                dropped += 1
+        for page, p in sorted(pick_on.items()):
+            it = p.item
+            candidates.append(Candidate(page, p.sheet, it.x0, it.y0, it.x1, it.y1,
+                                        size=it.size))
+            added += 1
+        if candidates:
+            out.append(DoorSighting(s.tag, candidates[0].page, candidates[0].sheet,
+                                    s.confidence if candidates[0].page == s.page
+                                    else "resolved", candidates))
+        else:
+            out.append(DoorSighting(s.tag, 0, "", "not_found", []))
+    log.info(
+        "tag_evidence: %d door number(s), %d moved, %d left for a person, %d added",
+        len(sightings), moved, dropped, added)
+    return out, dropped
