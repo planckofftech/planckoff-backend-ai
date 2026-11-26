@@ -1,11 +1,13 @@
-"""Area reads: the parts of a plan a person drew around, stored.
+﻿"""Area reads: the parts of a plan a person drew around, stored.
 
 Three things happen to an area read's boxes, and all three are here:
 
   saved      only the boxes answering the drawing are replaced; what they
              replaced is kept whole on the area, for undo
-  kept       a read of the whole set does not wipe them -- see `carry_over`,
-             which `store.save_audit` calls on either side of its rebuild
+  replaced   a read of the whole set replaces them like every other box the
+             system placed; only what a person did by hand stands. The area
+             read is marked superseded and its undo does nothing -- see
+             `supersede`, which `store.save_audit` calls before its rebuild
   undone     the area's own boxes come off and what they replaced goes back,
              except where something newer now stands
 
@@ -70,21 +72,6 @@ def for_document(document_id: str) -> list[dict[str, Any]]:
     return (client().table("area_reads").select("*")
             .eq("document_id", document_id)
             .order("created_at", desc=True).execute().data)
-
-
-def _plans(area: dict) -> list[AreaPlan]:
-    return [AreaPlan.from_json(p) for p in area.get("plan") or []]
-
-
-def _active(db, document_id: str) -> list[dict]:
-    """Area reads on this document whose boxes stand: read, not undone."""
-    try:
-        return (db.table("area_reads").select("*")
-                .eq("document_id", document_id).eq("status", "ready")
-                .execute().data)
-    except Exception as exc:  # noqa: BLE001 - before db/037, there are none
-        log.info("db: no area reads read (%s)", exc)
-        return []
 
 
 # --------------------------------------------------------------------------- #
@@ -200,90 +187,30 @@ def _typed(det: dict, page_of: dict[str, int]) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# kept through a read of the whole set
+# replaced by a read of the whole set
 # --------------------------------------------------------------------------- #
 
-class CarryOver:
-    """What an area read placed, lifted out before a whole-set rebuild and put
-    back after it -- so a person's paid read is not wiped by the next pass."""
-
-    def __init__(self, rows: list[dict], plans: list[AreaPlan],
-                 sheets: dict[int, dict]):
-        self.rows = rows            # stored detections, each with its page
-        self.plans = plans          # every active area's parts
-        self.sheets = sheets        # page -> old sheet row, for pages to re-make
-
-    def __bool__(self) -> bool:
-        return bool(self.rows)
-
-    def keeps(self, page: int, row: dict) -> bool:
-        """Does an area read own this place? Then the rebuild leaves it be."""
-        if any(r["page"] == page and r.get("door_tag")
-               and r["door_tag"] == row.get("door_tag") for r in self.rows):
-            return True
-        return answers(page, _box(row), self.plans)
+SUPERSEDED = "superseded"
+_SUPERSEDED_NOTE = "Replaced by a later read of the whole set."
 
 
-def lift(db, document_id: str) -> CarryOver:
-    """Before a rebuild: the boxes active area reads placed, and where."""
-    areas = _active(db, document_id)
-    if not areas:
-        return CarryOver([], [], {})
-    try:
-        ids = [a["id"] for a in areas]
-        rows = (db.table("detections").select("*")
-                .eq("document_id", document_id).in_("area_id", ids)
-                .execute().data)
-        sheets = {s["page"]: s for s in
-                  db.table("sheets").select("*")
-                  .eq("document_id", document_id).execute().data}
-    except Exception as exc:  # noqa: BLE001 - before db/037
-        log.info("db: area boxes not carried over (%s)", exc)
-        return CarryOver([], [], {})
-    by_id = {s["id"]: p for p, s in sheets.items()}
-    for r in rows:
-        r["page"] = by_id.get(r["sheet_id"])
-    rows = [r for r in rows if r["page"] is not None]
-    # An area read of chosen doors owns those doors' boxes, which the door
-    # number already keeps; only a read of every door owns the whole area.
-    plans = [p for a in areas if not a.get("doors") for p in _plans(a)]
-    return CarryOver(rows, plans, sheets)
-
-
-def put_back(db, document_id: str, carry: CarryOver, new_rows: list[dict],
-             sheet_id: dict[int, str]) -> list[dict]:
-    """After a rebuild's sheets are made and before its boxes are written:
-    drop the rebuilt boxes where an area read stands, re-make any sheet the
-    rebuild no longer lists, and return the rows to write.
+def supersede(db, document_id: str) -> int:
+    """A read of the whole set is about to replace every box: mark the area
+    reads whose boxes stand as replaced. Their undo then does nothing -- it
+    would put back boxes from before that read, on top of it. Returns how many.
     """
-    if not carry:
-        return new_rows
-    page_of = {v: k for k, v in sheet_id.items()}
-    missing = sorted({r["page"] for r in carry.rows} - set(sheet_id))
-    if missing:
-        made = store._insert("sheets", [
-            {k: v for k, v in carry.sheets[p].items() if k not in ("id", "created_at")}
-            for p in missing if p in carry.sheets
-        ])
-        sheet_id.update({m["page"]: m["id"] for m in made})
-    kept_rows = [r for r in new_rows
-                 if not carry.keeps(page_of.get(r["sheet_id"], -1), r)]
-    primary = {r["door_tag"] for r in carry.rows if r.get("is_primary") and r.get("door_tag")}
-    for r in kept_rows:
-        if r.get("door_tag") in primary:
-            r["is_primary"] = False
-    back = []
-    for r in carry.rows:
-        if r["page"] not in sheet_id:
-            continue
-        row = {k: v for k, v in r.items() if k not in ("sheet_id", "page", "created_at")}
-        row["sheet_id"] = sheet_id[r["page"]]
-        back.append(row)
-    log.info("db: %d box(es) from area reads kept through the rebuild; %d "
-             "rebuilt box(es) left out where they stand",
-             len(back), len(new_rows) - len(kept_rows))
-    return _same_keys(kept_rows + back)
-
+    try:
+        done = (db.table("area_reads")
+                .update({"status": SUPERSEDED, "message": _SUPERSEDED_NOTE,
+                         "updated_at": _now()})
+                .eq("document_id", document_id).eq("status", "ready")
+                .execute().data or [])
+    except Exception as exc:  # noqa: BLE001 - before db/037, there are none
+        log.info("db: area reads not marked replaced (%s)", exc)
+        return 0
+    if done:
+        log.info("db: %d area read(s) replaced by a read of the whole set", len(done))
+    return len(done)
 
 def _same_keys(rows: list[dict]) -> list[dict]:
     """One shape for every row of a bulk insert."""
@@ -309,8 +236,10 @@ def undo(area_id: str) -> dict[str, Any] | None:
     area = get(area_id)
     if area is None:
         return None
-    if area["status"] == "undone":
-        return {"area_id": area_id, "status": "undone", "removed": 0, "restored": 0}
+    if area["status"] in ("undone", SUPERSEDED):
+        # Replaced by a read of the whole set: nothing of it stands to undo.
+        return {"area_id": area_id, "status": area["status"], "removed": 0,
+                "restored": 0}
     document_id = area["document_id"]
 
     removed = (db.table("detections").delete().eq("area_id", area_id)

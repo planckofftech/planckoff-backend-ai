@@ -621,10 +621,13 @@ def save_extraction(*, org: str = "", project: str = "", filename: str,
             log.info("db: kept %d door(s) found on the drawing rather than in "
                      "the schedule", len(restored))
 
-        # Tables a person drew around and had read are their request, not a
-        # guess: the re-read above replaced every door, so put them back.
+        # A read of the whole schedule replaces everything the system read,
+        # tables read from a drawn box included. A person's corrections stand
+        # (they live apart, keyed on the door number), as do doors found on
+        # the drawing (kept above). A box read this replaced can no longer be
+        # undone -- its undo would put back values from before this read.
         from app.db import schedule_areas
-        schedule_areas.reapply(document_id)
+        schedule_areas.supersede(document_id)
 
         if repeated:
             log.warning("db: %d door number(s) appear twice and were stored "
@@ -809,13 +812,18 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
             return False
         org_id = document.data[0]["org_id"]
 
-        # Read before the wipe: the types people set, to put back below, and
-        # the boxes people had read by drawing around them, which this pass
-        # does not get to overrule (see app/db/areas.py).
+        # Read before the wipe: the types people set, to put back below.
+        #
+        # A read of the whole set replaces everything the system placed, the
+        # boxes from earlier area reads included. Only what a person did by
+        # hand stands: boxes placed or moved (manual_detections, untouched
+        # here), boxes removed (tombstones, below) and types set (below). An
+        # area read this replaces can no longer be undone -- its undo would
+        # put back boxes from before this read, on top of it.
         from app.db import areas
 
         typed = _types_by_hand(db, document_id)
-        carry = areas.lift(db, document_id)
+        areas.supersede(db, document_id)
         db.table("detections").delete().eq("document_id", document_id).execute()
         db.table("sheets").delete().eq("document_id", document_id).execute()
 
@@ -853,7 +861,6 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
             seen.add(key)
             rows.append(_detection_row(org_id, document_id, sheet_id[page], door))
         _keep_types(rows, typed, {v: k for k, v in sheet_id.items()})
-        rows = areas.put_back(db, document_id, carry, rows, sheet_id)
         _insert("detections", rows)
         _record_walls(db, document_id, audit.detected)
         _record_pages(db, document_id, audit.pages)
