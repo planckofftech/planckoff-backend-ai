@@ -45,6 +45,7 @@ _MAX_BOXES = 20
 # What a person is told. What happened, never why.
 _FAILED = "Reading this table failed. Please try again."
 _NOTHING = "No door schedule rows were found in this area."
+_SAME = "Every door in this table is already in the schedule as read."
 _PART = "Part of what was drawn could not be read. Draw around it again to finish it."
 _NO_IMAGES = ("This table could not be read as text, and image reading is not "
               "set up on this server.")
@@ -209,6 +210,8 @@ def _read_later(read_id: str, document_id: str, key: str, job_id: str | None,
                 finish("failed", _FAILED, None)
                 return
             note = _PART if unread else None
+            if not saved["added"] and not saved["updated"]:
+                note = f"{_SAME} {note}" if note else _SAME
             finish("ready", note, saved["added"] + saved["updated"])
             log.info("schedule area read %s on %s: %d box(es), %d added, %d "
                      "updated in %.0f s", read_id, document_id, boxes,

@@ -3,17 +3,26 @@
 What a read does to the schedule:
 
   added      a door number the schedule did not have becomes a door, tied to
-             this read (doors.schedule_area_id) and to a table of its own
+             this read (doors.schedule_area_id)
   updated    a door the schedule already had takes the values this read found
              for it -- only the ones it found; an empty cell never blanks a
              value. What it held before is kept on the read, for undo.
              A person's corrections are never touched: they live apart, keyed
-             on the door number, and stand over whatever a read says.
-  kept       a read of the whole schedule replaces every door, and would wipe
-             this. After one, every read still standing is applied again, oldest
-             first -- see `reapply`, called from `store.save_extraction`.
-  undone     the doors it added go, the values it replaced come back, and the
-             tables it made are taken off.
+             on the door number, and stand over whatever any read says.
+  table      where the box covers a table the schedule already lists, the read
+             takes that table over -- its title, headings, count and outline
+             become the box's -- rather than listing the same printed table
+             twice. What the table said before is kept, for undo. A table not
+             listed yet is added.
+  wanted     a table the person removed earlier and now draws around is wanted
+             after all -- their newer act wins. It comes off the removed list
+             (undo puts it back on).
+  replaced   a read of the whole schedule replaces everything the system read,
+             this included; only what a person did by hand stands. The read is
+             marked superseded and its undo does nothing -- see `supersede`,
+             called from `store.save_extraction`.
+  undone     the doors it added go, the values it replaced come back, a table
+             it took over says what it said before, a table it added comes off.
 
 Doors are matched by number and level, as the schedule keeps them.
 """
@@ -31,8 +40,16 @@ from app.schemas import DoorRow, ScheduleTable
 log = logging.getLogger(__name__)
 
 TABLE = "schedule_area_reads"
+SUPERSEDED = "superseded"
+_SUPERSEDED_NOTE = "Replaced by a later read of the whole schedule."
 # Door fields a read may set. `extra` is merged, never replaced.
 _FIELDS = tuple(f for f in DoorRow.model_fields if f not in ("extra", "door_tag", "level"))
+# A listed table is the one the box read when this share of the smaller of
+# the two outlines is covered by both.
+_SAME_TABLE = 0.5
+# What a table takeover changes, and so what undo puts back.
+_TABLE_FIELDS = ("title", "headers", "field_map", "row_count", "box_x0", "box_y0",
+                 "box_x1", "box_y1", "box_source", "schedule_area_id")
 
 
 def _now() -> str:
@@ -68,16 +85,6 @@ def for_document(document_id: str) -> list[dict[str, Any]]:
 # applying a read to the schedule
 # --------------------------------------------------------------------------- #
 
-def _tables_json(tables: list[ScheduleTable]) -> list[dict]:
-    """The tables as stored on the read, rows included, so the read can be
-    applied again after the whole schedule is re-read."""
-    return [t.model_dump(mode="json") for t in tables]
-
-
-def _tables_from(stored: list[dict]) -> list[ScheduleTable]:
-    return [ScheduleTable(**t) for t in stored or []]
-
-
 def _match(existing: list[dict], tag: str, level: str) -> dict | None:
     """The door this row is: same number and level; else the only door with
     that number, where one of the two names no level."""
@@ -105,27 +112,80 @@ def _changes(door: dict, row: DoorRow) -> tuple[dict, dict]:
     return new, before
 
 
+def _outline(row: dict) -> tuple[float, float, float, float] | None:
+    box = tuple(row.get(k) for k in ("box_x0", "box_y0", "box_x1", "box_y1"))
+    return box if all(v is not None for v in box) else None
+
+
+def _listed(listed: list[dict], table: ScheduleTable, taken: set[str]) -> dict | None:
+    """The table the schedule already lists that this box read, if any: on
+    the same page, its outline mostly inside the box read's or the other way
+    round. A table without an outline cannot be told apart and is left be."""
+    if table.box is None:
+        return None
+    a = (table.box.x0, table.box.y0, table.box.x1, table.box.y1)
+    best, most = None, 0.0
+    for row in listed:
+        b = _outline(row)
+        if row.get("page") != table.page or b is None or row["id"] in taken:
+            continue
+        ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        smaller = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+        share = ix * iy / smaller if smaller > 0 else 0.0
+        if share >= _SAME_TABLE and share > most:
+            best, most = row, share
+    return best
+
+
+def _table_values(t: ScheduleTable, read_id: str) -> dict:
+    return {"title": t.title, "headers": t.headers, "field_map": t.field_map,
+            "row_count": t.row_count,
+            "box_x0": t.box.x0 if t.box else None, "box_y0": t.box.y0 if t.box else None,
+            "box_x1": t.box.x1 if t.box else None, "box_y1": t.box.y1 if t.box else None,
+            "box_source": t.box.source if t.box else None,
+            "schedule_area_id": read_id}
+
+
 def _apply(db, document_id: str, org_id: str, read_id: str,
            tables: list[ScheduleTable]) -> dict[str, Any]:
-    """Write one read's tables into the schedule. Returns what it did."""
+    """Write one read's tables into the schedule. Returns what it did, and
+    what it replaced (for undo)."""
+    # A table the person removed earlier and has now drawn around is wanted
+    # after all: their newer act wins. It comes off the removed list, so the
+    # next read of the whole schedule keeps it too; undo puts it back.
     removed = store.removed_schedules(db, document_id)
-    tables = [t for t in tables
-              if not any(store._same_schedule(g, t.page, t.title) for g in removed)]
-    made = store._insert("schedules", [
-        {"document_id": document_id, "page": t.page, "title": t.title,
-         "headers": t.headers, "field_map": t.field_map, "row_count": t.row_count,
-         "box_x0": t.box.x0 if t.box else None, "box_y0": t.box.y0 if t.box else None,
-         "box_x1": t.box.x1 if t.box else None, "box_y1": t.box.y1 if t.box else None,
-         "box_source": t.box.source if t.box else None,
-         "schedule_area_id": read_id}
-        for t in tables
-    ]) if tables else []
+    wanted_back = [g for g in removed
+                   if any(store._same_schedule(g, t.page, t.title) for t in tables)]
+    if wanted_back:
+        db.table("documents").update(
+            {"removed_schedules": [g for g in removed if g not in wanted_back]}
+        ).eq("id", document_id).execute()
+
+    listed = (db.table("schedules").select("*").eq("document_id", document_id)
+              .execute().data or [])
+    taken: set[str] = set()
+    took_over: list[dict] = []
+    schedule_ids: list[str] = []
+    for t in tables:
+        mine = _listed(listed, t, taken)
+        if mine is not None:
+            taken.add(mine["id"])
+            took_over.append({"id": mine["id"],
+                              "before": {k: mine.get(k) for k in _TABLE_FIELDS}})
+            db.table("schedules").update(_table_values(t, read_id)).eq(
+                "id", mine["id"]).execute()
+            schedule_ids.append(mine["id"])
+        else:
+            made = store._insert("schedules", [
+                {"document_id": document_id, "page": t.page, **_table_values(t, read_id)}])
+            schedule_ids.append(made[0]["id"])
 
     existing = (db.table("doors").select("*").eq("document_id", document_id)
                 .execute().data or [])
     last = max((d.get("row_index") or 0 for d in existing), default=-1)
     added, updated, seen, untagged = [], [], set(), 0
-    for table, schedule in zip(tables, made):
+    for table, schedule_id in zip(tables, schedule_ids):
         for row in table.rows:
             tag = (row.door_tag or "").strip()
             if not tag:
@@ -141,7 +201,7 @@ def _apply(db, document_id: str, org_id: str, read_id: str,
                 values = row.model_dump(exclude={"extra"})
                 values["door_tag"] = tag
                 added.append({"org_id": org_id, "document_id": document_id,
-                              "schedule_id": schedule["id"], "row_index": last,
+                              "schedule_id": schedule_id, "row_index": last,
                               "source": "schedule", "schedule_area_id": read_id,
                               **values, "extra": row.extra})
                 continue
@@ -154,7 +214,7 @@ def _apply(db, document_id: str, org_id: str, read_id: str,
     if added:
         store._insert_doors(added)
     return {"added": len(added), "updated": updated, "untagged": untagged,
-            "tables": len(made)}
+            "tables": took_over, "unremoved": wanted_back}
 
 
 def save(document_id: str, read_id: str, tables: list[ScheduleTable],
@@ -167,10 +227,13 @@ def save(document_id: str, read_id: str, tables: list[ScheduleTable],
         if not document:
             return None
         done = _apply(db, document_id, document[0]["org_id"], read_id, tables)
-        update(read_id, tables=_tables_json(tables), replaced=done["updated"],
+        update(read_id, tables=[t.model_dump(mode="json") for t in tables],
+               replaced={"doors": done["updated"], "tables": done["tables"],
+                         "unremoved": done["unremoved"]},
                added=done["added"], updated=len(done["updated"]), method=method)
-        log.info("db: schedule area read %s: %d door(s) added, %d updated",
-                 read_id, done["added"], len(done["updated"]))
+        log.info("db: schedule area read %s: %d door(s) added, %d updated, "
+                 "%d table(s) taken over", read_id, done["added"],
+                 len(done["updated"]), len(done["tables"]))
         return {"added": done["added"], "updated": len(done["updated"]),
                 "untagged": done["untagged"]}
     except NoDatabase:
@@ -180,59 +243,72 @@ def save(document_id: str, read_id: str, tables: list[ScheduleTable],
         return None
 
 
-def reapply(document_id: str) -> int:
-    """After the whole schedule is read again: put every standing area read
-    back, oldest first, so a later read still wins where two overlap. Each
-    read's undo now puts back what this re-read found. Returns how many."""
-    try:
-        db = client()
-        standing = (db.table(TABLE).select("*").eq("document_id", document_id)
-                    .eq("status", "ready").order("created_at").execute().data)
-    except Exception as exc:  # noqa: BLE001 - before db/038 there are none
-        log.info("db: no schedule area reads to keep (%s)", exc)
-        return 0
-    if not standing:
-        return 0
-    org = (db.table("documents").select("org_id").eq("id", document_id)
-           .execute().data)
-    if not org:
-        return 0
-    for read in standing:
-        try:
-            done = _apply(db, document_id, org[0]["org_id"], read["id"],
-                          _tables_from(read.get("tables")))
-            update(read["id"], replaced=done["updated"], added=done["added"],
-                   updated=len(done["updated"]))
-        except Exception as exc:  # noqa: BLE001 - one read must not stop the rest
-            log.warning("db: schedule area read %s not kept: %s", read["id"], exc)
-    log.info("db: %d schedule area read(s) kept through the re-read", len(standing))
-    return len(standing)
+# --------------------------------------------------------------------------- #
+# replaced by a read of the whole schedule
+# --------------------------------------------------------------------------- #
 
+def supersede(document_id: str) -> int:
+    """A read of the whole schedule has replaced every door and table: mark
+    the box reads that stood as replaced. Their undo then does nothing -- it
+    would put back values from before that read, on top of it."""
+    try:
+        done = (client().table(TABLE)
+                .update({"status": SUPERSEDED, "message": _SUPERSEDED_NOTE,
+                         "updated_at": _now()})
+                .eq("document_id", document_id).eq("status", "ready")
+                .execute().data or [])
+    except Exception as exc:  # noqa: BLE001 - before db/038 there are none
+        log.info("db: schedule area reads not marked replaced (%s)", exc)
+        return 0
+    if done:
+        log.info("db: %d schedule area read(s) replaced by a read of the whole "
+                 "schedule", len(done))
+    return len(done)
+
+
+# --------------------------------------------------------------------------- #
+# undone
+# --------------------------------------------------------------------------- #
 
 def undo(read_id: str) -> dict[str, Any] | None:
-    """Take a read off the schedule. Undoing twice is the same as once."""
+    """Take a read off the schedule. Undoing twice is the same as once; a read
+    a whole-schedule read has replaced has nothing left to undo."""
     db = client()
     read = get(read_id)
     if read is None:
         return None
-    if read["status"] == "undone":
-        return {"schedule_area_id": read_id, "status": "undone",
+    if read["status"] in ("undone", SUPERSEDED):
+        return {"schedule_area_id": read_id, "status": read["status"],
                 "removed": 0, "restored": 0}
     document_id = read["document_id"]
     removed = restored = 0
     if read["status"] == "ready":
+        replaced = read.get("replaced") or {}
+        if isinstance(replaced, list):  # recorded before tables were taken over
+            replaced = {"doors": replaced, "tables": []}
         gone = (db.table("doors").delete().eq("schedule_area_id", read_id)
                 .execute().data or [])
         removed = len(gone)
         doors = (db.table("doors").select("id, door_tag, level")
                  .eq("document_id", document_id).execute().data or [])
-        for change in read.get("replaced") or []:
+        for change in replaced.get("doors") or []:
             door = _match(doors, change["door_tag"], change.get("level") or "")
             if door is None:
                 continue
             db.table("doors").update(change["before"]).eq("id", door["id"]).execute()
             restored += 1
+        # Tables taken over say what they said before; then whatever still
+        # names this read is a table it added, and comes off.
+        for table in replaced.get("tables") or []:
+            db.table("schedules").update(table["before"]).eq("id", table["id"]).execute()
         db.table("schedules").delete().eq("schedule_area_id", read_id).execute()
+        # Tables this read took off the removed list go back on it.
+        back = replaced.get("unremoved") or []
+        if back:
+            now = store.removed_schedules(db, document_id)
+            db.table("documents").update(
+                {"removed_schedules": now + [g for g in back if g not in now]}
+            ).eq("id", document_id).execute()
     update(read_id, status="undone", undone_at=_now())
     log.info("db: schedule area read %s undone: %d door(s) removed, %d restored",
              read_id, removed, restored)

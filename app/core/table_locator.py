@@ -55,6 +55,8 @@ _TAG_COLUMN_TOL = 14.0
 # Zero, deliberately: in ruled mode a wrapped cell shares its row's box, so a
 # tagless row at the *end* is the next table's caption, not more of this one.
 _TAGLESS_TAIL = 0
+# A door number printed with a space between its letters and its number.
+_SPACED_TAG = re.compile(r"^[A-Z]{1,3} \d{1,4}[A-Z]?$", re.IGNORECASE)
 # One printed line of headings shares a baseline this closely.
 _HEADING_BASELINE_TOL = 3.0
 # Heading rows that may sit above the sub-heading row before we stop climbing.
@@ -648,12 +650,14 @@ def _trim_to_tagged_rows(grid: TableGrid, items: list[TextItem],
     # `tag_x` still breaks ties, since it is usually right.
     rows = len(bounds) - 1
     tagged = [[False] * rows for _ in range(grid.n_cols)]
+    values: list[set[str]] = [set() for _ in range(grid.n_cols)]
     for item in items:
         if not item.horizontal or not TAG_RE.match(item.text):
             continue
         column = grid.column_of(item.x0)
         if column is None or item.cy < bounds[0] or item.cy >= bounds[-1]:
             continue
+        values[column].add(item.text.strip())
         for index in range(rows):
             if bounds[index] <= item.cy < bounds[index + 1]:
                 tagged[column][index] = True
@@ -662,8 +666,29 @@ def _trim_to_tagged_rows(grid: TableGrid, items: list[TextItem],
     counts = [sum(column) for column in tagged]
     if not any(counts):
         return
+    # Where two columns are equally full, the door numbers are the one whose
+    # values do not repeat. EOS Coit's door numbers tied at 38 with a column of
+    # detail references -- 15, 7, 2 over and over -- standing nearer `tag_x`;
+    # that column won, its last row held a dash, and the overhead door at the
+    # foot of the table was cut off.
     best = max(range(grid.n_cols),
-               key=lambda c: (counts[c], -abs(grid.col_bounds[c] - tag_x)))
+               key=lambda c: (counts[c], len(values[c]),
+                              -abs(grid.col_bounds[c] - tag_x)))
+
+    # A door number printed with a space -- "OH 1", the overhead door at the
+    # foot of EOS Coit's schedule -- is not tag-shaped to TAG_RE, so the table
+    # was cut off one row early and that door was never read. Counted here, in
+    # the door-number column only, for where the table ends. Kept to a few
+    # letters and a number so a note under the table ("NOTE 1") stays out.
+    for item in items:
+        if (not item.horizontal or not _SPACED_TAG.match(item.text.strip())
+                or grid.column_of(item.x0) != best
+                or item.cy < bounds[0] or item.cy >= bounds[-1]):
+            continue
+        for index in range(rows):
+            if bounds[index] <= item.cy < bounds[index + 1]:
+                tagged[best][index] = True
+                break
     last = max(i for i, has in enumerate(tagged[best]) if has)
     keep = min(last + 1 + _TAGLESS_TAIL, len(bounds) - 1)
     if keep + 1 < len(bounds):
