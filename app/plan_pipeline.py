@@ -28,6 +28,7 @@ from app.core import (
     page_finder,
     plan_index,
     swing_finder,
+    tag_evidence,
 )
 from app.core.door_locator import DoorSighting, locate
 from app.core.pdf_doc import PdfDoc
@@ -1507,11 +1508,29 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
                              for s in sightings]
                 searched += spare
 
+        # Where `locate` picked a room's label for a door's number, put it on
+        # the door's own tag, or leave it for a person -- never on the room.
+        # A read of the whole set only: where a person named the sheets or the
+        # tag shape, their word stands. See app/core/tag_evidence.py.
+        left_for_person = 0
+        if get_settings().room_tag_judge and not pages and not tag_shape:
+            try:
+                sightings, left_for_person = tag_evidence.apply(
+                    doc, sightings, tags, plans, avoid, numbers,
+                    seconds=get_settings().room_tag_judge_seconds)
+            except Exception as exc:  # noqa: BLE001 - locate's answer still stands
+                log.warning("plan_audit: room tag check skipped: %s", exc)
+
         unscheduled = door_reconcile.tagged_but_unscheduled(doc, tags, plans)
         # Reconciled against the doors asked about, or every door not asked
         # about is reported missing from the plans.
         asked = [r for r in rows if r.door_tag in tags] if doors else rows
         result = door_reconcile.reconcile(asked, sightings, plans, unscheduled)
+        if left_for_person:
+            # What happened, never why.
+            result.warnings.append(
+                f"{left_for_person} door(s) could not be placed with confidence "
+                "on a plan sheet and need placing by hand.")
 
         # Page sizes are needed to express positions as fractions of the page,
         # which is what the preview draws with.

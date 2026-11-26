@@ -1,4 +1,4 @@
-from functools import lru_cache
+﻿from functools import lru_cache
 from typing import Annotated
 
 from pydantic import AfterValidator
@@ -140,6 +140,18 @@ class Settings(BaseSettings):
     # pass with no trace. A sheet estimated over this is not measured; its doors
     # are still placed by their printed numbers.
     geometry_budget_mb: int = 2000
+
+    # Tell a door's number from a room's on the plans before measuring
+    # (app/core/tag_evidence.py). On: where the plan read's pick of a door
+    # number is a room label, it is moved to the door's own tag, or left for a
+    # person to place. Where the pick is already a door tag, nothing changes.
+    # ROOM_TAG_JUDGE=false turns it off without a redeploy.
+    room_tag_judge: bool = True
+    # ...for at most this long per plan read. A set dense enough to take
+    # longer keeps the plan read's own answer, untouched.
+    # Harmony's seven large sheets take about two minutes, the usual set
+    # seconds.
+    room_tag_judge_seconds: float = 180.0
 
     # Page-finder thresholds. Fitted to one document -- see PLAN.md section 8.
     min_header_hits: int = 5
