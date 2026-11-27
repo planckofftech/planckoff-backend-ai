@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.core.pdf_doc import PdfDoc
@@ -593,7 +594,8 @@ def other_leaf(doc: PdfDoc, page: int, mine: Swing,
 
 def arcs_for_tags(doc: PdfDoc, page: int, points: list[tuple[float, float]],
                   expected_r: float | None = None,
-                  door_pt: float = 36.0) -> list[Swing | None]:
+                  door_pt: float = 36.0,
+                  tick: Callable[[], None] | None = None) -> list[Swing | None]:
     """Give each door number the arc that belongs to it, however far it sits.
 
     A fixed reach cannot work. One sheet prints the number at the opening --
@@ -609,10 +611,15 @@ def arcs_for_tags(doc: PdfDoc, page: int, points: list[tuple[float, float]],
 
     Everything else stays as it was -- radius agreement first, so basins and
     chair backs never enter, and one arc to one door.
+
+    `tick`, when given, is called before each look around a number -- about a
+    second each on a busy sheet -- and may raise to stop the work part-way.
     """
     reach = door_pt * _TAG_SWEEP
     arcs: dict[tuple[int, int], Swing] = {}
     for x, y in points:
+        if tick is not None:
+            tick()
         for arc in arcs_near(doc, page, x, y, expected_r, reach / _WINDOW):
             arcs.setdefault((round(arc.hinge_x / _HINGE_TOL),
                              round(arc.hinge_y / _HINGE_TOL)), arc)
@@ -770,7 +777,8 @@ def assign_swings(doc: PdfDoc, page: int, points: list[tuple[float, float]],
 
 
 def calibrate(doc: PdfDoc, page: int, points: list[tuple[float, float]],
-              door_pt: float = 36.0) -> float | None:
+              door_pt: float = 36.0,
+              tick: Callable[[], None] | None = None) -> float | None:
     """The swing radius doors are actually drawn at on this sheet.
 
     Learned from the sheet rather than hard-coded, for the same reason the door
@@ -794,6 +802,8 @@ def calibrate(doc: PdfDoc, page: int, points: list[tuple[float, float]],
 
     Deliberately free of any assumed scale. Two of the six sets are drawn at
     1/8", one at 1/16"; nothing here needs to know which.
+
+    `tick`: as in `arcs_for_tags`.
     """
     sample = points[:_CALIBRATION_SAMPLE]
     if not sample:
@@ -801,6 +811,8 @@ def calibrate(doc: PdfDoc, page: int, points: list[tuple[float, float]],
 
     covers: dict[float, set[int]] = defaultdict(set)
     for index, (x, y) in enumerate(sample):
+        if tick is not None:
+            tick()
         for arc in arcs_near(doc, page, x, y, expected_r=None, door_pt=door_pt):
             covers[round(arc.radius * 2) / 2].add(index)
 
