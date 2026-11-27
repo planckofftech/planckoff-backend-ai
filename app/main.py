@@ -8,6 +8,7 @@ from app.api.areas import router as areas_router
 from app.api.price_watch import router as price_watch_router
 from app.api.prices import router as prices_router
 from app.api.routes import router
+from app.api.pages import router as pages_router
 from app.api.schedule_areas import router as schedule_areas_router
 from app.api.storage import router as storage_router
 from app.config import get_settings
@@ -61,6 +62,8 @@ app.include_router(storage_router)
 app.include_router(areas_router)
 # Door schedule tables a person drew around, read on their own.
 app.include_router(schedule_areas_router)
+# Plan pages a person removed from a set, and putting them back.
+app.include_router(pages_router)
 # Hardware list prices. Reads only what scripts/load_price_book.py stored.
 app.include_router(prices_router)
 # Watching the makers' websites for new editions of those books.

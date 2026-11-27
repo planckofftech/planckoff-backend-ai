@@ -37,7 +37,7 @@ from app.config import get_settings
 from app.api.offload import in_worker
 from app.core import review
 from app.core.pdf_doc import NotAPdfError
-from app.db import files, store
+from app.db import files, removed_pages, store
 from app.db.store import _insert as _insert_rows
 from app.db.client import NoDatabase, client
 from app.ai.client import AiUnavailableError, AiUpstreamError
@@ -360,6 +360,8 @@ _PLAN_PASSES: set[asyncio.Task] = set()
 
 # What a person waiting on the plans is told. What happened, never why.
 _PLAN_FAILED = "Locating doors on the plans failed. Please try again."
+_PAGES_REMOVED = ("The pages asked for were removed from this set. Put them "
+                  "back to read them.")
 
 
 def _plan_job(project_id: str, document_id: str, source_key: str | None) -> str | None:
@@ -402,13 +404,26 @@ def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
         shutil.copyfile(path, owned)
 
     async def run() -> None:
-        nonlocal owned
+        nonlocal owned, pages, regions
         started = time.perf_counter()
         try:
             # Plan reads on one document replace each other's boxes: one at
             # a time, in the order asked.
             await store.wait_turn(job_id, document_id)
             started = time.perf_counter()
+            # Read now, not when asked: a page removed while this waited its
+            # turn is skipped too.
+            skip = await asyncio.to_thread(removed_pages.pages, document_id)
+            asked = pages
+            if skip and pages:
+                pages = [p for p in pages if p not in skip]
+                regions = [r for r in regions or [] if r["page"] not in skip] or None
+            if asked and not pages:
+                if job_id:
+                    store.finish_job(job_id, "ready", document_id=document_id,
+                                     doors=0, message=_PAGES_REMOVED,
+                                     needs_review=True)
+                return
             if owned is None:
                 owned = await asyncio.to_thread(files.fetch, key)
             by_page: dict[int, list[tuple[float, float, float, float]]] = {}
@@ -419,7 +434,8 @@ def _plan_pass_later(document_id: str, path, rows, schedule_page: int | None,
                                           budget_usd=budget_usd,
                                           schedule_page=schedule_page,
                                           pages=pages, doors=doors,
-                                          regions=by_page or None))
+                                          regions=by_page or None,
+                                          skip_pages=skip or None))
             if pages or doors:
                 store.save_reprocess(document_id, found, pages=pages, doors=doors,
                                      regions=regions)
@@ -676,7 +692,18 @@ async def stored_document(
         out["detections"] = _name_the_counted_sheet(measured + placed, sheets)
         out["suppressed"] = len(store.tombstones(document_id))
     out["plan_status"] = _plan_status(document_id)
+    # Pages a person removed: left out of the plan view, offered for undo.
+    # Their boxes are already gone from `detections`.
+    out["removed_pages"] = removed_pages.listed(document_id)
     return out
+
+
+def _removed_detail(gone: list[int]) -> str:
+    """What a person is told when they ask for a page they removed."""
+    named = ", ".join(map(str, gone))
+    return (f"Page {named} was removed from this set. Put it back to read it."
+            if len(gone) == 1 else
+            f"Pages {named} were removed from this set. Put them back to read them.")
 
 
 def _plan_status(document_id: str) -> dict[str, Any] | None:
@@ -1169,10 +1196,12 @@ async def attach_plans(
             detail="That document has no doors stored, so there is nothing to "
                    "locate. Read the schedule first.")
 
+    skip = removed_pages.pages(document_id)
     path = await asyncio.to_thread(files.fetch, body.key)
     try:
         result = await in_worker(audit(path, rows=rows, detect=detect,
-                                       budget_usd=budget_usd))
+                                       budget_usd=budget_usd,
+                                       skip_pages=skip or None))
     except NotAPdfError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except AiUpstreamError as exc:
@@ -1265,11 +1294,13 @@ async def audit_document(
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED,
                             content={"job_id": job_id, "status": "reading"})
 
+    skip = removed_pages.pages(document_id)
     path = await asyncio.to_thread(files.fetch, key)
     try:
         result = await in_worker(audit(
             path, rows=rows, detect=detect, budget_usd=budget_usd,
-            schedule_page=pages[0]["page"] if pages else None))
+            schedule_page=pages[0]["page"] if pages else None,
+            skip_pages=skip or None))
     except NotAPdfError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     finally:
@@ -1386,6 +1417,10 @@ async def reprocess_document(
                 status_code=422,
                 detail=f"This set has {page_count} pages; there is no page "
                        f"{', '.join(map(str, beyond))}.")
+
+    gone = sorted(set(pages) & removed_pages.pages(document_id))
+    if gone:
+        raise HTTPException(status_code=409, detail=_removed_detail(gone))
 
     rows = _stored_rows(db, document_id)
     if not rows:
@@ -1591,6 +1626,8 @@ async def place_detection(document_id: str, body: NewDetection,
         raise HTTPException(status_code=404, detail="No such document.")
     org_id = found.data[0]["org_id"]
     page = _page_of(db, document_id, body.sheet_id)
+    if page in removed_pages.pages(document_id, db):
+        raise HTTPException(status_code=409, detail=_removed_detail([page]))
 
     created_door = False
     if body.door_tag:

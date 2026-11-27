@@ -288,6 +288,16 @@ def _ahead(job_id: str, document_id: str, kind: str = "plan") -> bool:
     return False
 
 
+def plan_running(document_id: str) -> bool:
+    """Is a plan read -- a pass over the set, a reprocess or an area read --
+    queued or running on this document? A job left behind by a stopped
+    server does not count."""
+    jobs = (client().table("reading_jobs").select("*")
+            .eq("document_id", document_id).eq("kind", "plan")
+            .in_("status", ["queued", "reading"]).execute().data or [])
+    return any(_as_seen(j)["status"] in ("queued", "reading") for j in jobs)
+
+
 async def wait_turn(job_id: str | None, document_id: str, kind: str = "plan") -> None:
     """Wait until every job of this kind on this document started before this
     one has finished, then mark this one reading. Schedule area reads queue
@@ -811,6 +821,9 @@ def save_audit(document_id: str, audit: PlanAudit) -> bool:
         if not document.data:
             return False
         org_id = document.data[0]["org_id"]
+        # Pages removed while this read ran are not stored, sheet or boxes.
+        from app.db import removed_pages
+        audit = removed_pages.leave_out(db, document_id, audit)
 
         # Read before the wipe: the types people set, to put back below.
         #
@@ -998,6 +1011,26 @@ def save_reprocess(document_id: str, audit: PlanAudit, *,
         if not document.data:
             return None
         org_id = document.data[0]["org_id"]
+        # Pages removed while this read ran are not stored.
+        from app.db import removed_pages
+        audit = removed_pages.leave_out(db, document_id, audit)
+        if doors:
+            # Only doors that still exist: one undone while this ran (the
+            # schedule box read that added it) gets no box.
+            standing = {d["door_tag"] for d in
+                        (db.table("doors").select("door_tag")
+                         .eq("document_id", document_id).execute().data or [])
+                        if d.get("door_tag")}
+            doors = doors & standing
+            if not doors:
+                # None left. Going on would read an empty set as "every
+                # door" below and replace them all.
+                log.info("db: reprocess of %s stored nothing -- the doors "
+                         "asked about are gone", document_id)
+                return {"replaced": 0, "added": 0, "kept_hand_placed": [],
+                        "left_out_removed": 0}
+            audit = audit.model_copy(update={
+                "detected": [d for d in audit.detected if d.tag in doors]})
 
         # Sheets are added, never rebuilt: manual boxes key on the page, but
         # the frontend holds sheet ids, and a sheet nobody asked about keeps
