@@ -87,6 +87,13 @@ _LAYOUT_SHARE = 0.25
 # At or above this share of printings being room labels, the set prints no
 # door tags and names its doors after their rooms.
 _ROOMS_SET = 0.75
+# A sheet where under this share of the printings are door tags prints its
+# doors by their rooms' numbers, whatever the rest of the set does: an overall
+# plan beside enlarged ones. Its picks stand. Measured 27 November 2026:
+# Harmony's overall plans A-101 and A-102 at 10% and 3%, DISD's at 0%; the
+# lowest sheet whose room-label picks testers moved by hand, Fifth Third's, at
+# 23%; every other sheet the judge changed at 45% or over.
+_DOOR_SHEET = 0.15
 # Label geometry, in multiples of the number's own text height.
 _STACK_GAP = 1.2       # edge to edge, above or below
 _STACK_SLACK = 0.5     # horizontal slack past the wider of the two
@@ -369,7 +376,8 @@ def _on_wall(doc: PdfDoc, page: int, item: TextItem, door_pt: float) -> bool:
 
 
 def _leader_door(doc: PdfDoc, page: int, item: TextItem, mark_radius: float,
-                 expected_r: float | None, door_pt: float) -> bool:
+                 expected_r: float | None, door_pt: float,
+                 tick=None) -> bool:
     """Does a line leave this number and end at a door?
 
     Stricter than `swing_finder.leader_end`: the line has to start at the
@@ -388,6 +396,8 @@ def _leader_door(doc: PdfDoc, page: int, item: TextItem, mark_radius: float,
             length = math.hypot(bx - ax, by - ay)
             if not (shortest <= length <= longest):
                 continue
+            if tick is not None:
+                tick()
             for a in swing_finder.arcs_near(doc, page, bx, by, expected_r, door_pt):
                 if (math.hypot(a.hinge_x - bx, a.hinge_y - by) <= door_pt * _LEADER_REACH
                         or math.hypot((a.x0 + a.x1) / 2 - bx, (a.y0 + a.y1) / 2 - by)
@@ -430,7 +440,7 @@ def measure(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
         labelled = paired_with_a_name(found, numbers, names)
 
         points = [(i.cx, i.cy) for i in found]
-        radius = swing_finder.calibrate(doc, sheet.page, points)
+        radius = swing_finder.calibrate(doc, sheet.page, points, tick=in_time)
         door_pt = radius or _BASE_DOOR_PT
 
         # Arcs go to door tags before room labels. A small room's own swing
@@ -446,7 +456,8 @@ def measure(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
             in_time()
             arcs = swing_finder.arcs_for_tags(doc, sheet.page,
                                               [(i.cx, i.cy) for i in group],
-                                              expected_r=radius, door_pt=door_pt)
+                                              expected_r=radius, door_pt=door_pt,
+                                              tick=in_time)
             for item, arc in zip(group, arcs):
                 if arc is None:
                     continue
@@ -469,7 +480,7 @@ def measure(doc: PdfDoc, tags: set[str], sheets: list[PlanSheet],
                 p.opening = "arc"
             elif not p.label and _leader_door(doc, sheet.page, item,
                                               mark.radius if mark else 0.0,
-                                              radius, door_pt):
+                                              radius, door_pt, tick=in_time):
                 p.opening = "leader"
             elif swing_finder.find_leaf(doc, sheet.page, item.cx, item.cy,
                                         door_pt=door_pt) is not None:
@@ -599,6 +610,17 @@ def judge(printings: list[Printing], tags: set[str],
         by_tag[p.tag].append(p)
 
     habit = learn(printings)
+    room_sheets: set[int] = set()
+    if habit is not None and habit.mode == "tags":
+        on_page: dict[int, Counter] = defaultdict(Counter)
+        for p in printings:
+            _classify(p, habit)
+            on_page[p.page][p.kind == "door"] += 1
+        room_sheets = {page for page, c in on_page.items()
+                       if c[True] < _DOOR_SHEET * (c[True] + c[False])}
+    elif habit is not None:
+        for p in printings:
+            _classify(p, habit)
     out: list[Verdict] = []
     for tag in sorted(tags):
         mine = by_tag.get(tag, [])
@@ -608,8 +630,6 @@ def judge(printings: list[Printing], tags: set[str],
         if habit is None:
             out.append(Verdict(tag, "defer", printings=mine))
             continue
-        for p in mine:
-            _classify(p, habit)
 
         by_page: dict[int, list[Printing]] = defaultdict(list)
         for p in mine:
@@ -617,6 +637,12 @@ def judge(printings: list[Printing], tags: set[str],
         picks, kept = [], []
         for page, page_printings in by_page.items():
             at = today.get(tag, {}).get(page)
+            if page in room_sheets:
+                # A sheet numbering its doors by their rooms: the plan read's
+                # answer there stands, and nothing is added where it had none.
+                if at is not None:
+                    kept.append(page)
+                continue
             if at is not None:
                 theirs = _todays(page_printings, at)
                 if theirs is None or theirs.kind == "door":

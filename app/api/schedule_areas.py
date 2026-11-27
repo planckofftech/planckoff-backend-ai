@@ -34,6 +34,7 @@ from app.core.read_area import normalise
 from app.core.read_schedule_area import finish as finish_tables
 from app.core.read_schedule_area import merge_boxes, read_box
 from app.db import files, schedule_areas, store
+from app.db.client import client
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["schedule areas"])
@@ -165,6 +166,44 @@ async def _read_all(path, drawn: list[dict], ai: bool):
     return tables, method, warnings, unread, len(boxes)
 
 
+def _place_new_doors(document_id: str, tags: list[str]) -> None:
+    """Put the doors a box read added on the plans -- those doors only.
+
+    Started by the backend, not the caller: a plan job (kind "plan") that
+    waits its turn behind any other plan read on the set, and shows under
+    the document's `plan_status`. Free: the doors' own printed numbers are
+    read, not the vision model. The pass finds the sheets each number is
+    printed on itself, sheets with no boxes yet included -- a table the first
+    read missed is usually for doors on a sheet it never boxed. No other box
+    is touched (store.save_reprocess with `doors`).
+
+    Only on a set that has had a plan pass: one that never has gets the whole
+    pass when a person asks for it. Never fails the box read.
+    """
+    if not tags:
+        return
+    try:
+        db = client()
+        found = store.stored_pdf(document_id)
+        key = store.drawings_uri(found) if found else None
+        if not key or not files.available():
+            return
+        if not (db.table("sheets").select("id").eq("document_id", document_id)
+                .limit(1).execute().data):
+            return
+        rows = storage._stored_rows(db, document_id)
+        listed = (db.table("schedules").select("page").eq("document_id", document_id)
+                  .order("page").execute().data)
+        job_id = storage._plan_job(found["project_id"], document_id, key)
+        storage._plan_pass_later(document_id, None, rows,
+                                 listed[0]["page"] if listed else None, job_id,
+                                 key=key, detect=False, doors=set(tags))
+        log.info("placing %d door(s) a schedule box read added to %s",
+                 len(tags), document_id)
+    except Exception as exc:  # noqa: BLE001 - the doors are in the schedule regardless
+        log.warning("new doors on %s not sent to the plans: %s", document_id, exc)
+
+
 def _read_later(read_id: str, document_id: str, key: str, job_id: str | None,
                 drawn: list[dict]) -> None:
     """Read the boxes after the request has been answered, and record how it
@@ -212,6 +251,10 @@ def _read_later(read_id: str, document_id: str, key: str, job_id: str | None,
             note = _PART if unread else None
             if not saved["added"] and not saved["updated"]:
                 note = f"{_SAME} {note}" if note else _SAME
+            # The plan job first, then ready: whoever sees this read ready
+            # with doors added finds the job placing them already listed
+            # under the document's plan_status -- never a moment without it.
+            _place_new_doors(document_id, saved.get("added_tags") or [])
             finish("ready", note, saved["added"] + saved["updated"])
             log.info("schedule area read %s on %s: %d box(es), %d added, %d "
                      "updated in %.0f s", read_id, document_id, boxes,

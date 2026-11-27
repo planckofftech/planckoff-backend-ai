@@ -96,6 +96,9 @@ def save(document_id: str, area_id: str, audit: PlanAudit,
         if not document:
             return None
         org_id = document[0]["org_id"]
+        # A page removed while this read ran is not written to.
+        from app.db import removed_pages
+        audit = removed_pages.leave_out(db, document_id, audit)
 
         existing = (db.table("sheets").select("*")
                     .eq("document_id", document_id).execute().data)
@@ -247,6 +250,18 @@ def undo(area_id: str) -> dict[str, Any] | None:
 
     restored = 0
     snapshot = area.get("replaced") or []
+    if area["status"] == "ready":
+        # A page removed since: what this read replaced there goes back onto
+        # what the removal kept, for when the page is put back -- not onto
+        # the page now.
+        from app.db import removed_pages
+        done_before = {a["id"] for a in for_document(document_id)
+                       if a["status"] == "undone"} | {area_id}
+        for r in snapshot:
+            if r.get("area_id") in done_before:
+                r["area_id"] = None
+        gone_pages = removed_pages.take_area_back(db, document_id, area_id, snapshot)
+        snapshot = [r for r in snapshot if r.get("page") not in gone_pages]
     if snapshot:
         sheets = (db.table("sheets").select("id, page")
                   .eq("document_id", document_id).execute().data)

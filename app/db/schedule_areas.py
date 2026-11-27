@@ -214,7 +214,8 @@ def _apply(db, document_id: str, org_id: str, read_id: str,
     if added:
         store._insert_doors(added)
     return {"added": len(added), "updated": updated, "untagged": untagged,
-            "tables": took_over, "unremoved": wanted_back}
+            "tables": took_over, "unremoved": wanted_back,
+            "added_tags": sorted({a["door_tag"] for a in added})}
 
 
 def save(document_id: str, read_id: str, tables: list[ScheduleTable],
@@ -235,7 +236,7 @@ def save(document_id: str, read_id: str, tables: list[ScheduleTable],
                  "%d table(s) taken over", read_id, done["added"],
                  len(done["updated"]), len(done["tables"]))
         return {"added": done["added"], "updated": len(done["updated"]),
-                "untagged": done["untagged"]}
+                "untagged": done["untagged"], "added_tags": done["added_tags"]}
     except NoDatabase:
         return None
     except Exception as exc:  # noqa: BLE001 - the schedule stands as it was
@@ -291,6 +292,14 @@ def undo(read_id: str) -> dict[str, Any] | None:
         removed = len(gone)
         doors = (db.table("doors").select("id, door_tag, level")
                  .eq("document_id", document_id).execute().data or [])
+        # The boxes placed on the plans for the doors this read added go with
+        # them -- unless another door still carries the number. Boxes a person
+        # placed are theirs and stay.
+        left = {d["door_tag"] for d in doors if d.get("door_tag")}
+        orphans = sorted({d["door_tag"] for d in gone if d.get("door_tag")} - left)
+        for start in range(0, len(orphans), store._BATCH):
+            db.table("detections").delete().eq("document_id", document_id).in_(
+                "door_tag", orphans[start:start + store._BATCH]).execute()
         for change in replaced.get("doors") or []:
             door = _match(doors, change["door_tag"], change.get("level") or "")
             if door is None:

@@ -1383,7 +1383,8 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
                 tag_shape: str = "",
                 pages: list[int] | None = None,
                 doors: set[str] | None = None,
-                regions: dict[int, list[tuple[float, float, float, float]]] | None = None
+                regions: dict[int, list[tuple[float, float, float, float]]] | None = None,
+                skip_pages: set[int] | None = None
                 ) -> PlanAudit:
     """PDF in, reconciliation out. Stateless.
 
@@ -1420,8 +1421,12 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
     fractions -- usually the `unread` a pass reported. Only they are read, and
     only doors inside them come back, so finishing a sheet never doubles a
     door already found beside the part left over.
+
+    `skip_pages` are pages a person removed from the set: never looked at,
+    whatever else asks for them.
     """
     started = time.perf_counter()
+    skip = set(skip_pages or ())
     _DRY_RUN.set(dry_run)
 
     with PdfDoc(source) as doc:
@@ -1453,13 +1458,17 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             # the page, so the sheet still carries its number and title.
             named = {s.page: s for s in sheets}
             plans = [named.get(p) or plan_index.PlanSheet(page=p, number="", title="")
-                     for p in sorted(set(pages)) if 1 <= p <= pages_scanned]
+                     for p in sorted(set(pages))
+                     if 1 <= p <= pages_scanned and p not in skip]
         else:
             # The sheets this set's door numbers are printed on, where they
             # are printed as text; titles where they are not.
             plans = plan_index.door_plans(doc, sheets, tags,
                                           {best_page} if best_page else set())
             titled = plan_index.floor_plans(sheets)
+            if skip:
+                plans = [s for s in plans if s.page not in skip]
+                titled = [s for s in titled if s.page not in skip]
             pictures = [s for s in titled
                         if not s.is_enlargement and _unreadable(doc, s.page)]
             if not plans:
@@ -1497,7 +1506,8 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
         missing = {s.tag for s in sightings if not s.found}
         searched = list(plans)
         if missing and not pages:
-            spare = plan_index.other_architectural(sheets, plans)
+            spare = [s for s in plan_index.other_architectural(sheets, plans)
+                     if s.page not in skip]
             if spare:
                 log.info("plan_audit widening to %d more architectural sheets "
                          "for %d unplaced doors", len(spare), len(missing))
@@ -1610,6 +1620,9 @@ async def audit(source: bytes | str | Path, *, detect: bool = False,
             # plan, which is what it is.
             detected = _measure_from_tags(doc, plans, sightings, rows, sizes,
                                           tag_shape)
+
+        if skip:
+            detected = [d for d in detected if d.location.page not in skip]
 
         # Which sheet leads for each storey. Worked out from where the door
         # numbers actually landed, so it reflects the drawings rather than the

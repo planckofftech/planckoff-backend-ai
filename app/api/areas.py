@@ -29,7 +29,7 @@ from app.api.offload import in_worker
 from app.config import get_settings
 from app.core.pdf_doc import PdfDoc
 from app.core.read_area import WHOLE, AreaPlan, keep, normalise, plan_areas
-from app.db import areas, files, store
+from app.db import areas, files, removed_pages, store
 from app.plan_pipeline import audit
 from app.schemas import PlanAudit
 
@@ -44,6 +44,7 @@ _PAGES_PER_PASS = 10
 _FAILED = "Reading this area failed. Please try again."
 _NOTHING = "No doors were found in this area."
 _NOT_FOUND = "The doors chosen were not found in this area."
+_REMOVED = "The page drawn on was removed from this set. Put it back to read it."
 
 
 class DrawnArea(BaseModel):
@@ -116,6 +117,9 @@ async def read_areas(document_id: str, body: AreaRequest,
                 status_code=422,
                 detail=f"This set has {page_count} pages; there is no page "
                        f"{', '.join(map(str, beyond))}.")
+    gone = sorted(set(pages) & removed_pages.pages(document_id, db))
+    if gone:
+        raise HTTPException(status_code=409, detail=storage._removed_detail(gone))
 
     rows = storage._stored_rows(db, document_id)
     if not rows:
@@ -185,6 +189,7 @@ def _read_later(area_id: str, document_id: str, key: str, rows, schedule_page: i
                 pass
 
     async def run() -> None:
+        nonlocal drawn
         path = None
         started = time.perf_counter()
         try:
@@ -194,6 +199,13 @@ def _read_later(area_id: str, document_id: str, key: str, rows, schedule_page: i
                 return
             areas.update(area_id, status="reading")
             started = time.perf_counter()
+            # A page removed while this waited its turn is not read.
+            skip = await asyncio.to_thread(removed_pages.pages, document_id)
+            if skip:
+                drawn = [d for d in drawn if d["page"] not in skip]
+                if not drawn:
+                    finish("ready", _REMOVED, 0)
+                    return
             path = await asyncio.to_thread(files.fetch, key)
 
             pages = sorted({d["page"] for d in drawn})
